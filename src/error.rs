@@ -16,7 +16,7 @@ use std::{
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// The error that can be returned in this crate.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Error {
     kind: ErrorKind,
     notifier: Option<Notifier>,
@@ -57,6 +57,10 @@ pub enum ErrorKind {
     FutureCompleted,
     /// No default async runtime is available (no runtime feature flag was enabled).
     NoDefaultRuntime,
+    /// A configured local allocation or queue bound was exceeded. Never recoverable.
+    ResourceLimitExceeded,
+    /// An operation belongs to an invalidated channel generation.
+    StaleGeneration,
 
     /// The broker did not send a heartbeat within the negotiated timeout.
     MissingHeartbeatError,
@@ -156,7 +160,9 @@ impl Error {
             ErrorKind::SerialisationError(_) => false,
             ErrorKind::AuthProviderError(_) => false,
             ErrorKind::FutureCompleted => false,
-            ErrorKind::NoDefaultRuntime => false,
+            ErrorKind::NoDefaultRuntime
+            | ErrorKind::ResourceLimitExceeded
+            | ErrorKind::StaleGeneration => false,
 
             ErrorKind::MissingHeartbeatError => true,
         }
@@ -192,11 +198,13 @@ impl fmt::Display for Error {
             ErrorKind::IOError(e) => write!(f, "IO error: {e}"),
             ErrorKind::RuntimeShutdownError(e) => write!(f, "runtime shutdown error: {e}"),
             ErrorKind::ParsingError(e) => write!(f, "failed to parse: {e}"),
-            ErrorKind::ProtocolError(e) => write!(f, "protocol error: {e}"),
+            ErrorKind::ProtocolError(e) => write!(f, "AMQP peer error code {}", e.get_id()),
             ErrorKind::SerialisationError(e) => write!(f, "failed to serialise: {e}"),
-            ErrorKind::AuthProviderError(e) => write!(f, "failure during authentication: {e}"),
+            ErrorKind::AuthProviderError(_) => write!(f, "failure during authentication"),
             ErrorKind::FutureCompleted => write!(f, "future polled after completion"),
             ErrorKind::NoDefaultRuntime => write!(f, "no default configured runtime"),
+            ErrorKind::ResourceLimitExceeded => write!(f, "AMQP resource limit exceeded"),
+            ErrorKind::StaleGeneration => write!(f, "AMQP channel generation is stale"),
 
             ErrorKind::MissingHeartbeatError => {
                 write!(f, "no heartbeat received from server for too long")
@@ -262,5 +270,11 @@ impl PartialEq for Error {
 
             _ => false,
         }
+    }
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }

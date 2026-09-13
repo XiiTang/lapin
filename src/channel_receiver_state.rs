@@ -17,11 +17,19 @@ impl ChannelReceiverStates {
         self.0.clear()
     }
 
-    pub(crate) fn set_will_receive(&mut self, class_id: Identifier, delivery_cause: DeliveryCause) {
+    pub(crate) fn set_will_receive(
+        &mut self,
+        class_id: Identifier,
+        delivery_cause: DeliveryCause,
+    ) -> Result<()> {
+        if !self.0.is_empty() {
+            return Err(std::io::Error::other("Interleaved AMQP content methods").into());
+        }
         self.0.push_back(ChannelReceiverState::WillReceiveContent(
             class_id,
             delivery_cause,
         ));
+        Ok(())
     }
 
     pub(crate) fn set_content_length<

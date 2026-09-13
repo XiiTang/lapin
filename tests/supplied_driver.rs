@@ -350,7 +350,12 @@ async fn authentication_failure_resolves_waiter_without_waiting_for_server() {
         .await
         .unwrap()
         .unwrap_err();
-    assert!(error.to_string().contains("fixture authentication failed"));
+    assert_eq!(error.to_string(), "failure during authentication");
+    assert!(!format!("{error:?}").contains("fixture authentication failed"));
+    assert!(matches!(
+        error.kind(),
+        lapin::ErrorKind::AuthProviderError(_)
+    ));
     owner.stop();
     until(|| owner.is_finished()).await;
     let _ = tokio::task::spawn_blocking(move || owner.join())

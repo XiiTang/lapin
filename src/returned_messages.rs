@@ -21,10 +21,11 @@ impl ReturnedMessages {
         &self,
         size: PayloadSize,
         properties: BasicProperties,
+        reservation: Option<crate::limits::Reservation>,
         confirm_mode: bool,
     ) {
         self.lock_inner()
-            .handle_content_header_frame(size, properties, confirm_mode);
+            .handle_content_header_frame(size, properties, reservation, confirm_mode);
     }
 
     pub(crate) fn handle_body_frame(
@@ -85,10 +86,12 @@ impl Inner {
         &mut self,
         size: PayloadSize,
         properties: BasicProperties,
+        reservation: Option<crate::limits::Reservation>,
         confirm_mode: bool,
     ) {
         if let Some(message) = self.current_message.as_mut() {
             message.properties = properties;
+            message.reservation = reservation;
         }
         if size == 0 {
             self.new_delivery_complete(confirm_mode);
@@ -111,7 +114,7 @@ impl Inner {
 
     fn new_delivery_complete(&mut self, confirm_mode: bool) {
         if let Some(message) = self.current_message.take() {
-            warn!(?message, "Server returned us a message");
+            warn!("Server returned a message");
             if confirm_mode {
                 self.waiting_messages.push_back(message);
             } else {

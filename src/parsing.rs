@@ -34,7 +34,7 @@ impl<'a> ParsingContext<'a> {
         self.buffers[0].as_ptr()
     }
 
-    fn iter(&self) -> Chain<Iter<'a, u8>, Iter<'a, u8>> {
+    pub(crate) fn iter(&self) -> Chain<Iter<'a, u8>, Iter<'a, u8>> {
         self.buffers[0].iter().chain(self.buffers[1].iter())
     }
 }

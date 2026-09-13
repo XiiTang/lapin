@@ -29,6 +29,13 @@ impl ConsumerCanceler {
 
 impl Drop for ConsumerCanceler {
     fn drop(&mut self) {
+        if self
+            .internal_rpc
+            .explicit_close
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         if self.status.state() == ConsumerState::Active {
             self.internal_rpc.cancel_consumer(
                 self.channel_id,

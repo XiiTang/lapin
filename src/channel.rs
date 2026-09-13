@@ -56,6 +56,7 @@ use tracing::{error, info, trace};
 #[derive(Clone)]
 pub struct Channel {
     id: ChannelId,
+    expected_generation: Option<u64>,
     configuration: NegotiatedConfig,
     status: ChannelStatus,
     connection_status: ConnectionStatus,
@@ -121,10 +122,11 @@ impl Channel {
         };
         Self {
             id: channel_id,
+            expected_generation: None,
+            local_registry: Registry::new(configuration.topology_budget.clone()),
             configuration,
             status,
             connection_status,
-            local_registry: Registry::default(),
             acknowledgements: Acknowledgements::new(channel_id, returned_messages.clone()),
             consumers: Consumers::default(),
             basic_get_delivery: BasicGetDelivery::default(),
@@ -137,6 +139,15 @@ impl Channel {
             _connection_closer: connection_closer,
             recovery_config,
         }
+    }
+
+    /// Bind public operations to one delivery-tag generation. Enqueueing and
+    /// recovery invalidation are synchronized so stale operations cannot cross reconnect.
+    #[must_use]
+    pub fn at_generation(&self, generation: u64) -> Self {
+        let mut c = self.clone();
+        c.expected_generation = Some(generation);
+        c
     }
 
     /// Return a snapshot of the current channel state.
@@ -338,7 +349,9 @@ impl Channel {
         options: QueueDeclareOptions,
         arguments: FieldTable,
     ) {
-        self.local_registry.register_queue(name, options, arguments);
+        self.local_registry
+            .register_queue(name, options, arguments)
+            .unwrap();
     }
 
     #[cfg(test)]
@@ -374,10 +387,18 @@ impl Channel {
     }
 
     pub(crate) async fn start_recovery(&self) -> Result<()> {
-        let topology = self
+        let mut topology = self
             .update_recovery()
             .ok_or_else(|| self.status.state_error("start_recovery"))?;
 
+        if !self.recovery_config.1 {
+            topology.exchanges.clear();
+            topology.queues.clear();
+        }
+        if !self.recovery_config.2 {
+            topology.consumers.clear();
+            self.cancel_consumers();
+        }
         // First, reopen the channel
         self.channel_open(self.clone()).await?;
 
@@ -477,6 +498,20 @@ impl Channel {
         expected_reply: Option<ExpectedReply>,
         resolver: Option<PromiseResolver<()>>,
     ) {
+        let _generation = match self.status.guard_generation(self.expected_generation) {
+            Ok(guard) => guard,
+            Err(e) => {
+                canceler.cancel(e.clone());
+                if let Some(reply) = expected_reply {
+                    reply.1.cancel(e.clone());
+                }
+                if let Some(r) = resolver {
+                    r.reject(e.clone());
+                }
+                self.internal_rpc.set_connection_error(e);
+                return;
+            }
+        };
         trace!(channel=%self.id, "send_frame");
         self.frames
             .push(self.id, frame, canceler, expected_reply, resolver);
@@ -512,7 +547,13 @@ impl Channel {
 
         trace!(channel=%self.id, "send_frames");
         let (promise, resolver) = Promise::new(ctx);
-        self.frames.push_frames(self.id, frames, resolver);
+        {
+            let _generation = self
+                .status
+                .guard_generation(self.expected_generation)
+                .inspect_err(|e| self.internal_rpc.set_connection_error(e.clone()))?;
+            self.frames.push_frames(self.id, frames, resolver);
+        }
         self.wake();
         promise.await?;
         Ok(publisher_confirms_result
@@ -554,23 +595,37 @@ impl Channel {
         size: PayloadSize,
         properties: BasicProperties,
     ) -> Result<()> {
+        let reservation = self
+            .configuration
+            .budget
+            .as_ref()
+            .map(|b| b.reserve(size))
+            .transpose()?;
         self.status.set_content_length(
             self.id,
             class_id,
             size,
             |delivery_cause, confirm_mode| match delivery_cause {
                 DeliveryCause::Consume(consumer_tag) => {
-                    self.consumers
-                        .handle_content_header_frame(consumer_tag, size, properties);
+                    self.consumers.handle_content_header_frame(
+                        consumer_tag,
+                        size,
+                        properties,
+                        reservation,
+                    );
                 }
                 DeliveryCause::Get => {
-                    self.basic_get_delivery
-                        .handle_content_header_frame(size, properties);
+                    self.basic_get_delivery.handle_content_header_frame(
+                        size,
+                        properties,
+                        reservation,
+                    );
                 }
                 DeliveryCause::Return => {
                     self.returned_messages.handle_content_header_frame(
                         size,
                         properties,
+                        reservation,
                         confirm_mode,
                     );
                 }
@@ -766,7 +821,7 @@ impl Channel {
         method: protocol::connection::Start,
         step: ConnectionStep,
     ) -> Result<()> {
-        trace!(?method, "Server sent connection::Start");
+        trace!("Server sent connection::Start");
 
         let state = self.connection_status.state();
         if state != ConnectionState::Connecting {
@@ -898,7 +953,7 @@ impl Channel {
         method: protocol::connection::Tune,
         step: ConnectionStep,
     ) -> Result<()> {
-        trace!(?method, "Server sent Connection::Tune");
+        trace!("Server sent Connection::Tune");
 
         let state = self.connection_status.state();
         if state != ConnectionState::Connecting {
@@ -958,7 +1013,6 @@ impl Channel {
             .map(|error| {
                 error!(
                     channel=%self.id,
-                    ?method,
                     ?error,
                     "Connection closed",
                 );
@@ -966,7 +1020,7 @@ impl Channel {
             })
             .unwrap_or_else(|error| {
                 error!(%error);
-                info!(channel=%self.id, ?method, "Connection closed");
+                info!(channel=%self.id, "Connection closed");
                 ErrorKind::InvalidConnectionState(ConnectionState::Closed).into()
             });
         if self.recovery_config.can_recover(&error) {
@@ -1043,11 +1097,11 @@ impl Channel {
     fn on_channel_close_received(&self, method: protocol::channel::Close) -> Result<()> {
         let error = AMQPError::try_from(method.clone()).map(|error| {
                 error!(
-                    channel=%self.id, ?method, ?error,
+                    channel=%self.id, ?error,
                     "Channel closed"
                 );
                 Error::from(ErrorKind::ProtocolError(error))
-            }).map_err(|error| info!(channel=%self.id, ?method, code_to_error=%error, "Channel closed with a non-error code")).ok();
+            }).map_err(|error| info!(channel=%self.id, code_to_error=%error, "Channel closed with a non-error code")).ok();
         self.set_closing(error.clone());
         let channel = self.clone();
         self.internal_rpc
@@ -1070,8 +1124,12 @@ impl Channel {
         routing_key: ShortString,
         arguments: FieldTable,
     ) -> Result<()> {
-        self.local_registry
-            .register_exchange_binding(destination, source, routing_key, arguments);
+        self.local_registry.register_exchange_binding(
+            destination,
+            source,
+            routing_key,
+            arguments,
+        )?;
         Ok(())
     }
 
@@ -1100,7 +1158,7 @@ impl Channel {
         arguments: FieldTable,
     ) -> Result<()> {
         self.local_registry
-            .register_exchange(exchange, kind, options, arguments);
+            .register_exchange(exchange, kind, options, arguments)?;
         resolver.resolve(());
         Ok(())
     }
@@ -1138,7 +1196,7 @@ impl Channel {
         arguments: FieldTable,
     ) -> Result<()> {
         self.local_registry
-            .register_queue(method.queue.clone(), options, arguments);
+            .register_queue(method.queue.clone(), options, arguments)?;
         resolver.resolve(Queue::new(
             method.queue,
             method.message_count,
@@ -1155,7 +1213,7 @@ impl Channel {
         arguments: FieldTable,
     ) -> Result<()> {
         self.local_registry
-            .register_queue_binding(queue, exchange, routing_key, arguments);
+            .register_queue_binding(queue, exchange, routing_key, arguments)?;
         Ok(())
     }
 
@@ -1181,20 +1239,20 @@ impl Channel {
         resolver: PromiseResolver<Option<BasicGetMessage>>,
     ) -> Result<()> {
         let class_id = method.get_amqp_class_id();
-        let killswitch = self.status.set_will_receive(class_id, DeliveryCause::Get);
-        self.basic_get_delivery.start_new_delivery(
-            BasicGetMessage::new(
-                self.id,
-                method.delivery_tag,
-                method.exchange,
-                method.routing_key,
-                method.redelivered,
-                method.message_count,
-                self.internal_rpc.clone(),
-                killswitch,
-            ),
-            resolver,
+        let killswitch = self.status.set_will_receive(class_id, DeliveryCause::Get)?;
+        let mut message = BasicGetMessage::new(
+            self.id,
+            method.delivery_tag,
+            method.exchange,
+            method.routing_key,
+            method.redelivered,
+            method.message_count,
+            self.internal_rpc.clone(),
+            killswitch,
         );
+        message.delivery.generation = self.status.generation();
+        self.basic_get_delivery
+            .start_new_delivery(message, resolver);
         Ok(())
     }
 
@@ -1246,9 +1304,9 @@ impl Channel {
         let consumer_tag = method.consumer_tag.clone();
         let killswitch = self
             .status
-            .set_will_receive(class_id, DeliveryCause::Consume(consumer_tag.clone()));
+            .set_will_receive(class_id, DeliveryCause::Consume(consumer_tag.clone()))?;
         self.consumers.start_delivery(&consumer_tag, |error| {
-            Delivery::new(
+            let mut delivery = Delivery::new(
                 self.id,
                 method.delivery_tag,
                 method.exchange,
@@ -1257,7 +1315,9 @@ impl Channel {
                 Some(self.internal_rpc.clone()),
                 Some(error),
                 killswitch,
-            )
+            );
+            delivery.generation = self.status.generation();
+            delivery
         });
         Ok(())
     }
@@ -1347,7 +1407,7 @@ impl Channel {
         let class_id = method.get_amqp_class_id();
         let killswitch = self
             .status
-            .set_will_receive(class_id, DeliveryCause::Return);
+            .set_will_receive(class_id, DeliveryCause::Return)?;
         self.returned_messages
             .start_new_delivery(BasicReturnMessage::new(
                 method.exchange,

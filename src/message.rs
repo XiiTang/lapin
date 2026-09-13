@@ -27,6 +27,8 @@ pub struct Delivery {
     /// The delivery tag of the message. Use this for
     /// acknowledging the message.
     pub delivery_tag: DeliveryTag,
+    /// Channel generation in which this delivery tag was received.
+    pub generation: u64,
 
     /// The exchange of the message. May be an empty string
     /// if the default exchange is used.
@@ -48,6 +50,7 @@ pub struct Delivery {
 
     /// The acker used to ack/nack the message
     pub acker: Acker,
+    pub(crate) reservation: Option<crate::limits::Reservation>,
 }
 
 impl Delivery {
@@ -85,6 +88,8 @@ impl Delivery {
         killswitch: KillSwitch,
     ) -> Self {
         Self {
+            generation: 0,
+            reservation: None,
             delivery_tag,
             exchange,
             routing_key,

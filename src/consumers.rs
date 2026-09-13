@@ -59,11 +59,12 @@ impl Consumers {
         consumer_tag: &S,
         size: PayloadSize,
         properties: BasicProperties,
+        reservation: Option<crate::limits::Reservation>,
     ) where
         ShortString: Borrow<S>,
     {
         if let Some(consumer) = self.read().get(consumer_tag) {
-            consumer.handle_content_header_frame(size, properties);
+            consumer.handle_content_header_frame(size, properties, reservation);
         }
     }
 

@@ -243,11 +243,13 @@ impl Consumer {
         &self,
         size: PayloadSize,
         properties: BasicProperties,
+        reservation: Option<crate::limits::Reservation>,
     ) {
-        self.check_new_delivery(
-            self.lock_inner()
-                .handle_content_header_frame(size, properties),
-        );
+        self.check_new_delivery(self.lock_inner().handle_content_header_frame(
+            size,
+            properties,
+            reservation,
+        ));
     }
 
     pub(crate) fn handle_body_frame(&self, remaining_size: PayloadSize, payload: Vec<u8>) {
@@ -385,9 +387,11 @@ impl Inner {
         &mut self,
         size: PayloadSize,
         properties: BasicProperties,
+        reservation: Option<crate::limits::Reservation>,
     ) -> Option<Delivery> {
         if let Some(delivery) = self.current_message.as_mut() {
             delivery.properties = properties;
+            delivery.reservation = reservation;
         }
         self.check_new_delivery_complete(size == 0)
     }

@@ -70,6 +70,24 @@ impl ConnectionDriver {
     pub fn stop(&self) {
         self.0.stop();
     }
+    /// Clone a stop callback for an external cancellation/deadline watcher.
+    pub fn stop_handle(&self) -> impl Fn() + Clone + Send + Sync + 'static {
+        let force = self.0.force_stop.clone();
+        let channels = self.0.channels.clone();
+        let tasks = self.0.tasks.clone();
+        let rpc = self.0.rpc.clone();
+        let waker = self.0.waker.clone();
+        move || {
+            if force.kill() {
+                channels.set_connection_error(
+                    std::io::Error::from(std::io::ErrorKind::ConnectionAborted).into(),
+                );
+                tasks.stop();
+                rpc.stop();
+                waker.wake();
+            }
+        }
+    }
     /// Whether physical I/O and all scoped async tasks have exited.
     #[must_use]
     pub fn is_finished(&self) -> bool {
@@ -122,6 +140,9 @@ impl Connection {
     ) -> Self {
         let conn = Self::new(configuration, status, internal_rpc, events);
         conn.closer.noop();
+        conn.internal_rpc
+            .explicit_close
+            .store(true, std::sync::atomic::Ordering::Release);
         conn
     }
 
@@ -323,6 +344,7 @@ impl Connection {
             socket_state.handle(),
         );
         let events = Events::new();
+        events.bind(internal_rpc.handle());
         let channels = Channels::new(
             configuration.clone(),
             status.clone(),
@@ -401,6 +423,39 @@ impl Connection {
         };
         let (conn, channel0, control) = Self::connector_parts(uri, runtime, connect, options)?;
         conn.closer.noop();
+        conn.internal_rpc
+            .explicit_close
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok((ConnectionDriver(control), conn.start(channel0)))
+    }
+
+    /// Start a caller-owned connector under declared retry and recovery policy.
+    /// Every connection attempt invokes the supplied closure. No built-in DNS/TLS
+    /// is used. An explicit provider is required and automatic token refresh is forbidden.
+    pub fn from_connector<
+        RK: RuntimeKit + Clone + Send + 'static,
+        S: futures_io::AsyncRead + futures_io::AsyncWrite + Unpin + Send + 'static,
+    >(
+        uri: AMQPUri,
+        runtime: Runtime<RK>,
+        connect: impl AsyncFn(AMQPUri, Runtime<RK>) -> Result<S> + Send + Sync + 'static,
+        options: ConnectionProperties,
+    ) -> Result<(ConnectionDriver, impl Future<Output = Result<Self>> + Send)> {
+        if options
+            .auth_provider
+            .as_ref()
+            .is_none_or(|p| p.valid_for().is_some())
+        {
+            return Err(std::io::Error::other(
+                "supplied connector requires explicit authentication without token refresh",
+            )
+            .into());
+        }
+        let (conn, channel0, control) = Self::connector_parts(uri, runtime, connect, options)?;
+        conn.closer.noop();
+        conn.internal_rpc
+            .explicit_close
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok((ConnectionDriver(control), conn.start(channel0)))
     }
 
@@ -542,6 +597,7 @@ mod tests {
             socket_state.handle(),
         );
         let events = Events::new();
+        events.bind(internal_rpc.handle());
         let channels = Channels::new(
             configuration.clone(),
             status.clone(),
@@ -817,5 +873,26 @@ mod tests {
             channels.handle_frame(header_frame).unwrap();
             assert!(channel.status().connected());
         }
+    }
+    #[test]
+    fn stale_generation_cannot_enqueue_an_acknowledgement() {
+        let (connection, channels, _, frames) = create_connection_with_frames();
+        connection.closer.noop();
+        connection
+            .configuration
+            .negotiated_config
+            .set_channel_max(4);
+        let channel = channels.create(connection.closer.clone()).unwrap();
+        channel.set_state(ChannelState::Connected);
+        let result = futures_lite::future::block_on(
+            channel
+                .at_generation(1)
+                .basic_ack(1, crate::options::BasicAckOptions::default()),
+        );
+        assert!(matches!(
+            result.unwrap_err().kind(),
+            ErrorKind::StaleGeneration
+        ));
+        assert!(!frames.has_pending());
     }
 }
