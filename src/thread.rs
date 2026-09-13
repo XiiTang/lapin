@@ -23,6 +23,12 @@ impl ThreadHandle {
         *self.lock_inner() = Some(handle);
     }
 
+    pub(crate) fn is_finished(&self) -> bool {
+        self.lock_inner()
+            .as_ref()
+            .is_none_or(|thread| thread.is_finished())
+    }
+
     fn take(&self) -> Option<JoinHandle> {
         self.lock_inner().take()
     }

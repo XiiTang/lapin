@@ -1,7 +1,10 @@
 use crate::Result;
 use flume::{Receiver, Sender};
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     task::{Poll, Wake, Waker},
 };
 use tracing::{error, trace};
@@ -9,25 +12,29 @@ use tracing::{error, trace};
 pub(crate) struct SocketState {
     readable: bool,
     writable: bool,
-    events: Receiver<SocketEvent>,
+    events: Receiver<()>,
     handle: SocketStateHandle,
 }
 
 impl Default for SocketState {
     fn default() -> Self {
-        let (sender, receiver) = flume::unbounded();
+        let (sender, receiver) = flume::bounded(1);
         Self {
             readable: true,
             writable: true,
             events: receiver,
-            handle: SocketStateHandle { sender },
+            handle: SocketStateHandle {
+                sender,
+                pending: Arc::new(AtomicU8::new(0)),
+            },
         }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct SocketStateHandle {
-    sender: Sender<SocketEvent>,
+    sender: Sender<()>,
+    pending: Arc<AtomicU8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,7 +60,7 @@ impl SocketState {
 
     pub(crate) fn wait(&mut self) {
         match self.events.recv() {
-            Ok(event) => self.handle_event(event),
+            Ok(()) => self.apply_pending(),
             Err(err) => error!(?err, "waiting for socket event failed"),
         }
     }
@@ -105,8 +112,18 @@ impl SocketState {
     }
 
     pub(crate) fn poll_events(&mut self) {
-        while let Ok(event) = self.events.try_recv() {
-            self.handle_event(event);
+        if self.events.try_recv().is_ok() {
+            self.apply_pending();
+        }
+    }
+
+    fn apply_pending(&mut self) {
+        let pending = self.handle.pending.swap(0, Ordering::AcqRel);
+        if pending & 1 != 0 {
+            self.handle_event(SocketEvent::Readable);
+        }
+        if pending & 2 != 0 {
+            self.handle_event(SocketEvent::Writable);
         }
     }
 
@@ -136,7 +153,15 @@ impl SocketState {
 
 impl SocketStateHandle {
     pub(crate) fn send(&self, event: SocketEvent) {
-        let _ = self.sender.send(event);
+        let bit = match event {
+            SocketEvent::Readable => 1,
+            SocketEvent::Writable => 2,
+            SocketEvent::Wake => 4,
+        };
+        self.pending.fetch_or(bit, Ordering::Release);
+        // Coalesce notifications, preserving read/write readiness separately.
+        // Never block a reactor or grow a queue when physical I/O stalls.
+        let _ = self.sender.try_send(());
     }
 
     pub(crate) fn wake(&self) {
@@ -151,5 +176,39 @@ impl Wake for SocketStateWaker {
 
     fn wake_by_ref(self: &Arc<Self>) {
         self.handle.send(self.event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn wake_storm_is_bounded_and_preserves_both_readiness_flags() {
+        let mut state = SocketState::default();
+        state.readable = false;
+        state.writable = false;
+        let handle = state.handle();
+        std::thread::scope(|scope| {
+            for event in [
+                SocketEvent::Readable,
+                SocketEvent::Writable,
+                SocketEvent::Wake,
+            ] {
+                let handle = handle.clone();
+                scope.spawn(move || {
+                    for _ in 0..10000 {
+                        handle.send(event);
+                    }
+                });
+            }
+        });
+        assert_eq!(state.events.len(), 1);
+        state.wait();
+        assert!(state.readable && state.writable);
+        assert_eq!(state.events.len(), 0);
+        state.readable = false;
+        handle.send(SocketEvent::Readable);
+        state.poll_events();
+        assert!(state.readable);
     }
 }

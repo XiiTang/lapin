@@ -41,26 +41,27 @@ impl<RK: RuntimeKit + Clone + Send + 'static> SecretUpdate<RK> {
     pub(crate) fn start(&self, internal_rpc: InternalRPCHandle) {
         let secret_update = self.clone();
         let killswitch = self.killswitch.clone();
-        self.runtime.spawn(async move {
-            while let Some(dur) = secret_update.poll_timeout(&killswitch) {
-                secret_update.runtime.sleep(dur).await;
-                match secret_update
-                    .provider
-                    .refresh()
-                    .map_err(|e| Error::from(ErrorKind::AuthProviderError(e)))
-                {
-                    Err(err) => error!(%err, "Failed refreshing secret"),
-                    Ok(token) => {
-                        if let Err(err) = internal_rpc
-                            .update_secret(token, "Automatic periodical refresh".into())
-                            .await
-                        {
-                            error!(%err, "Failed refreshing secret");
+        self.runtime
+            .spawn(internal_rpc.task_scope.clone().wrap(async move {
+                while let Some(dur) = secret_update.poll_timeout(&killswitch) {
+                    secret_update.runtime.sleep(dur).await;
+                    match secret_update
+                        .provider
+                        .refresh()
+                        .map_err(|e| Error::from(ErrorKind::AuthProviderError(e)))
+                    {
+                        Err(err) => error!(%err, "Failed refreshing secret"),
+                        Ok(token) => {
+                            if let Err(err) = internal_rpc
+                                .update_secret(token, "Automatic periodical refresh".into())
+                                .await
+                            {
+                                error!(%err, "Failed refreshing secret");
+                            }
                         }
                     }
                 }
-            }
-        });
+            }));
     }
 
     pub(crate) fn cancel(&self) {

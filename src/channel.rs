@@ -829,13 +829,17 @@ impl Channel {
                     .amqp_client_properties
                     .insert("capabilities".into(), AMQPValue::FieldTable(capabilities));
 
-                let auth_starter = auth_provider
-                    .auth_starter()
-                    .map_err(ErrorKind::AuthProviderError)?;
                 let channel = self.clone();
                 let client_properties = configuration.amqp_client_properties.clone();
+                let guard = AuthenticationGuard(Some(resolver.clone()));
                 self.internal_rpc.spawn(async move {
-                    channel
+                    let auth_starter = match auth_provider.auth_starter_async().await {
+                        Ok(response) => response,
+                        Err(message) => {
+                            return guard.finish(Err(ErrorKind::AuthProviderError(message).into()));
+                        }
+                    };
+                    let result = channel
                         .connection_start_ok(
                             client_properties,
                             mechanism,
@@ -845,7 +849,8 @@ impl Channel {
                             connection,
                             auth_provider,
                         )
-                        .await
+                        .await;
+                    guard.finish(result)
                 });
                 Ok(())
             }
@@ -858,7 +863,7 @@ impl Channel {
         method: protocol::connection::Secure,
         step: ConnectionStep,
     ) -> Result<()> {
-        trace!(?method, "Server sent connection::Secure");
+        trace!("Server sent connection::Secure");
 
         let state = self.connection_status.state();
         if state != ConnectionState::Connecting {
@@ -869,13 +874,18 @@ impl Channel {
             ConnectionStep::StartOk(resolver, connection, auth_provider)
             | ConnectionStep::SecureOk(resolver, connection, auth_provider) => {
                 let channel = self.clone();
-                let response = auth_provider
-                    .continue_auth(method.challenge)
-                    .map_err(ErrorKind::AuthProviderError)?;
+                let guard = AuthenticationGuard(Some(resolver.clone()));
                 self.internal_rpc.spawn(async move {
-                    channel
+                    let response = match auth_provider.continue_auth_async(method.challenge).await {
+                        Ok(response) => response,
+                        Err(message) => {
+                            return guard.finish(Err(ErrorKind::AuthProviderError(message).into()));
+                        }
+                    };
+                    let result = channel
                         .connection_secure_ok(response, resolver, connection, auth_provider)
-                        .await
+                        .await;
+                    guard.finish(result)
                 });
                 Ok(())
             }
@@ -1368,3 +1378,24 @@ impl Channel {
 include!(concat!(env!("OUT_DIR"), "/channel.rs"));
 #[cfg(not(feature = "codegen"))]
 include!("generated/channel.rs");
+
+// A handshake waiter must also finish when its asynchronous authentication
+// future is canceled before the next connection step is installed.
+struct AuthenticationGuard(Option<PromiseResolver<Connection>>);
+impl AuthenticationGuard {
+    fn finish(mut self, result: Result<()>) -> Result<()> {
+        if let Some(resolver) = self.0.take()
+            && let Err(error) = &result
+        {
+            resolver.reject(error.clone());
+        }
+        result
+    }
+}
+impl Drop for AuthenticationGuard {
+    fn drop(&mut self) {
+        if let Some(resolver) = self.0.take() {
+            resolver.reject(std::io::Error::from(std::io::ErrorKind::ConnectionAborted).into());
+        }
+    }
+}

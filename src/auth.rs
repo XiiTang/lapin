@@ -5,6 +5,8 @@ use crate::{
 use amq_protocol::auth::{Credentials, SASLMechanism};
 use std::{
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{Mutex, MutexGuard},
     time::Duration,
 };
@@ -23,10 +25,25 @@ pub trait AuthProvider: Send + Sync + 'static {
 
     /// The answer to the received challenge to forward to the RabbitMQ server (Connection.SecureOk)
     fn continue_auth(&self, challenge: LongString) -> Result<LongString, String> {
-        Err(format!(
-            "Received Connection.Secure with challenge '{challenge}' but we don't know how to handle it for {0}.",
-            self.mechanism(),
-        ))
+        let _ = challenge;
+        Err("Authentication continuation is not supported by this provider".into())
+    }
+
+    /// Asynchronous initial authentication, for caller-owned native interaction.
+    /// The driver cancels this future when its task scope stops.
+    fn auth_starter_async(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<LongString, String>> + Send + '_>> {
+        Box::pin(async move { self.auth_starter() })
+    }
+
+    /// Asynchronous continuation of the same authentication exchange.
+    /// The challenge and result must remain private to the authentication provider.
+    fn continue_auth_async(
+        &self,
+        challenge: LongString,
+    ) -> Pin<Box<dyn Future<Output = Result<LongString, String>> + Send + '_>> {
+        Box::pin(async move { self.continue_auth(challenge) })
     }
 
     /// How long is the current session/token valid for? None means no expiration.
