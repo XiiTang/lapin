@@ -56,7 +56,7 @@ futures-io = "^0.3"
 
 [dependencies.amq-protocol]
 git = "https://github.com/XiiTang/amq-protocol"
-rev = "4e27db43291f2f845cb9dec56e4f4dd5c597db53"
+rev = "de2feaa979724a30af28cbb2d94a0c4fd74e916f"
 default-features = false
 
 [dependencies.async-rs]
