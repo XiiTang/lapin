@@ -1,5 +1,5 @@
 use crate::{
-    AsyncTcpStream, ConnectionProperties, ConnectionStatus, Error, Event, Promise, Result,
+    ConnectionProperties, ConnectionStatus, Error, Event, Promise, Result,
     channel::{Channel, Reply},
     channels::Channels,
     configuration::Configuration,
@@ -39,6 +39,61 @@ pub struct Connection {
     events: Events,
     io_loop: ThreadHandle,
     closer: Arc<ConnectionCloser>,
+}
+
+struct ConnectorControl {
+    force_stop: crate::killswitch::KillSwitch,
+    channels: Channels,
+    thread: ThreadHandle,
+    waker: crate::socket_state::SocketStateHandle,
+    rpc: InternalRPCHandle,
+    tasks: crate::task_scope::TaskScope,
+}
+impl ConnectorControl {
+    fn stop(&self) {
+        if self.force_stop.kill() {
+            self.channels.set_connection_error(
+                std::io::Error::from(std::io::ErrorKind::ConnectionAborted).into(),
+            );
+            self.tasks.stop();
+            self.rpc.stop();
+            self.waker.wake();
+        }
+    }
+}
+/// Owner of the physical driver created by `Connection::from_stream`.
+/// Stop and join it before dropping the supplied async task scope. Dropping
+/// this owner requests an immediate stop; it never emits AMQP cleanup commands.
+pub struct ConnectionDriver(ConnectorControl);
+impl ConnectionDriver {
+    /// Stop physical I/O immediately without sending protocol cleanup.
+    pub fn stop(&self) {
+        self.0.stop();
+    }
+    /// Whether physical I/O and all scoped async tasks have exited.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.0.thread.is_finished() && self.0.tasks.is_finished()
+    }
+    /// Join physical I/O and all scoped async tasks. Call on a blocking worker after stop.
+    pub fn join(self) -> Result<()> {
+        let result = self.0.thread.wait("supplied AMQP driver");
+        self.0.tasks.stop();
+        self.0.tasks.wait();
+        result
+    }
+}
+impl fmt::Debug for ConnectionDriver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionDriver")
+            .field("finished", &self.is_finished())
+            .finish_non_exhaustive()
+    }
+}
+impl Drop for ConnectionDriver {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
 }
 
 impl Connection {
@@ -228,18 +283,28 @@ impl Connection {
     /// Drives the AMQP handshake over a transport supplied by the `connect`
     /// closure. Prefer one of the higher-level `connect*` methods unless you
     /// are wrapping a non-standard socket type.
-    pub async fn connector<RK: RuntimeKit + Clone + Send + 'static>(
+    pub async fn connector<
+        RK: RuntimeKit + Clone + Send + 'static,
+        S: futures_io::AsyncRead + futures_io::AsyncWrite + Unpin + Send + 'static,
+    >(
         uri: AMQPUri,
         runtime: Runtime<RK>,
-        connect: impl AsyncFn(
-            AMQPUri,
-            Runtime<RK>,
-        ) -> Result<AsyncTcpStream<<RK as Reactor>::TcpStream>>
-        + Send
-        + Sync
-        + 'static,
+        connect: impl AsyncFn(AMQPUri, Runtime<RK>) -> Result<S> + Send + Sync + 'static,
         options: ConnectionProperties,
     ) -> Result<Self> {
+        let (conn, channel0, _control) = Self::connector_parts(uri, runtime, connect, options)?;
+        conn.start(channel0).await
+    }
+
+    fn connector_parts<
+        RK: RuntimeKit + Clone + Send + 'static,
+        S: futures_io::AsyncRead + futures_io::AsyncWrite + Unpin + Send + 'static,
+    >(
+        uri: AMQPUri,
+        runtime: Runtime<RK>,
+        connect: impl AsyncFn(AMQPUri, Runtime<RK>) -> Result<S> + Send + Sync + 'static,
+        options: ConnectionProperties,
+    ) -> Result<(Self, Channel, ConnectorControl)> {
         let configuration = Configuration::new(&uri, options);
         let status = ConnectionStatus::new(&uri);
         let frames = Frames::default();
@@ -268,6 +333,15 @@ impl Connection {
         );
         let channel0 = channels.channel0();
         let conn = Connection::new(configuration, status, internal_rpc.handle(), events);
+        let force_stop = crate::killswitch::KillSwitch::default();
+        let control = ConnectorControl {
+            force_stop: force_stop.clone(),
+            channels: channels.clone(),
+            thread: conn.io_loop.clone(),
+            waker: socket_state.handle(),
+            rpc: internal_rpc.handle(),
+            tasks: internal_rpc.handle().task_scope.clone(),
+        };
         let io_loop = IoLoop::new(
             conn.status.clone(),
             conn.configuration.negotiated_config.clone(),
@@ -280,11 +354,54 @@ impl Connection {
             connect,
             uri,
             conn.configuration().backoff,
+            force_stop,
         );
 
         internal_rpc.start(channels);
         conn.io_loop.register(io_loop.start()?);
-        conn.start(channel0).await
+        Ok((conn, channel0, control))
+    }
+
+    /// Use exactly one caller-owned stream and an explicit authentication provider.
+    /// The returned owner exists before negotiation is polled, so failed or
+    /// canceled handshakes can be stopped and joined as well. The supplied
+    /// runtime owns all async tasks. No DNS, TLS, reconnection, implicit
+    /// connection close or token refresh is selected by this entry point.
+    pub fn from_stream<
+        RK: RuntimeKit + Clone + Send + 'static,
+        S: futures_io::AsyncRead + futures_io::AsyncWrite + Unpin + Send + 'static,
+    >(
+        uri: AMQPUri,
+        runtime: Runtime<RK>,
+        stream: S,
+        mut options: ConnectionProperties,
+    ) -> Result<(ConnectionDriver, impl Future<Output = Result<Self>> + Send)> {
+        if options.auto_recover
+            || options
+                .auth_provider
+                .as_ref()
+                .is_none_or(|provider| provider.valid_for().is_some())
+        {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"supplied AMQP transport requires explicit authentication without automatic recovery or refresh").into());
+        }
+        options.backoff = backon::ExponentialBuilder::default().with_max_times(0);
+        let stream = std::sync::Mutex::new(Some(stream));
+        let connect = async move |_: AMQPUri, _: Runtime<RK>| {
+            stream
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "supplied AMQP transport was already consumed",
+                    )
+                    .into()
+                })
+        };
+        let (conn, channel0, control) = Self::connector_parts(uri, runtime, connect, options)?;
+        conn.closer.noop();
+        Ok((ConnectionDriver(control), conn.start(channel0)))
     }
 
     pub(crate) async fn start(self, channel0: Channel) -> Result<Self> {

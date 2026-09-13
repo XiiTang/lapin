@@ -240,7 +240,15 @@ impl FrameEntry {
 
 impl fmt::Display for FrameEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.frame.fmt(f)
+        match &self.frame {
+            AMQPFrame::ProtocolHeader(_) => f.write_str("protocol header"),
+            AMQPFrame::Method(channel, _) => write!(f, "method on channel {channel}"),
+            AMQPFrame::Header(channel, _) => write!(f, "content header on channel {channel}"),
+            AMQPFrame::Body(channel, bytes) => {
+                write!(f, "{} body bytes on channel {channel}", bytes.len())
+            }
+            AMQPFrame::Heartbeat | AMQPFrame::InvalidHeartbeat(_) => f.write_str("heartbeat"),
+        }
     }
 }
 
@@ -306,7 +314,7 @@ impl Inner {
     ) {
         let sending = FrameSending::new(Some(canceler), resolver);
         if let Some(error) = self.check_poison(channel_id) {
-            trace!(channel=%channel_id, frame=?frame, "Discarding frame because of poisoning");
+            trace!(channel=%channel_id, "Discarding frame because of poisoning");
             if let Some(reply) = expected_reply {
                 Self::cancel_expected_reply(reply, error.clone());
             }
@@ -337,7 +345,7 @@ impl Inner {
         let last_frame = frames.pop();
 
         if let Some(error) = self.check_poison(channel_id) {
-            trace!(channel=%channel_id, frames=?frames, "Discarding frames because of poisoning");
+            trace!(channel=%channel_id, count=frames.len(), "Discarding frames because of poisoning");
             resolver.reject(error);
             return;
         }

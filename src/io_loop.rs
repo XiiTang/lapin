@@ -1,5 +1,5 @@
 use crate::{
-    AsyncTcpStream, ConnectionState, ConnectionStatus, Error, ErrorKind, Result,
+    ConnectionState, ConnectionStatus, Error, ErrorKind, Result,
     buffer::Buffer,
     channels::Channels,
     configuration::NegotiatedConfig,
@@ -39,10 +39,8 @@ enum Status {
 
 pub(crate) struct IoLoop<
     RK: RuntimeKit + Clone + Send + 'static,
-    C: AsyncFn(AMQPUri, Runtime<RK>) -> Result<AsyncTcpStream<<RK as Reactor>::TcpStream>>
-        + Send
-        + Sync
-        + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    C: AsyncFn(AMQPUri, Runtime<RK>) -> Result<S> + Send + Sync + 'static,
 > {
     connection_status: ConnectionStatus,
     configuration: NegotiatedConfig,
@@ -63,15 +61,14 @@ pub(crate) struct IoLoop<
     serialized_frames: VecDeque<(FrameSize, FrameSending)>,
     half_closed: bool,
     first_connection: bool,
+    force_stop: KillSwitch,
 }
 
 impl<
     RK: RuntimeKit + Clone + Send + 'static,
-    C: AsyncFn(AMQPUri, Runtime<RK>) -> Result<AsyncTcpStream<<RK as Reactor>::TcpStream>>
-        + Send
-        + Sync
-        + 'static,
-> IoLoop<RK, C>
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    C: AsyncFn(AMQPUri, Runtime<RK>) -> Result<S> + Send + Sync + 'static,
+> IoLoop<RK, S, C>
 {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -86,6 +83,7 @@ impl<
         connect: C,
         uri: AMQPUri,
         backoff: ExponentialBuilder,
+        force_stop: KillSwitch,
     ) -> Self {
         let frame_size = std::cmp::max(
             protocol::constants::FRAME_MIN_SIZE,
@@ -113,6 +111,7 @@ impl<
             serialized_frames: VecDeque::default(),
             half_closed: false,
             first_connection: true,
+            force_stop,
         }
     }
 
@@ -178,7 +177,7 @@ impl<
     }
 
     fn should_continue(&self, connection_killswitch: &KillSwitch) -> bool {
-        if self.connection_status.errored() {
+        if self.force_stop.killed() || self.connection_status.errored() {
             return false;
         }
 
@@ -234,6 +233,7 @@ impl<
                         }
                     }
 
+                    if self.force_stop.killed(){break (stream,Ok(()));}
                     let connecting = self.connecting();
                     let reconnect = self.reconnecting();
 
@@ -282,7 +282,7 @@ impl<
 
                 trace!(status=?self.status, connection_status=?self.connection_status.state(), "io_loop entering exit/cleanup phase");
                 self.internal_rpc.stop();
-                if self.heartbeat.killswitch().killed()
+                if !self.force_stop.killed() && self.heartbeat.killswitch().killed()
                     && let Err(err) = self.runtime.block_on(std::future::poll_fn(move |cx| {
                         Pin::new(&mut stream)
                             .poll_close(cx)
@@ -333,6 +333,9 @@ impl<
             self.socket_state.wait();
         }
         self.poll_socket_events();
+        if self.force_stop.killed() {
+            return Ok(());
+        }
         self.attempt_flush(stream.as_mut(), writable_context, connection_killswitch)?;
         self.write(stream.as_mut(), writable_context, connection_killswitch)?;
         self.check_connection_state();
@@ -424,7 +427,7 @@ impl<
         writable_context: &mut Context<'_>,
         connection_killswitch: &KillSwitch,
     ) -> Result<()> {
-        while self.can_write() {
+        while !self.force_stop.killed() && self.can_write() {
             let res =
                 self.write_to_stream(stream.as_mut(), writable_context, connection_killswitch);
             self.handle_io_result(connection_killswitch, res)?;
@@ -438,7 +441,7 @@ impl<
         readable_context: &mut Context<'_>,
         connection_killswitch: &KillSwitch,
     ) -> Result<()> {
-        while self.can_read() {
+        while !self.force_stop.killed() && self.can_read() {
             let res =
                 self.read_from_stream(stream.as_mut(), readable_context, connection_killswitch);
             let stop = res.as_ref().is_ok_and(|stop| *stop);
@@ -662,4 +665,24 @@ fn io_loop_span(connect_span: tracing::Span) -> tracing::Span {
     // connect operation, so we set it as a follows_from relationship.
     span.follows_from(&connect_span);
     span
+}
+
+impl<RK, S, C> Drop for IoLoop<RK, S, C>
+where
+    RK: RuntimeKit + Clone + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    C: AsyncFn(AMQPUri, Runtime<RK>) -> Result<S> + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        // This covers EOF, connector failure and unwind as well as explicit stop.
+        // Resolve library waiters before canceling the RPC task that owns them.
+        if !self.connection_status.closed() && !self.connection_status.errored() {
+            let error = self
+                .frames
+                .poison()
+                .unwrap_or_else(|| io::Error::from(io::ErrorKind::ConnectionAborted).into());
+            self.channels.set_connection_error(error);
+        }
+        self.internal_rpc.task_scope.stop();
+    }
 }

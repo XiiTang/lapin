@@ -38,11 +38,12 @@ impl<RK: RuntimeKit + Clone + Send + 'static> Heartbeat<RK> {
     pub(crate) fn start(&self, internal_rpc: InternalRPCHandle) {
         let heartbeat = self.clone();
         let poison = self.lock_inner().poison.clone();
-        self.runtime.spawn(async move {
-            while let Some(dur) = heartbeat.poll_timeout(&internal_rpc, &poison) {
-                heartbeat.runtime.sleep(dur).await;
-            }
-        });
+        self.runtime
+            .spawn(internal_rpc.task_scope.clone().wrap(async move {
+                while let Some(dur) = heartbeat.poll_timeout(&internal_rpc, &poison) {
+                    heartbeat.runtime.sleep(dur).await;
+                }
+            }));
     }
 
     fn poll_timeout(
