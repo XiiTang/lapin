@@ -616,7 +616,21 @@ impl<
     }
 
     fn parse(&mut self, connection_killswitch: &KillSwitch) -> Result<Option<AMQPFrame>> {
-        match parse_frame(self.receive_buffer.parsing_context()) {
+        let context = self.receive_buffer.parsing_context();
+        let header: Vec<u8> = context.iter().take(7).copied().collect();
+        if header.len() == 7 && header[0] != b'A' {
+            let size = u32::from_be_bytes([header[3], header[4], header[5], header[6]]) as u64 + 8;
+            let maximum = u64::from(self.frame_size);
+            if size > maximum {
+                return self
+                    .critical_error(
+                        connection_killswitch,
+                        ErrorKind::ResourceLimitExceeded.into(),
+                    )
+                    .map(|_| None);
+            }
+        }
+        match parse_frame(context) {
             Ok((i, f)) => {
                 let consumed = self.receive_buffer.offset(i);
                 let frame_max = self.configuration.frame_max() as usize;
@@ -636,7 +650,7 @@ impl<
             }
             Err(e) => {
                 if !e.is_incomplete() {
-                    error!(error=?e, "parse error");
+                    error!("AMQP parse error");
                     self.critical_error(connection_killswitch, ErrorKind::ParsingError(e).into())?;
                 }
                 Ok(None)

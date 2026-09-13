@@ -32,6 +32,13 @@ impl fmt::Debug for ChannelCloser {
 
 impl Drop for ChannelCloser {
     fn drop(&mut self) {
+        if self
+            .internal_rpc
+            .explicit_close
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         if self.status.auto_close(self.id) {
             self.internal_rpc.close_channel(
                 self.id,

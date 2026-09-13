@@ -31,7 +31,11 @@ pub struct ConnectionProperties {
     pub(crate) auth_provider: Option<Arc<dyn AuthProvider>>,
     pub(crate) backoff: ExponentialBuilder,
     pub(crate) auto_recover: bool,
+    pub(crate) recover_topology: bool,
+    pub(crate) recover_consumers: bool,
     backoff_configured: bool,
+    pub(crate) receive_limits: Option<crate::ReceiveLimits>,
+    pub(crate) topology_bytes: Option<usize>,
 }
 
 impl Default for ConnectionProperties {
@@ -42,12 +46,30 @@ impl Default for ConnectionProperties {
             auth_provider: None,
             backoff: ExponentialBuilder::default().with_max_times(0 /* no retry by default */),
             auto_recover: false,
+            recover_topology: true,
+            recover_consumers: true,
             backoff_configured: false,
+            receive_limits: None,
+            topology_bytes: None,
         }
     }
 }
 
 impl ConnectionProperties {
+    /// Limit the total retained topology metadata across all channels.
+    #[must_use]
+    pub fn with_topology_limit(mut self, bytes: usize) -> Self {
+        self.topology_bytes = Some(bytes);
+        self
+    }
+
+    /// Bound all retained deliveries before allocating their bodies.
+    #[must_use]
+    pub fn with_receive_limits(mut self, limits: crate::ReceiveLimits) -> Self {
+        self.receive_limits = Some(limits);
+        self
+    }
+
     /// Override the AMQP locale sent to the server (default: `"en_US"`).
     #[must_use]
     pub fn with_locale(mut self, locale: ShortString) -> Self {
@@ -101,6 +123,17 @@ impl ConnectionProperties {
     ) -> Self {
         self.backoff = conf(self.backoff);
         self.backoff_configured = true;
+        self
+    }
+
+    /// Enable reconnection with explicitly selected topology and consumer recovery.
+    /// The caller must separately configure a finite backoff. Pending publications
+    /// and transactions are never replayed by this setting.
+    #[must_use]
+    pub fn with_recovery(mut self, topology: bool, consumers: bool) -> Self {
+        self.auto_recover = true;
+        self.recover_topology = topology;
+        self.recover_consumers = consumers;
         self
     }
 

@@ -20,9 +20,10 @@ impl BasicGetDelivery {
         &self,
         size: PayloadSize,
         properties: BasicProperties,
+        reservation: Option<crate::limits::Reservation>,
     ) {
         self.lock_inner()
-            .handle_content_header_frame(size, properties);
+            .handle_content_header_frame(size, properties, reservation);
     }
 
     pub(crate) fn handle_body_frame(&self, remaining_size: PayloadSize, payload: Vec<u8>) {
@@ -52,9 +53,15 @@ impl Inner {
         self.0 = Some(InnerData { message, resolver });
     }
 
-    fn handle_content_header_frame(&mut self, size: PayloadSize, properties: BasicProperties) {
+    fn handle_content_header_frame(
+        &mut self,
+        size: PayloadSize,
+        properties: BasicProperties,
+        reservation: Option<crate::limits::Reservation>,
+    ) {
         if let Some(inner) = self.0.as_mut() {
             inner.message.properties = properties;
+            inner.message.reservation = reservation;
         }
         if size == 0 {
             self.new_delivery_complete();

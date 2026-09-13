@@ -22,7 +22,24 @@ use tracing::trace;
 #[derive(Clone)]
 pub struct ChannelStatus(Arc<RwLock<Inner>>);
 
+pub(crate) struct GenerationGuard<'a> {
+    _guard: RwLockReadGuard<'a, Inner>,
+}
 impl ChannelStatus {
+    pub(crate) fn guard_generation(
+        &self,
+        expected: Option<u64>,
+    ) -> Result<Option<GenerationGuard<'_>>> {
+        let Some(expected) = expected else {
+            return Ok(None);
+        };
+        let guard = self.read();
+        if guard.generation != expected {
+            return Err(ErrorKind::StaleGeneration.into());
+        }
+        Ok(Some(GenerationGuard { _guard: guard }))
+    }
+
     pub(crate) fn new(id: ChannelId, internal_rpc: InternalRPCHandle) -> Self {
         Self(Arc::new(RwLock::new(Inner::new(id, internal_rpc))))
     }
@@ -39,7 +56,13 @@ impl ChannelStatus {
         [ChannelState::Closing, ChannelState::Reconnecting].contains(&self.read().state)
     }
 
-    /// Returns `true` if the channel is in [`ChannelState::Connected`] and ready for use.
+    /// Generation of delivery tags and transaction state; changes before recovery.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.read().generation
+    }
+
+    /// Whether this channel currently permits protocol operations.
     #[must_use]
     pub fn connected(&self) -> bool {
         self.read().state == ChannelState::Connected
@@ -118,12 +141,12 @@ impl ChannelStatus {
         &self,
         class_id: Identifier,
         delivery_cause: DeliveryCause,
-    ) -> KillSwitch {
+    ) -> Result<KillSwitch> {
         let mut inner = self.write();
         inner
             .receiver_state
-            .set_will_receive(class_id, delivery_cause);
-        inner.killswitch.clone()
+            .set_will_receive(class_id, delivery_cause)?;
+        Ok(inner.killswitch.clone())
     }
 
     pub(crate) fn set_content_length<
@@ -220,6 +243,7 @@ impl fmt::Debug for ChannelStatus {
 
 struct Inner {
     id: ChannelId,
+    generation: u64,
     confirm: bool,
     send_flow: bool,
     state: ChannelState,
@@ -233,6 +257,7 @@ impl Inner {
     fn new(id: ChannelId, internal_rpc: InternalRPCHandle) -> Self {
         let this = Self {
             id,
+            generation: 0,
             confirm: false,
             send_flow: true,
             state: ChannelState::default(),
@@ -251,6 +276,9 @@ impl Inner {
     }
 
     fn set_reconnecting(&mut self, error: Error, topology: ChannelDefinition) -> Error {
+        if self.state != ChannelState::Reconnecting {
+            self.generation = self.generation.saturating_add(1);
+        }
         self.state = ChannelState::Reconnecting;
         std::mem::take(&mut self.killswitch).kill();
         self.receiver_state.reset();

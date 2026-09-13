@@ -34,6 +34,8 @@ pub(crate) struct InternalRPCHandle {
     sender: Sender<Option<InternalCommand>>,
     waker: SocketStateHandle,
     pub(crate) task_scope: crate::task_scope::TaskScope,
+    pub(crate) explicit_close: Arc<std::sync::atomic::AtomicBool>,
+    overflow: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl InternalRPCHandle {
@@ -239,7 +241,10 @@ impl InternalRPCHandle {
 
     pub(crate) fn stop(&self) {
         trace!("Stopping internal RPC command");
-        let _ = self.sender.send(None);
+        if self.sender.try_send(None).is_err() {
+            self.overflow
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -249,7 +254,10 @@ impl InternalRPCHandle {
     fn send(&self, command: InternalCommand) {
         trace!(?command, "Queuing internal RPC command");
         // The only scenario where this can fail if this is the IoLoop already exited
-        let _ = self.sender.send(Some(command));
+        if self.sender.try_send(Some(command)).is_err() {
+            self.overflow
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         self.waker.wake();
     }
 }
@@ -318,11 +326,13 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
         frames: Frames,
         waker: SocketStateHandle,
     ) -> Self {
-        let (sender, rpc) = flume::unbounded();
+        let (sender, rpc) = flume::bounded(256);
         let handle = InternalRPCHandle {
             sender,
             waker,
             task_scope: Default::default(),
+            explicit_close: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overflow: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         Self {
             rpc,
@@ -386,6 +396,14 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
         };
 
         while let Ok(Some(command)) = rpc.recv_async().await {
+            if self
+                .handle
+                .overflow
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                channels.set_connection_error(ErrorKind::ResourceLimitExceeded.into());
+                break;
+            }
             trace!(?command, "Handling internal RPC command");
             match command {
                 BasicAck(channel_id, delivery_tag, options, resolver, error) => {

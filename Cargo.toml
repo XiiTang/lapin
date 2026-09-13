@@ -47,6 +47,7 @@ version = "^1.0"
 optional = true
 
 [dependencies]
+zeroize = "1.9"
 async-trait = "^0.1.42"
 cfg-if = "^1.0"
 event-listener = "^5.0"
@@ -54,7 +55,8 @@ futures-core = "^0.3"
 futures-io = "^0.3"
 
 [dependencies.amq-protocol]
-version = "^10.5"
+git = "https://github.com/XiiTang/amq-protocol"
+rev = "1a099f781f730d25bd7f49cd4b1befedf1f63eda"
 default-features = false
 
 [dependencies.async-rs]

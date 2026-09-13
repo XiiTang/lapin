@@ -75,6 +75,13 @@ impl ExchangeDefinition {
         routing_key: ShortString,
         arguments: FieldTable,
     ) {
+        if self
+            .bindings
+            .iter()
+            .any(|b| b.source == source && b.routing_key == routing_key && b.arguments == arguments)
+        {
+            return;
+        }
         self.bindings.push(BindingDefinition {
             source,
             routing_key,
@@ -142,6 +149,13 @@ impl QueueDefinition {
         routing_key: ShortString,
         arguments: FieldTable,
     ) {
+        if self
+            .bindings
+            .iter()
+            .any(|b| b.source == source && b.routing_key == routing_key && b.arguments == arguments)
+        {
+            return;
+        }
         self.bindings.push(BindingDefinition {
             source,
             routing_key,

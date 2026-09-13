@@ -7,6 +7,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
+use zeroize::Zeroize;
 
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct Buffer {
@@ -34,6 +35,7 @@ impl Buffer {
     }
 
     pub(crate) fn reset(&mut self) {
+        self.memory.as_mut_slice().zeroize();
         self.position = 0;
         self.end = 0;
         self.available_data = 0;
@@ -107,6 +109,9 @@ impl Buffer {
 
     pub(crate) fn consume(&mut self, count: usize) -> usize {
         let cnt = cmp::min(count, self.available_data());
+        let first = cnt.min(self.capacity - self.position);
+        self.memory[self.position..self.position + first].zeroize();
+        self.memory[..cnt - first].zeroize();
         self.position += cnt;
         self.position %= self.capacity;
         self.available_data -= cnt;
@@ -239,5 +244,11 @@ impl BackToTheBuffer for &mut Buffer {
                 s
             })
         })
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        self.memory.as_mut_slice().zeroize();
     }
 }
