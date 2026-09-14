@@ -961,8 +961,8 @@ impl Channel {
         }
 
         match step {
-            ConnectionStep::StartOk(resolver, connection, _)
-            | ConnectionStep::SecureOk(resolver, connection, _) => {
+            ConnectionStep::StartOk(resolver, connection, auth_provider)
+            | ConnectionStep::SecureOk(resolver, connection, auth_provider) => {
                 self.tune_connection_configuration(
                     method.channel_max,
                     method.frame_max,
@@ -972,17 +972,26 @@ impl Channel {
                 let channel = self.clone();
                 let configuration = self.configuration.clone();
                 let vhost = self.connection_status.vhost();
+                let guard = AuthenticationGuard(Some(resolver.clone()));
                 self.internal_rpc.spawn(async move {
-                    channel
-                        .connection_tune_ok(
-                            configuration.channel_max(),
-                            configuration.frame_max(),
-                            configuration.heartbeat(),
-                        )
-                        .await?;
-                    channel
-                        .connection_open(vhost, Box::new(connection), resolver)
-                        .await
+                    let result = async {
+                        auth_provider
+                            .finish_auth_async()
+                            .await
+                            .map_err(|reason| Error::from(ErrorKind::AuthProviderError(reason)))?;
+                        channel
+                            .connection_tune_ok(
+                                configuration.channel_max(),
+                                configuration.frame_max(),
+                                configuration.heartbeat(),
+                            )
+                            .await?;
+                        channel
+                            .connection_open(vhost, Box::new(connection), resolver)
+                            .await
+                    }
+                    .await;
+                    guard.finish(result)
                 });
                 Ok(())
             }

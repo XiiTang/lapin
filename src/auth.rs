@@ -46,6 +46,12 @@ pub trait AuthProvider: Send + Sync + 'static {
         Box::pin(async move { self.continue_auth(challenge) })
     }
 
+    /// Validate the peer's success transition before sending TuneOk/Open. Stateful
+    /// mechanisms must reject success before their mutual exchange is complete.
+    fn finish_auth_async(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// How long is the current session/token valid for? None means no expiration.
     fn valid_for(&self) -> Option<Duration> {
         None
