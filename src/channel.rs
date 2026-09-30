@@ -399,6 +399,7 @@ impl Channel {
             topology.consumers.clear();
             self.cancel_consumers();
         }
+        let (consumer_prefetch, global_prefetch) = self.status.qos_snapshot();
         // First, reopen the channel
         self.channel_open(self.clone()).await?;
 
@@ -460,8 +461,19 @@ impl Channel {
             }
         }
 
-        // Finally, redeclare all consumers
+        // Restore acknowledged channel QoS before any consumer can receive.
+        if let Some(count) = global_prefetch {
+            self.basic_qos(count, BasicQosOptions { global: true })
+                .await?;
+        }
+        // Consumers created before an explicit QoS retain the broker default.
+        // Recreate those first, before applying limits captured by later ones.
+        topology.consumers.sort_by_key(|consumer| consumer.prefetch);
         for consumer in topology.consumers.iter().cloned() {
+            if let Some(count) = consumer.prefetch {
+                self.basic_qos(count, BasicQosOptions { global: false })
+                    .await?;
+            }
             consumer.reset();
             self.do_basic_consume(
                 consumer.queue().clone(),
@@ -473,6 +485,10 @@ impl Channel {
             .await?;
         }
 
+        if let Some(count) = consumer_prefetch {
+            self.basic_qos(count, BasicQosOptions { global: false })
+                .await?;
+        }
         Ok(())
     }
 
@@ -1282,6 +1298,11 @@ impl Channel {
         }
     }
 
+    fn on_basic_qos_ok_received(&self, prefetch_count: u16, global: bool) -> Result<()> {
+        self.status.qos_confirmed(prefetch_count, global);
+        Ok(())
+    }
+
     fn on_basic_consume_ok_received(
         &self,
         method: protocol::basic::ConsumeOk,
@@ -1293,14 +1314,16 @@ impl Channel {
         original: Option<Consumer>,
     ) -> Result<()> {
         let consumer = original.unwrap_or_else(|| {
-            Consumer::new(
+            let mut consumer = Consumer::new(
                 method.consumer_tag.clone(),
                 self.internal_rpc.clone(),
                 channel_closer,
                 queue,
                 options,
                 arguments,
-            )
+            );
+            consumer.prefetch = self.status.qos_snapshot().0;
+            consumer
         });
         self.consumers
             .register(method.consumer_tag, consumer.clone());
