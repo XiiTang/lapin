@@ -106,6 +106,7 @@ impl ExchangeDefinition {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct QueueDefinition {
     pub(crate) name: ShortString,
+    pub(crate) server_generated: bool,
     pub(crate) options: Option<QueueDeclareOptions>,
     pub(crate) arguments: Option<FieldTable>,
     pub(crate) bindings: Vec<BindingDefinition>,
@@ -116,10 +117,12 @@ impl QueueDefinition {
     pub(crate) fn declared(
         name: ShortString,
         options: QueueDeclareOptions,
+        server_generated: bool,
         arguments: FieldTable,
     ) -> Self {
         Self {
             name,
+            server_generated,
             options: Some(options),
             arguments: Some(arguments),
             bindings: Vec::new(),
@@ -130,6 +133,7 @@ impl QueueDefinition {
     pub(crate) fn undeclared(name: ShortString) -> Self {
         Self {
             name,
+            server_generated: false,
             options: None,
             arguments: None,
             bindings: Vec::new(),

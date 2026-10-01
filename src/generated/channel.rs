@@ -262,7 +262,12 @@ pub(crate) enum Reply {
         ShortString,
         FieldTable,
     ),
-    QueueDeclareOk(PromiseResolver<Queue>, QueueDeclareOptions, FieldTable),
+    QueueDeclareOk(
+        PromiseResolver<Queue>,
+        QueueDeclareOptions,
+        FieldTable,
+        ShortString,
+    ),
     QueueBindOk(
         PromiseResolver<()>,
         ShortString,
@@ -1840,7 +1845,8 @@ impl Channel {
             nowait,
         } = options;
         let (promise, resolver) = Promise::new("queue.declare");
-        let reply = Reply::QueueDeclareOk(resolver.clone(), options, creation_arguments);
+        let reply =
+            Reply::QueueDeclareOk(resolver.clone(), options, creation_arguments, queue.clone());
         let nowait_reply = nowait.then(|| protocol::queue::DeclareOk {
             queue: queue.clone(),
             ..Default::default()
@@ -1876,8 +1882,14 @@ impl Channel {
         match self.frames.find_expected_reply(self.id, |reply| {
             matches!(&reply.0, Reply::QueueDeclareOk(..))
         }) {
-            Some(Reply::QueueDeclareOk(resolver, options, creation_arguments)) => {
-                self.on_queue_declare_ok_received(method, resolver, options, creation_arguments)
+            Some(Reply::QueueDeclareOk(resolver, options, creation_arguments, requested_queue)) => {
+                self.on_queue_declare_ok_received(
+                    method,
+                    resolver,
+                    options,
+                    creation_arguments,
+                    requested_queue,
+                )
             }
             unexpected => self.handle_invalid_contents(
                 format!(

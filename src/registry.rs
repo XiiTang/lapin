@@ -112,15 +112,44 @@ impl Registry {
         name: ShortString,
         options: QueueDeclareOptions,
         arguments: FieldTable,
+        server_generated: bool,
     ) -> crate::Result<()> {
         let mut inner = self.lock_inner();
         if let Some(queue) = inner.queues.get_mut(&name) {
             queue.set_declared(options, arguments);
+            queue.server_generated |= server_generated;
         } else {
             inner.queues.insert(
                 name.clone(),
-                QueueDefinition::declared(name, options, arguments),
+                QueueDefinition::declared(name, options, server_generated, arguments),
             );
+        }
+        drop(inner);
+        self.check_limit()
+    }
+
+    pub(crate) fn remap_queue(
+        &self,
+        previous: &ShortString,
+        current: &ShortString,
+    ) -> crate::Result<()> {
+        if previous == current {
+            return Ok(());
+        }
+        let mut inner = self.lock_inner();
+        if let Some(mut queue) = inner.queues.remove(previous) {
+            queue.name = current.clone();
+            if let Some(existing) = inner.queues.get_mut(current) {
+                for binding in queue.bindings {
+                    existing.register_binding(
+                        binding.source,
+                        binding.routing_key,
+                        binding.arguments,
+                    );
+                }
+            } else {
+                inner.queues.insert(current.clone(), queue);
+            }
         }
         drop(inner);
         self.check_limit()

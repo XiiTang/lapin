@@ -252,6 +252,11 @@
           {
             "name": "creation_arguments",
             "type": "FieldTable"
+          },
+          {
+            "name": "queue",
+            "type": "ShortString",
+            "clone": true
           }
         ],
         "nowait_hook": {

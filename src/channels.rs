@@ -271,8 +271,19 @@ impl Channels {
         trace!("Connection recovered, now recovering channels");
 
         // TODO: use future::join! when stable
+        let mut names = HashMap::new();
+        let mut prepared = Vec::new();
         for channel in channels {
-            channel.start_recovery().await?;
+            let topology = channel.prepare_recovery(&mut names).await?;
+            prepared.push((channel, topology));
+        }
+        for (channel, topology) in prepared {
+            channel.finish_recovery(topology, &names).await?;
+        }
+        for (previous, current) in names {
+            self.events
+                .sender()
+                .queue_recovered(previous.to_string(), current.to_string());
         }
 
         Ok(())

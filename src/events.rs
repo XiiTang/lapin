@@ -101,6 +101,10 @@ impl EventsSender {
         self.send(Event::SendFlow(active));
     }
 
+    pub(crate) fn queue_recovered(&self, previous: String, current: String) {
+        self.send(Event::QueueRecovered { previous, current });
+    }
+
     pub(crate) fn error(&self, error: Error) {
         self.send(Event::Error(error));
     }
@@ -117,6 +121,13 @@ impl EventsSender {
 pub enum Event {
     /// The connection has been established (or re-established after recovery).
     Connected,
+    /// A server-named queue was recreated with a new broker-assigned name.
+    QueueRecovered {
+        /// The prior broker-assigned queue name.
+        previous: String,
+        /// The newly assigned queue name.
+        current: String,
+    },
     /// The broker has blocked the connection due to resource constraints.
     /// The inner string is the human-readable reason supplied by the broker.
     ConnectionBlocked(String),
