@@ -875,6 +875,49 @@ mod tests {
         }
     }
     #[test]
+    fn a_close_for_the_brokers_violation_is_this_clients_and_a_brokers_close_its_own() {
+        use amq_protocol::protocol::channel;
+        let (conn, channels, _) = create_connection();
+        conn.closer.noop();
+        conn.configuration.negotiated_config.set_channel_max(4);
+        let violated = channels.create(conn.closer.clone()).unwrap();
+        violated.set_state(ChannelState::Connected);
+        let _pending = violated.register_publisher_confirm();
+        // The broker acknowledges a delivery tag nothing was published with.
+        let ack = AMQPClass::Basic(basic::AMQPMethod::Ack(basic::Ack {
+            delivery_tag: 7,
+            multiple: false,
+        }));
+        let error = channels
+            .handle_frame(AMQPFrame::Method(violated.id(), ack))
+            .unwrap_err();
+        assert!(
+            matches!(error.kind(), ErrorKind::ProtocolViolation(_)),
+            "{error}"
+        );
+        assert!(!error.is_amqp_error());
+
+        let closed = channels.create(conn.closer.clone()).unwrap();
+        closed.set_state(ChannelState::Connected);
+        let pending = closed.register_publisher_confirm();
+        let close = AMQPClass::Channel(channel::AMQPMethod::Close(channel::Close {
+            reply_code: 406,
+            reply_text: "PRECONDITION_FAILED".into(),
+            class_id: 60,
+            method_id: 40,
+        }));
+        channels
+            .handle_frame(AMQPFrame::Method(closed.id(), close))
+            .unwrap();
+        let error = futures_lite::future::block_on(pending).unwrap_err();
+        assert!(
+            matches!(error.kind(), ErrorKind::ProtocolError(_)),
+            "{error}"
+        );
+        assert!(error.is_amqp_soft_error());
+    }
+
+    #[test]
     fn stale_generation_cannot_enqueue_an_acknowledgement() {
         let (connection, channels, _, frames) = create_connection_with_frames();
         connection.closer.noop();

@@ -41,3 +41,17 @@ cargo clippy --no-default-features --features tokio --lib \
 The embedding IMAPipe tests additionally exercise independent wire peers and an
 isolated RabbitMQ 4.3.5 process. Their exact matrix belongs to IMAPipe's design
 and acceptance documents; these fork tests do not claim other-platform acceptance.
+
+## This client's own protocol closes (`ErrorKind::ProtocolViolation`)
+
+lapin reported both a Channel.Close or Connection.Close the broker sent and a
+close lapin sent itself, because the broker broke the protocol, as
+`ErrorKind::ProtocolError`. A caller could not tell the broker's refusal from
+lapin's verdict on the broker. lapin's three own closes (a connection frame on
+a channel, invalid content and an acknowledgement for a delivery tag nothing
+was published with) now return `ErrorKind::ProtocolViolation` carrying the
+close lapin sent; a received close stays `ProtocolError`, and `is_amqp_error`
+still means only that. Recovery treats both as before. Regression:
+`cargo test --no-default-features --features tokio --lib a_close_for_the_brokers_violation`,
+which fails on the previous commit with the acknowledgement's error reported as
+`ProtocolError`. With it the validation above runs 27 tests (16 unit).

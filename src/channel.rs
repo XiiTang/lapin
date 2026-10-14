@@ -249,7 +249,7 @@ impl Channel {
                 class_id,
                 method_id,
             );
-            Err(ErrorKind::ProtocolError(error).into())
+            Err(ErrorKind::ProtocolViolation(error).into())
         }
     }
 
@@ -357,6 +357,12 @@ impl Channel {
     #[cfg(test)]
     pub(crate) fn register_consumer(&self, tag: ShortString, consumer: Consumer) {
         self.consumers.register(tag, consumer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_publisher_confirm(&self) -> PublisherConfirm {
+        self.status.set_confirm();
+        self.acknowledgements.register_pending()
     }
 
     pub(crate) fn finalize_connection(&self) {
@@ -615,7 +621,7 @@ impl Channel {
             class_id,
             method_id,
         );
-        let error = Error::from(ErrorKind::ProtocolError(error));
+        let error = Error::from(ErrorKind::ProtocolViolation(error));
         self.internal_rpc.set_connection_error(error.clone());
         Err(error)
     }
@@ -741,7 +747,7 @@ impl Channel {
                 )
                 .await
         });
-        Err(ErrorKind::ProtocolError(err).into())
+        Err(ErrorKind::ProtocolViolation(err).into())
     }
 
     fn on_connection_close_ok_sent(&self, error: Error) {

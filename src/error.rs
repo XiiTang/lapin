@@ -49,6 +49,9 @@ pub enum ErrorKind {
     ParsingError(ParserError),
     /// The broker sent an AMQP error (channel or connection level).
     ProtocolError(AMQPError),
+    /// This client closed the channel or connection because the broker broke
+    /// the protocol; the error is the close this client sent.
+    ProtocolViolation(AMQPError),
     /// An AMQP frame could not be serialised.
     SerialisationError(Arc<GenError>),
     /// The authentication provider returned an error.
@@ -157,6 +160,7 @@ impl Error {
             ErrorKind::RuntimeShutdownError(_) => false,
             ErrorKind::ParsingError(_) => false,
             ErrorKind::ProtocolError(_) => true,
+            ErrorKind::ProtocolViolation(_) => true,
             ErrorKind::SerialisationError(_) => false,
             ErrorKind::AuthProviderError(_) => false,
             ErrorKind::FutureCompleted => false,
@@ -199,6 +203,13 @@ impl fmt::Display for Error {
             ErrorKind::RuntimeShutdownError(e) => write!(f, "runtime shutdown error: {e}"),
             ErrorKind::ParsingError(e) => write!(f, "failed to parse: {e}"),
             ErrorKind::ProtocolError(e) => write!(f, "AMQP peer error code {}", e.get_id()),
+            ErrorKind::ProtocolViolation(e) => {
+                write!(
+                    f,
+                    "AMQP peer broke the protocol, closed with code {}",
+                    e.get_id()
+                )
+            }
             ErrorKind::SerialisationError(e) => write!(f, "failed to serialise: {e}"),
             ErrorKind::AuthProviderError(_) => write!(f, "failure during authentication"),
             ErrorKind::FutureCompleted => write!(f, "future polled after completion"),
@@ -219,7 +230,7 @@ impl error::Error for Error {
             ErrorKind::IOError(e) => Some(&**e),
             ErrorKind::RuntimeShutdownError(e) => Some(&**e),
             ErrorKind::ParsingError(e) => Some(e),
-            ErrorKind::ProtocolError(e) => Some(e),
+            ErrorKind::ProtocolError(e) | ErrorKind::ProtocolViolation(e) => Some(e),
             ErrorKind::SerialisationError(e) => Some(&**e),
             _ => None,
         }
@@ -264,6 +275,9 @@ impl PartialEq for Error {
             (RuntimeShutdownError(_), RuntimeShutdownError(_)) => false,
             (ParsingError(left_inner), ParsingError(right_inner)) => left_inner == right_inner,
             (ProtocolError(left_inner), ProtocolError(right_inner)) => left_inner == right_inner,
+            (ProtocolViolation(left_inner), ProtocolViolation(right_inner)) => {
+                left_inner == right_inner
+            }
             (SerialisationError(_), SerialisationError(_)) => false,
             (FutureCompleted, FutureCompleted) => true,
             (NoDefaultRuntime, NoDefaultRuntime) => true,
