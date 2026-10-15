@@ -991,9 +991,9 @@ impl Channel {
                     connection,
                     auth_provider,
                 )),
-                Box::new(resolver),
+                Box::new(resolver.clone()),
             )),
-            None,
+            Some(resolver),
         );
         promise.await
     }
@@ -1030,9 +1030,9 @@ impl Channel {
                     connection,
                     auth_provider,
                 )),
-                Box::new(resolver),
+                Box::new(resolver.clone()),
             )),
-            None,
+            Some(resolver),
         );
         promise.await
     }
@@ -1882,15 +1882,8 @@ impl Channel {
         match self.frames.find_expected_reply(self.id, |reply| {
             matches!(&reply.0, Reply::QueueDeclareOk(..))
         }) {
-            Some(Reply::QueueDeclareOk(resolver, options, creation_arguments, requested_queue)) => {
-                self.on_queue_declare_ok_received(
-                    method,
-                    resolver,
-                    options,
-                    creation_arguments,
-                    requested_queue,
-                )
-            }
+            Some(Reply::QueueDeclareOk(resolver, options, creation_arguments, queue)) => self
+                .on_queue_declare_ok_received(method, resolver, options, creation_arguments, queue),
             unexpected => self.handle_invalid_contents(
                 format!(
                     "unexpected queue declare-ok received on channel {}, was awaiting for {:?}",

@@ -1528,3 +1528,107 @@ impl Drop for AuthenticationGuard {
         }
     }
 }
+
+#[cfg(all(test, feature = "tokio"))]
+mod authentication_step_tests {
+    use super::*;
+    use crate::{
+        ConnectionProperties, configuration::Configuration, events::Events, heartbeat::Heartbeat,
+        internal_rpc::InternalRPC, secret_update::SecretUpdate, socket_state::SocketState,
+    };
+
+    fn channel() -> (Channel, InternalRPC<crate::runtime::DefaultRuntimeKit>) {
+        let runtime = crate::runtime::default_runtime().unwrap();
+        let configuration = Configuration::new(
+            &"amqp://localhost/%2f".parse().unwrap(),
+            ConnectionProperties::default().enable_auto_recover(),
+        );
+        let connection_status = ConnectionStatus::default();
+        let socket = SocketState::default();
+        let frames = Frames::default();
+        let rpc = InternalRPC::new(
+            runtime.clone(),
+            Heartbeat::new(connection_status.clone(), runtime.clone()),
+            SecretUpdate::new(
+                connection_status.clone(),
+                runtime,
+                configuration.auth_provider.clone(),
+            ),
+            frames.clone(),
+            socket.handle(),
+        );
+        let recovery = configuration.recovery_config();
+        let channel = Channel::new(
+            1,
+            configuration.negotiated_config,
+            connection_status,
+            socket.handle(),
+            rpc.handle(),
+            frames,
+            None,
+            recovery,
+            Events::new().sender(),
+        );
+        channel.set_state(ChannelState::Connected);
+        (channel, rpc)
+    }
+
+    #[test]
+    fn authentication_step_waiters_finish_when_their_frames_are_written() {
+        use std::{
+            future::Future,
+            pin::Pin,
+            task::{Context, Poll, Waker},
+        };
+        for secure in [false, true] {
+            let (channel, _rpc) = channel();
+            let uri = "amqp://localhost/%2f".parse().unwrap();
+            let configuration = Configuration::new(&uri, ConnectionProperties::default());
+            let auth = configuration.auth_provider.clone();
+            let connection = Connection::for_reconnect(
+                configuration,
+                channel.connection_status.clone(),
+                channel.internal_rpc.clone(),
+                Events::new(),
+            );
+            let (overall, resolver) = Promise::new("overall handshake");
+            let mut future: Pin<Box<dyn Future<Output = Result<()>>>> = if secure {
+                Box::pin(channel.connection_secure_ok(
+                    "response".into(),
+                    resolver,
+                    connection,
+                    auth,
+                ))
+            } else {
+                Box::pin(channel.connection_start_ok(
+                    FieldTable::default(),
+                    "PLAIN".into(),
+                    "response".into(),
+                    "en_US".into(),
+                    resolver,
+                    connection,
+                    auth,
+                ))
+            };
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            let frame = channel.frames.pop(true).unwrap();
+            frame.into_serialized_frame(1).1.resolve();
+            assert!(
+                matches!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+                "authentication step stayed pending after its frame was written"
+            );
+            assert!(
+                overall.try_wait().is_none(),
+                "writing a step completed the whole handshake"
+            );
+            let step = channel.frames.find_connection_step(channel.id).unwrap();
+            let (resolver, _) = step.into_connection_resolver();
+            resolver.reject(ErrorKind::MissingHeartbeatError.into());
+            assert!(
+                matches!(overall.try_wait(), Some(Err(error)) if matches!(error.kind(), ErrorKind::MissingHeartbeatError))
+            );
+        }
+    }
+
+}

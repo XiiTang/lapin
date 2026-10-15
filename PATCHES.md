@@ -69,3 +69,31 @@ passes (1 test, exit 0) on macOS arm64. The test also confirms tag 1 is reused
 only after pending waiters end and its new acknowledgement succeeds. Upstream's
 acknowledgement reset and futures-channel's sender-drop completion were inspected.
 
+## Complete a promise once, including abandoned resolvers (#63, batch 4)
+
+Only resolver handles count toward liveness; the last unresolved resolver
+rejects with a BrokenPipe error and wakes the waiter. `Shared` keeps completion
+separate from its takeable result, so neither a late resolver nor resolver drop
+can replace an already consumed result. Explicitly rejected causes win over the
+unknown abandoned-resolver fallback. All resolver creation, clones, completion
+and drops use the same locked state. This follows futures-channel's independent
+completion flag and sender-drop wakeup, inspected alongside upstream Promise.
+
+The StartOk and SecureOk callers now complete their step promises at frame-write
+completion, while their separate overall-handshake resolver remains pending.
+Their shared template and generated code change together: otherwise the newly
+observable lost resolver turns an ordinary handshake into a connection error.
+
+Regressions:
+- `cargo test --locked --no-default-features --features tokio --lib promise::tests`:
+  the original fork fails the wakeup and permanent-completion assertions (exit
+  101; 1 passed, 2 failed); the patch passes all 3 (exit 0).
+- `cargo test --locked --no-default-features --features tokio --lib authentication_step_waiters`:
+  the old generated caller fails its post-write completion assertion (exit 101);
+  the patched caller passes for both StartOk and SecureOk (exit 0).
+- `cargo test --locked --no-default-features --features tokio --test connection_retry`:
+  all 3 tests pass (exit 0), including protocol-header retries and normal auth.
+
+Validation is on macOS arm64. Ordering observes wakeup, frame-write completion
+and the separate handshake result, without sleeps in the new tests.
+
