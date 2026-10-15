@@ -18,6 +18,8 @@ struct Inner {
 struct State {
     stopped: bool,
     active: usize,
+    #[cfg(test)]
+    waiters: usize,
 }
 impl TaskScope {
     pub(crate) fn wrap(&self, future: impl Future<Output = ()> + Send + 'static) -> ScopedFuture {
@@ -55,14 +57,31 @@ impl TaskScope {
             .active
             == 0
     }
+    #[cfg(test)]
+    pub(crate) fn is_waiting(&self) -> bool {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiters
+            != 0
+    }
     pub(crate) fn wait(&self) {
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        {
+            state.waiters += 1;
+        }
         while state.active != 0 {
             state = self
                 .0
                 .drained
                 .wait(state)
                 .unwrap_or_else(|e| e.into_inner());
+        }
+        #[cfg(test)]
+        {
+            state.waiters -= 1;
         }
     }
 }

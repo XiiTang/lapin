@@ -112,3 +112,25 @@ get pending (exit 101); completed delivery preservation already passes. With
 the patch all 3 tests pass (exit 0) on macOS arm64. Tests cover clean and error
 closing, closed, connection error, recovery and reset, repeated cancellation,
 first-cause retention, and both partial and completed receive-budget ownership.
+
+## Drain supplied-connection children before an end escapes (#63, batch 4)
+
+`ConnectionDriver::join` now stops its driver, retains an I/O thread panic,
+stops/drains every scoped async child and only then resumes that same panic.
+Supplied establishment uses this same join checkpoint from the supplied
+executor's blocking task before returning a handshake error, leaving the async
+executor free to drain on current-thread runtimes. Fallible I/O thread launch
+precedes RPC startup for supplied transports, so a failed launch accepts no RPC
+child. The ordinary non-supplied connector retains its previous startup path.
+No public API is added. Boundless's custom async-rs Executor owns reading task
+ends; RuntimeParts delegates its Reactor to Tokio without changing lapin.
+
+Regression: `cargo test --locked --no-default-features --features tokio --lib round2_lifecycle`.
+The previous fork fails both held-child cases (exit 101): I/O panic escapes before
+drain, and failed supplied establishment returns before drain. The patch passes
+all 3 tests (exit 0), also checking that failed thread launch starts no RPC work.
+The tests observe a real scope drain waiter while another child remains held,
+then release it and verify the original panic/error. On macOS arm64 the selected
+library, supplied_driver and connection_retry tests pass. Tokio JoinSet's
+owned-result handling and async-rs Executor/TaskImpl were inspected; a blocking
+join is scheduled through the supplied executor rather than blocking its caller.

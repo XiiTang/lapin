@@ -41,6 +41,7 @@ pub struct Connection {
     closer: Arc<ConnectionCloser>,
 }
 
+#[derive(Clone)]
 struct ConnectorControl {
     force_stop: crate::killswitch::KillSwitch,
     channels: Channels,
@@ -50,6 +51,17 @@ struct ConnectorControl {
     tasks: crate::task_scope::TaskScope,
 }
 impl ConnectorControl {
+    fn start_supplied(
+        &self,
+        start_io: impl FnOnce() -> Result<crate::thread::JoinHandle>,
+        start_rpc: impl FnOnce(),
+    ) -> Result<()> {
+        // Do the fallible thread launch before accepting any async child work.
+        self.thread.register(start_io()?);
+        start_rpc();
+        Ok(())
+    }
+
     fn stop(&self) {
         if self.force_stop.kill() {
             self.channels.set_connection_error(
@@ -95,10 +107,16 @@ impl ConnectionDriver {
     }
     /// Join physical I/O and all scoped async tasks. Call on a blocking worker after stop.
     pub fn join(self) -> Result<()> {
-        let result = self.0.thread.wait("supplied AMQP driver");
+        self.0.stop();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.0.thread.wait("supplied AMQP driver")
+        }));
         self.0.tasks.stop();
         self.0.tasks.wait();
-        result
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 }
 impl fmt::Debug for ConnectionDriver {
@@ -313,7 +331,8 @@ impl Connection {
         connect: impl AsyncFn(AMQPUri, Runtime<RK>) -> Result<S> + Send + Sync + 'static,
         options: ConnectionProperties,
     ) -> Result<Self> {
-        let (conn, channel0, _control) = Self::connector_parts(uri, runtime, connect, options)?;
+        let (conn, channel0, _control) =
+            Self::connector_parts(uri, runtime, connect, options, false)?;
         conn.start(channel0).await
     }
 
@@ -325,6 +344,7 @@ impl Connection {
         runtime: Runtime<RK>,
         connect: impl AsyncFn(AMQPUri, Runtime<RK>) -> Result<S> + Send + Sync + 'static,
         options: ConnectionProperties,
+        supplied: bool,
     ) -> Result<(Self, Channel, ConnectorControl)> {
         let configuration = Configuration::new(&uri, options);
         let status = ConnectionStatus::new(&uri);
@@ -379,8 +399,12 @@ impl Connection {
             force_stop,
         );
 
-        internal_rpc.start(channels);
-        conn.io_loop.register(io_loop.start()?);
+        if supplied {
+            control.start_supplied(|| io_loop.start(), || internal_rpc.start(channels))?;
+        } else {
+            internal_rpc.start(channels);
+            conn.io_loop.register(io_loop.start()?);
+        }
         Ok((conn, channel0, control))
     }
 
@@ -421,12 +445,17 @@ impl Connection {
                     .into()
                 })
         };
-        let (conn, channel0, control) = Self::connector_parts(uri, runtime, connect, options)?;
+        let (conn, channel0, control) =
+            Self::connector_parts(uri, runtime.clone(), connect, options, true)?;
         conn.closer.noop();
         conn.internal_rpc
             .explicit_close
             .store(true, std::sync::atomic::Ordering::Release);
-        Ok((ConnectionDriver(control), conn.start(channel0)))
+        let cleanup = control.clone();
+        Ok((
+            ConnectionDriver(control),
+            conn.start_supplied(channel0, cleanup, runtime),
+        ))
     }
 
     /// Start a caller-owned connector under declared retry and recovery policy.
@@ -451,12 +480,37 @@ impl Connection {
             )
             .into());
         }
-        let (conn, channel0, control) = Self::connector_parts(uri, runtime, connect, options)?;
+        let (conn, channel0, control) =
+            Self::connector_parts(uri, runtime.clone(), connect, options, true)?;
         conn.closer.noop();
         conn.internal_rpc
             .explicit_close
             .store(true, std::sync::atomic::Ordering::Release);
-        Ok((ConnectionDriver(control), conn.start(channel0)))
+        let cleanup = control.clone();
+        Ok((
+            ConnectionDriver(control),
+            conn.start_supplied(channel0, cleanup, runtime),
+        ))
+    }
+
+    async fn start_supplied<RK: RuntimeKit + Clone + Send + 'static>(
+        self,
+        channel0: Channel,
+        control: ConnectorControl,
+        runtime: Runtime<RK>,
+    ) -> Result<Self> {
+        let result = self.start(channel0).await;
+        if result.is_err() {
+            control.stop();
+            // Keep the calling executor free to finish the scoped async children.
+            if let Err(error) = runtime
+                .spawn_blocking(move || ConnectionDriver(control).join())
+                .await
+            {
+                tracing::error!(?error, "Failed to join supplied AMQP establishment cleanup");
+            }
+        }
+        result
     }
 
     pub(crate) async fn start(self, channel0: Channel) -> Result<Self> {
@@ -937,5 +991,148 @@ mod tests {
             ErrorKind::StaleGeneration
         ));
         assert!(!frames.has_pending());
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod round2_lifecycle {
+    use super::*;
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        time::Duration,
+    };
+
+    struct External;
+    impl crate::auth::AuthProvider for External {}
+
+    fn driver() -> (ConnectionDriver, InternalRPC<async_rs::Tokio>) {
+        let rt = Runtime::tokio_current();
+        let uri = "amqp://localhost/%2f".parse().unwrap();
+        let config = Configuration::new(&uri, ConnectionProperties::default());
+        let status = ConnectionStatus::new(&uri);
+        let socket = SocketState::default();
+        let frames = Frames::default();
+        let rpc = InternalRPC::new(
+            rt.clone(),
+            Heartbeat::new(status.clone(), rt.clone()),
+            SecretUpdate::new(status.clone(), rt, config.auth_provider.clone()),
+            frames.clone(),
+            socket.handle(),
+        );
+        let events = Events::new();
+        let channels = Channels::new(
+            config,
+            status,
+            socket.handle(),
+            rpc.handle(),
+            frames,
+            events,
+        );
+        (
+            ConnectionDriver(ConnectorControl {
+                force_stop: Default::default(),
+                channels,
+                thread: Default::default(),
+                waker: socket.handle(),
+                rpc: rpc.handle(),
+                tasks: rpc.handle().task_scope.clone(),
+            }),
+            rpc,
+        )
+    }
+
+    async fn waiting(scope: &crate::task_scope::TaskScope) {
+        // This deadline detects a hung test; progress is the scope's actual waiter state.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !scope.is_waiting() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_thread_launch_precedes_acceptance_of_rpc_work() {
+        let (driver, _rpc) = driver();
+        let started = std::cell::Cell::new(false);
+        let error = driver
+            .0
+            .start_supplied(
+                || Err(std::io::Error::from(std::io::ErrorKind::Other).into()),
+                || started.set(true),
+            )
+            .unwrap_err();
+        assert!(error.is_io_error());
+        assert!(!started.get());
+        assert!(driver.0.tasks.is_finished());
+    }
+
+    #[tokio::test]
+    async fn join_drains_scoped_tasks_before_resuming_an_io_panic() {
+        let (driver, _rpc) = driver();
+        let scope = driver.0.tasks.clone();
+        let held = scope.wrap(std::future::pending());
+        driver
+            .0
+            .thread
+            .register(std::thread::spawn(|| panic!("I/O thread failure")));
+        let (returned, mut observed) = tokio::sync::oneshot::channel();
+        let join = tokio::task::spawn_blocking(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| driver.join()));
+            let _ = returned.send(());
+            result
+        });
+        let drained_first = tokio::select! {
+            _ = &mut observed => false,
+            _ = waiting(&scope) => true,
+        };
+        drop(held);
+        let panic = join.await.unwrap().unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"I/O thread failure"));
+        assert!(
+            drained_first,
+            "join propagated the panic while a scoped child was still held"
+        );
+        assert!(scope.is_finished());
+    }
+
+    #[tokio::test]
+    async fn failed_supplied_establishment_drains_before_returning_its_error() {
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let gate = std::sync::Mutex::new(Some(gate));
+        let (driver, handshake) = Connection::from_connector(
+            "amqp://localhost/%2f".parse().unwrap(),
+            Runtime::tokio_current(),
+            async move |_, _| {
+                let gate = gate.lock().unwrap().take().unwrap();
+                gate.await.unwrap();
+                Err::<futures_lite::io::Cursor<Vec<u8>>, Error>(
+                    std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into(),
+                )
+            },
+            ConnectionProperties::default().with_auth_provider(External),
+        )
+        .unwrap();
+        let scope = driver.0.tasks.clone();
+        let held = scope.wrap(std::future::pending());
+        let mut handshake = Box::pin(handshake);
+        release.send(()).unwrap();
+        let drained_first = tokio::select! {
+            result = &mut handshake => { assert!(result.is_err()); false },
+            _ = waiting(&scope) => true,
+        };
+        drop(held);
+        if drained_first {
+            assert!(handshake.await.is_err());
+        }
+        let _ = tokio::task::spawn_blocking(move || driver.join())
+            .await
+            .unwrap();
+        assert!(
+            drained_first,
+            "establishment returned an error before draining its scoped child"
+        );
+        assert!(scope.is_finished());
     }
 }
