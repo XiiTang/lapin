@@ -184,9 +184,11 @@ mod tests {
     use super::*;
     #[test]
     fn wake_storm_is_bounded_and_preserves_both_readiness_flags() {
-        let mut state = SocketState::default();
-        state.readable = false;
-        state.writable = false;
+        let mut state = SocketState {
+            readable: false,
+            writable: false,
+            ..SocketState::default()
+        };
         let handle = state.handle();
         std::thread::scope(|scope| {
             for event in [
