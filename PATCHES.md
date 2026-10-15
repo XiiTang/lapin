@@ -134,3 +134,17 @@ then release it and verify the original panic/error. On macOS arm64 the selected
 library, supplied_driver and connection_retry tests pass. Tokio JoinSet's
 owned-result handling and async-rs Executor/TaskImpl were inspected; a blocking
 join is scheduled through the supplied executor rather than blocking its caller.
+
+## Keep publisher-confirm fixtures on the existing Delivery interface (#63 lint)
+
+The publisher_confirms example and its symlinked integration test now build
+expected deliveries through `Delivery::mock`, setting their existing public
+properties and acker fields. The private receive reservation stays owned by the
+constructor. The socket-state wake-storm test initializes its readiness flags
+with its state, removing field_reassign_with_default without weakening the lint.
+
+Regression/check: `cargo clippy --locked --no-default-features --features tokio --all-targets -- -D warnings`.
+Before this fixture-only patch it fails (exit 101) on both Delivery struct
+literals and the socket-state initializer; afterwards it passes (exit 0), on
+macOS arm64. The existing library wake-storm test also passes. No broker test
+is claimed executed by this compile/lint check, and no lint was suppressed.

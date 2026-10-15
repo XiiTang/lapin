@@ -123,19 +123,19 @@ async fn tokio_main() {
         .expect("publisher-confirms");
     assert!(confirm.is_ack());
     let message = confirm.take_message().unwrap();
-    let acker = message.delivery.acker.clone();
+    let mut delivery = Delivery::mock(
+        0,
+        "".into(),
+        "unroutable-routing-key-for-tests".into(),
+        false,
+        payload.to_vec(),
+    );
+    delivery.properties = BasicProperties::default().with_priority(42);
+    delivery.acker = message.delivery.acker.clone();
     assert_eq!(
         message,
         BasicReturnMessage {
-            delivery: Delivery {
-                delivery_tag: 0,
-                exchange: "".into(),
-                routing_key: "unroutable-routing-key-for-tests".into(),
-                redelivered: false,
-                properties: BasicProperties::default().with_priority(42),
-                data: payload.to_vec(),
-                acker,
-            },
+            delivery,
             reply_code: 312,
             reply_text: "NO_ROUTE".into(),
         }
