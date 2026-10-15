@@ -184,7 +184,34 @@ impl Inner {
     }
 
     fn reset(&mut self, error: Error) {
-        self.delivery_tag = IdSequence::new(false);
         self.on_channel_error(error);
+        self.delivery_tag = IdSequence::new(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ErrorKind;
+
+    #[test]
+    fn reset_rejects_the_last_waiter_before_reusing_delivery_tags() {
+        let acknowledgements = Acknowledgements::new(1, ReturnedMessages::default());
+        let _confirm = acknowledgements.register_pending();
+        let last = acknowledgements.get_last_pending().unwrap();
+        acknowledgements.reset(ErrorKind::MissingHeartbeatError.into());
+        assert!(
+            matches!(last.try_wait(), Some(Err(error)) if matches!(error.kind(), ErrorKind::MissingHeartbeatError))
+        );
+        let _next = acknowledgements.register_pending();
+        assert_eq!(
+            acknowledgements.lock_inner().delivery_tag.current(),
+            Some(1)
+        );
+        acknowledgements.ack(1).unwrap();
+        assert!(matches!(
+            acknowledgements.get_last_pending().unwrap().try_wait(),
+            Some(Ok(()))
+        ));
     }
 }

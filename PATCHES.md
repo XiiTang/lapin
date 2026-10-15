@@ -55,3 +55,17 @@ still means only that. Recovery treats both as before. Regression:
 `cargo test --no-default-features --features tokio --lib a_close_for_the_brokers_violation`,
 which fails on the previous commit with the acknowledgement's error reported as
 `ProtocolError`. With it the validation above runs 27 tests (16 unit).
+
+## Reject the last confirmation waiter before resetting tags (#63, batch 4)
+
+`Acknowledgements::reset` now rejects pending confirmations while the old delivery
+sequence still identifies the last waiter, then resets the sequence. Otherwise
+`wait_for_confirms` loses its error resolver and never sees the recovery cause.
+The checkpoint is `Inner::reset`; all acknowledgement resets go through it.
+
+Regression: `cargo test --locked --no-default-features --features tokio --lib reset_rejects_the_last_waiter`.
+The unchanged fork fails the last waiter's result assertion (exit 101); the patch
+passes (1 test, exit 0) on macOS arm64. The test also confirms tag 1 is reused
+only after pending waiters end and its new acknowledgement succeeds. Upstream's
+acknowledgement reset and futures-channel's sender-drop completion were inspected.
+
