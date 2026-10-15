@@ -1,4 +1,6 @@
-use crate::{BasicProperties, PromiseResolver, message::BasicGetMessage, types::PayloadSize};
+use crate::{
+    BasicProperties, Error, PromiseResolver, message::BasicGetMessage, types::PayloadSize,
+};
 use std::{
     fmt,
     sync::{Arc, Mutex, MutexGuard},
@@ -8,6 +10,15 @@ use std::{
 pub(crate) struct BasicGetDelivery(Arc<Mutex<Inner>>);
 
 impl BasicGetDelivery {
+    pub(crate) fn cancel(&self, error: Error) {
+        let pending = self.lock_inner().0.take();
+        if let Some(InnerData { message, resolver }) = pending {
+            // Release the partial body's reservation before waking its waiter.
+            drop(message);
+            resolver.reject(error);
+        }
+    }
+
     pub(crate) fn start_new_delivery(
         &self,
         message: BasicGetMessage,

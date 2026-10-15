@@ -174,6 +174,10 @@ impl Channel {
 
     pub(crate) fn set_closing(&self, error: Option<Error>) {
         self.set_state(ChannelState::Closing);
+        self.basic_get_delivery
+            .cancel(error.clone().unwrap_or_else(|| {
+                ErrorKind::InvalidChannelState(ChannelState::Closing, "channel closing").into()
+            }));
         if let Some(error) = error {
             self.error_publisher_confirms(error.clone());
             self.error_consumers(error); // ignore the returned error here, only happens with default executor if we cannot spawn a thread
@@ -184,6 +188,7 @@ impl Channel {
 
     pub(crate) fn set_closed(&self, error: Error) {
         self.set_state(ChannelState::Closed);
+        self.basic_get_delivery.cancel(error.clone());
         self.error_publisher_confirms(error.clone());
         self.cancel_consumers();
         self.internal_rpc.remove_channel(self.id, error);
@@ -192,6 +197,7 @@ impl Channel {
     // Only called in case of a protocol failure
     pub(crate) fn set_connection_error(&self, error: Error) {
         self.set_state(ChannelState::Error);
+        self.basic_get_delivery.cancel(error.clone());
         self.error_publisher_confirms(error.clone());
         self.error_consumers(error.clone());
         self.internal_rpc.remove_channel(self.id, error.clone());
@@ -371,6 +377,7 @@ impl Channel {
 
     pub(crate) fn init_recovery(&self, error: Error) -> Error {
         let err = self.status.set_reconnecting(error, self.topology());
+        self.basic_get_delivery.cancel(err.clone());
         self.frames.drop_frames_for_channel(self.id, err.clone());
         self.poison(err.clone());
         err
@@ -382,6 +389,7 @@ impl Channel {
 
     pub(crate) fn update_recovery(&self) -> Option<ChannelDefinition> {
         self.status.update_recovery_context(|ctx| {
+            self.basic_get_delivery.cancel(ctx.cause());
             // Cleanup any pending expecting reply
             ctx.set_expected_replies(self.frames.take_expected_replies(self.id));
             // Also reset the acknowledgements state for this channel
@@ -1530,6 +1538,162 @@ impl Drop for AuthenticationGuard {
 }
 
 #[cfg(all(test, feature = "tokio"))]
+mod partial_get_tests {
+    use super::*;
+    use crate::{
+        ConnectionProperties, configuration::Configuration, events::Events, heartbeat::Heartbeat,
+        internal_rpc::InternalRPC, secret_update::SecretUpdate, socket_state::SocketState,
+    };
+
+    fn channel() -> (Channel, InternalRPC<crate::runtime::DefaultRuntimeKit>) {
+        let runtime = crate::runtime::default_runtime().unwrap();
+        let configuration = Configuration::new(
+            &"amqp://localhost/%2f".parse().unwrap(),
+            ConnectionProperties::default().enable_auto_recover(),
+        );
+        let connection_status = ConnectionStatus::default();
+        let socket = SocketState::default();
+        let frames = Frames::default();
+        let rpc = InternalRPC::new(
+            runtime.clone(),
+            Heartbeat::new(connection_status.clone(), runtime.clone()),
+            SecretUpdate::new(
+                connection_status.clone(),
+                runtime,
+                configuration.auth_provider.clone(),
+            ),
+            frames.clone(),
+            socket.handle(),
+        );
+        let recovery = configuration.recovery_config();
+        let channel = Channel::new(
+            1,
+            configuration.negotiated_config,
+            connection_status,
+            socket.handle(),
+            rpc.handle(),
+            frames,
+            None,
+            recovery,
+            Events::new().sender(),
+        );
+        channel.set_state(ChannelState::Connected);
+        (channel, rpc)
+    }
+
+    fn partial(channel: &Channel) -> (Promise<Option<BasicGetMessage>>, crate::limits::Budget) {
+        let (promise, resolver) = Promise::new("partial basic.get");
+        channel
+            .on_basic_get_ok_received(
+                protocol::basic::GetOk {
+                    delivery_tag: 1,
+                    redelivered: false,
+                    exchange: "".into(),
+                    routing_key: "".into(),
+                    message_count: 0,
+                },
+                resolver,
+            )
+            .unwrap();
+        let budget = crate::limits::Budget::new(crate::ReceiveLimits {
+            message_bytes: 4,
+            retained_bytes: 4,
+            retained_messages: 1,
+        });
+        channel.basic_get_delivery.handle_content_header_frame(
+            4,
+            BasicProperties::default(),
+            Some(budget.reserve(4).unwrap()),
+        );
+        channel.basic_get_delivery.handle_body_frame(2, vec![1, 2]);
+        assert!(promise.try_wait().is_none());
+        assert!(budget.reserve(4).is_err());
+        (promise, budget)
+    }
+
+    #[test]
+    fn partial_get_ends_on_every_channel_terminal_path() {
+        for path in [
+            "closing",
+            "closing_error",
+            "closed",
+            "error",
+            "recovery",
+            "reset",
+        ] {
+            let (channel, _rpc) = channel();
+            let (promise, budget) = partial(&channel);
+            let cause = ErrorKind::MissingHeartbeatError.into();
+            match path {
+                "closing" => channel.set_closing(None),
+                "closing_error" => channel.set_closing(Some(cause)),
+                "closed" => channel.set_closed(cause),
+                "error" => channel.set_connection_error(cause),
+                "recovery" => {
+                    channel.init_recovery(cause);
+                }
+                "reset" => {
+                    channel.status.set_reconnecting(cause, channel.topology());
+                    channel.update_recovery();
+                }
+                _ => unreachable!(),
+            }
+            let result = promise
+                .try_wait()
+                .unwrap_or_else(|| panic!("{path} left basic.get pending"));
+            let error = result.unwrap_err();
+            if path == "closing" {
+                assert!(matches!(
+                    error.kind(),
+                    ErrorKind::InvalidChannelState(ChannelState::Closing, _)
+                ));
+            } else {
+                assert!(
+                    matches!(error.kind(), ErrorKind::MissingHeartbeatError),
+                    "{path} lost the known cause: {error:?}"
+                );
+            }
+            assert!(
+                budget.reserve(4).is_ok(),
+                "{path} retained the partial body"
+            );
+            channel.set_closed(ErrorKind::StaleGeneration.into());
+            assert!(promise.try_wait().is_none(), "{path} completed twice");
+        }
+    }
+
+    #[test]
+    fn a_completed_get_survives_channel_failure() {
+        let (channel, _rpc) = channel();
+        let (promise, budget) = partial(&channel);
+        channel.basic_get_delivery.handle_body_frame(0, vec![3, 4]);
+        channel.set_connection_error(ErrorKind::MissingHeartbeatError.into());
+        let message = promise.try_wait().unwrap().unwrap().unwrap();
+        assert_eq!(message.data, [1, 2, 3, 4]);
+        assert!(budget.reserve(4).is_err());
+        drop(message);
+        assert!(budget.reserve(4).is_ok());
+    }
+
+    #[test]
+    fn partial_get_cancellation_releases_once_and_preserves_its_first_cause() {
+        let (channel, _rpc) = channel();
+        let (promise, budget) = partial(&channel);
+        channel
+            .basic_get_delivery
+            .cancel(ErrorKind::MissingHeartbeatError.into());
+        channel
+            .basic_get_delivery
+            .cancel(ErrorKind::StaleGeneration.into());
+        assert!(budget.reserve(4).is_ok());
+        assert!(
+            matches!(promise.try_wait(), Some(Err(error)) if matches!(error.kind(), ErrorKind::MissingHeartbeatError))
+        );
+        assert!(promise.try_wait().is_none());
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
 mod authentication_step_tests {
     use super::*;
     use crate::{
@@ -1630,5 +1794,4 @@ mod authentication_step_tests {
             );
         }
     }
-
 }

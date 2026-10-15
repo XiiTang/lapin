@@ -97,3 +97,18 @@ Regressions:
 Validation is on macOS arm64. Ordering observes wakeup, frame-write completion
 and the separate handshake result, without sleeps in the new tests.
 
+## End partial basic.get deliveries with their channel (#63, batch 4)
+
+`BasicGetDelivery::cancel` takes the partial message once, releases its receive
+reservation and rejects its resolver with the channel's known cause. Every
+channel close, connection error, recovery initialization and recovery reset
+calls that checkpoint. Completed messages keep their result and reservation
+until the recipient drops them. Upstream content assembly and consumer cleanup
+were inspected; this uses their existing take-and-reject ownership pattern.
+
+Regression: `cargo test --locked --no-default-features --features tokio --lib partial_get_tests`.
+On the preceding fork the terminal-path test fails because closing leaves the
+get pending (exit 101); completed delivery preservation already passes. With
+the patch all 3 tests pass (exit 0) on macOS arm64. Tests cover clean and error
+closing, closed, connection error, recovery and reset, repeated cancellation,
+first-cause retention, and both partial and completed receive-budget ownership.
