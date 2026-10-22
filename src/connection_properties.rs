@@ -36,6 +36,7 @@ pub struct ConnectionProperties {
     backoff_configured: bool,
     pub(crate) receive_limits: Option<crate::ReceiveLimits>,
     pub(crate) topology_bytes: Option<usize>,
+    pub(crate) collect_topology: bool,
 }
 
 impl Default for ConnectionProperties {
@@ -51,11 +52,24 @@ impl Default for ConnectionProperties {
             backoff_configured: false,
             receive_limits: None,
             topology_bytes: None,
+            collect_topology: true,
         }
     }
 }
 
 impl ConnectionProperties {
+    /// Collect exchange and queue declarations and bindings for recovery (default: `true`).
+    ///
+    /// When `false`, the registry retains no exchange or queue topology, even if
+    /// automatic recovery is enabled. Recovery then restores no exchanges, queues
+    /// or bindings. Returned queue facts and live consumer routing remain available;
+    /// consumer recovery is still controlled separately.
+    #[must_use]
+    pub fn with_topology_collection(mut self, enabled: bool) -> Self {
+        self.collect_topology = enabled;
+        self
+    }
+
     /// Limit the total retained topology metadata across all channels.
     #[must_use]
     pub fn with_topology_limit(mut self, bytes: usize) -> Self {
@@ -171,6 +185,7 @@ impl fmt::Debug for ConnectionProperties {
             .field("client_properties", &self.client_properties)
             .field("backoff", &self.backoff)
             .field("auto_recover", &self.auto_recover)
+            .field("collect_topology", &self.collect_topology)
             .finish()
     }
 }

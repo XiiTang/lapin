@@ -46,6 +46,7 @@ impl Configuration {
                 uri,
                 options.receive_limits,
                 options.topology_bytes,
+                options.collect_topology,
             ),
             auto_recover,
             recover_topology: options.recover_topology,
@@ -106,6 +107,7 @@ pub(crate) struct NegotiatedConfig {
     inner: Arc<RwLock<Inner>>,
     pub(crate) budget: Option<crate::limits::Budget>,
     pub(crate) topology_budget: Option<crate::limits::Budget>,
+    pub(crate) collect_topology: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -122,8 +124,10 @@ impl NegotiatedConfig {
         uri: &AMQPUri,
         limits: Option<crate::ReceiveLimits>,
         topology_bytes: Option<usize>,
+        collect_topology: bool,
     ) -> Self {
         Self {
+            collect_topology,
             budget: limits.map(crate::limits::Budget::new),
             topology_budget: topology_bytes.map(|bytes| {
                 crate::limits::Budget::new(crate::ReceiveLimits {

@@ -125,3 +125,36 @@ Before this fixture-only patch it fails (exit 101) on both Delivery struct
 literals and the socket-state initializer; afterwards it passes (exit 0), on
 macOS arm64. The existing library wake-storm test also passes. No broker test
 is claimed executed by this compile/lint check, and no lint was suppressed.
+
+## Disable duplicate topology collection at Registry (protocol plan W1b)
+
+The protocol plan's W1b cutover disables lapin automatic recovery and duplicate
+topology collection. Boundless's journal owns restoration once W7d adds explicit
+reconnect.
+`ConnectionProperties::with_topology_collection(bool)` defaults to `true` for
+existing callers. Setting it to `false` makes every Registry declaration,
+binding and queue-remapping growth path a no-op and topology extraction empty.
+This includes bindings to externally managed exchanges and queues that were
+never declared through the connection. Disabled collection reserves no topology
+budget, so a successful broker result cannot fail because of metadata retention.
+
+The flag is authoritative even with automatic recovery enabled: recovery then
+restores no exchanges, queues or bindings. This combination is accepted.
+QueueDeclareOk still returns the broker's queue name and counts, and ConsumeOk
+still establishes live consumer routing. Consumer recovery remains separately
+configured. Boundless's pin and connection construction change in its later work;
+this patch changes only the fork.
+
+Registry regressions inspect private storage and reservations, cloned registries,
+external bindings and queue remapping in both modes. Channel regressions dispatch
+protocol replies through the expected-reply machinery, check caller results and
+a routed delivery, and inspect recovery snapshots with collection disabled in
+both recovery-builder orders. These tests require no running RabbitMQ instance.
+
+Regression: `cargo test --locked --no-default-features --features tokio --lib -- registry::tests channel::`.
+All 8 tests pass (exit 0) on macOS arm64, including the existing channel
+authentication and partial-get regressions. The new tests establish empty
+storage with no limit or a zero limit, preserved broker results and routing,
+empty exchange/queue recovery snapshots, and unchanged default collection.
+`cargo clippy --locked --no-default-features --features tokio --lib -- -D warnings`
+and `cargo fmt --all -- --check` also pass (both exit 0).

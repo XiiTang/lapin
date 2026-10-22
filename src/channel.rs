@@ -123,7 +123,10 @@ impl Channel {
         Self {
             id: channel_id,
             expected_generation: None,
-            local_registry: Registry::new(configuration.topology_budget.clone()),
+            local_registry: Registry::new(
+                configuration.collect_topology,
+                configuration.topology_budget.clone(),
+            ),
             configuration,
             status,
             connection_status,
@@ -1536,6 +1539,9 @@ impl Drop for AuthenticationGuard {
         }
     }
 }
+
+#[cfg(all(test, feature = "tokio"))]
+mod topology_collection_tests;
 
 #[cfg(all(test, feature = "tokio"))]
 mod partial_get_tests {
