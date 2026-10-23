@@ -177,3 +177,27 @@ and Cargo.lock. That fork refreshes its own webpki and root-certificate locks;
 its protocol implementation is unchanged. The webpki 0.103.16 and roots
 1.0.10 resolutions above remain fixed. Regression coverage: the complete
 Tokio-enabled library suite and Boundless's complete AMQP library tests.
+
+## Report the receive or queue bound that was exceeded (#201, W11e)
+
+`ResourceLimitExceeded` previously discarded which check failed, so an embedding
+application could report a single oversized body, a retained delivery count, an
+event queue or an internal RPC queue as retained body bytes. It now carries a
+`ResourceLimit`, the actual maximum and the attempted total when representable.
+`Budget::reserve` checks one body's advertised bytes before aggregate bytes and
+delivery count; queue owners supply their own count bounds. Reservation ownership,
+queue sizes and non-recoverability are unchanged. Topology collection is outside
+this patch.
+
+`IoLoop::parse` reports an oversized peer frame as `FrameTooLarge`, retaining
+its whole advertised size and the receiving maximum. This keeps a malformed peer
+response distinct from local resource exhaustion, including the negotiated-frame
+check after parsing. Boundless maps these errors only at `amqp::Native::lapin`.
+
+Regressions (macOS arm64): `cargo test --locked --no-default-features --features
+tokio --lib limits::` checks the exact three body/delivery limits and release;
+`cargo test --locked --no-default-features --features tokio --lib queue_reports`
+fills both real queues and checks their exact count failures. Boundless's
+`oversized_content_is_rejected_before_body_allocation` checks the body's own limit;
+`an_oversized_peer_frame_is_an_invalid_response_before_its_body_arrives` sends only
+an over-limit frame header and checks the program-visible peer failure.

@@ -61,7 +61,21 @@ pub enum ErrorKind {
     /// No default async runtime is available (no runtime feature flag was enabled).
     NoDefaultRuntime,
     /// A configured local allocation or queue bound was exceeded. Never recoverable.
-    ResourceLimitExceeded,
+    ResourceLimitExceeded {
+        /// The local bound that refused the value.
+        limit: crate::ResourceLimit,
+        /// The configured maximum, in the limit's units.
+        maximum: u64,
+        /// The attempted total, when representable.
+        observed: Option<u64>,
+    },
+    /// A peer advertised a frame exceeding the receiving frame limit.
+    FrameTooLarge {
+        /// The maximum whole frame size, including its header and end marker.
+        maximum: u64,
+        /// The whole frame size advertised by the peer.
+        observed: u64,
+    },
     /// An operation belongs to an invalidated channel generation.
     StaleGeneration,
 
@@ -165,7 +179,8 @@ impl Error {
             ErrorKind::AuthProviderError(_) => false,
             ErrorKind::FutureCompleted => false,
             ErrorKind::NoDefaultRuntime
-            | ErrorKind::ResourceLimitExceeded
+            | ErrorKind::ResourceLimitExceeded { .. }
+            | ErrorKind::FrameTooLarge { .. }
             | ErrorKind::StaleGeneration => false,
 
             ErrorKind::MissingHeartbeatError => true,
@@ -214,7 +229,20 @@ impl fmt::Display for Error {
             ErrorKind::AuthProviderError(_) => write!(f, "failure during authentication"),
             ErrorKind::FutureCompleted => write!(f, "future polled after completion"),
             ErrorKind::NoDefaultRuntime => write!(f, "no default configured runtime"),
-            ErrorKind::ResourceLimitExceeded => write!(f, "AMQP resource limit exceeded"),
+            ErrorKind::ResourceLimitExceeded {
+                limit,
+                maximum,
+                observed,
+            } => {
+                write!(f, "AMQP {limit:?} limit {maximum} exceeded")?;
+                if let Some(observed) = observed {
+                    write!(f, ": {observed}")?;
+                }
+                Ok(())
+            }
+            ErrorKind::FrameTooLarge { maximum, observed } => {
+                write!(f, "AMQP peer frame size {observed} exceeds {maximum}")
+            }
             ErrorKind::StaleGeneration => write!(f, "AMQP channel generation is stale"),
 
             ErrorKind::MissingHeartbeatError => {

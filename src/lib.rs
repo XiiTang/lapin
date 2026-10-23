@@ -209,7 +209,7 @@ mod io_loop;
 mod killswitch;
 mod limits;
 mod listener;
-pub use limits::ReceiveLimits;
+pub use limits::{ReceiveLimits, ResourceLimit};
 mod notifier;
 mod parsing;
 mod promise;

@@ -10,6 +10,12 @@ use std::{
     task::{Context, Poll},
 };
 
+const EVENT_QUEUE_MESSAGES: usize = 64;
+fn overflow_error() -> Error {
+    crate::ResourceLimit::EventQueueMessages
+        .exceeded(EVENT_QUEUE_MESSAGES, Some(EVENT_QUEUE_MESSAGES as u64 + 1))
+}
+
 #[derive(Clone, Debug)]
 // Wrap in an arc not to tamper with receiver count
 pub(crate) struct Events(Arc<Inner>);
@@ -24,7 +30,7 @@ struct Inner {
 
 impl Events {
     pub(crate) fn new() -> Self {
-        let (sender, receiver) = flume::bounded(64);
+        let (sender, receiver) = flume::bounded(EVENT_QUEUE_MESSAGES);
         Self(Arc::new(Inner {
             sender,
             receiver,
@@ -62,9 +68,7 @@ impl Stream for EventStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Event>> {
         if self.inner.overflow.load(Ordering::Acquire) && !self.reported {
             self.reported = true;
-            return Poll::Ready(Some(Event::Error(
-                crate::ErrorKind::ResourceLimitExceeded.into(),
-            )));
+            return Poll::Ready(Some(Event::Error(overflow_error())));
         }
         Pin::new(&mut self.stream).poll_next(cx)
     }
@@ -80,7 +84,7 @@ impl EventsSender {
                 && !self.0.overflow.swap(true, Ordering::AcqRel)
                 && let Some(rpc) = &*self.0.rpc.lock().unwrap_or_else(|e| e.into_inner())
             {
-                rpc.set_connection_error(crate::ErrorKind::ResourceLimitExceeded.into());
+                rpc.set_connection_error(overflow_error());
             }
         }
     }
@@ -138,4 +142,41 @@ pub enum Event {
     SendFlow(bool),
     /// An error occurred on the connection.
     Error(Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn a_full_event_queue_reports_its_message_count() {
+        let events = Events::new();
+        let mut listener = Box::pin(events.listener());
+        for _ in 0..=EVENT_QUEUE_MESSAGES {
+            events.sender().connection_unblocked();
+        }
+        let Event::Error(error) =
+            futures_lite::future::poll_once(futures_lite::StreamExt::next(&mut listener))
+                .await
+                .expect("the full queue must report without waiting")
+                .unwrap()
+        else {
+            panic!("overflow must be reported before the retained events");
+        };
+        assert!(
+            matches!(
+                error.kind(),
+                crate::ErrorKind::ResourceLimitExceeded {
+                    limit: crate::ResourceLimit::EventQueueMessages,
+                    maximum: 64,
+                    observed: Some(65),
+                }
+            ),
+            "{error}"
+        );
+        assert!(!error.can_be_recovered());
+        assert!(matches!(
+            futures_lite::future::poll_once(futures_lite::StreamExt::next(&mut listener)).await,
+            Some(Some(Event::ConnectionUnblocked))
+        ));
+    }
 }

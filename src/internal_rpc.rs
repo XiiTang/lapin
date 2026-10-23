@@ -19,6 +19,8 @@ use flume::{Receiver, Sender};
 use std::{collections::HashMap, fmt, future::Future, sync::Arc, time::Duration};
 use tracing::{debug, trace};
 
+const INTERNAL_RPC_QUEUE_MESSAGES: usize = 256;
+
 pub(crate) struct InternalRPC<RK: RuntimeKit + Clone + Send + 'static> {
     rpc: Receiver<Option<InternalCommand>>,
     handle: InternalRPCHandle,
@@ -326,7 +328,7 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
         frames: Frames,
         waker: SocketStateHandle,
     ) -> Self {
-        let (sender, rpc) = flume::bounded(256);
+        let (sender, rpc) = flume::bounded(INTERNAL_RPC_QUEUE_MESSAGES);
         let handle = InternalRPCHandle {
             sender,
             waker,
@@ -401,7 +403,12 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                 .overflow
                 .load(std::sync::atomic::Ordering::Acquire)
             {
-                channels.set_connection_error(ErrorKind::ResourceLimitExceeded.into());
+                channels.set_connection_error(
+                    crate::ResourceLimit::InternalRpcQueueMessages.exceeded(
+                        INTERNAL_RPC_QUEUE_MESSAGES,
+                        Some(INTERNAL_RPC_QUEUE_MESSAGES as u64 + 1),
+                    ),
+                );
                 break;
             }
             trace!(?command, "Handling internal RPC command");
@@ -581,5 +588,76 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
             self.handle.waker.wake();
         }
         trace!("InternalRPC stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn a_full_internal_rpc_queue_reports_its_command_count() {
+        let runtime = Runtime::tokio_current();
+        let uri = crate::uri::AMQPUri::default();
+        let config = crate::Configuration::new(&uri, crate::ConnectionProperties::default());
+        let status = crate::ConnectionStatus::new(&uri);
+        let socket = crate::socket_state::SocketState::default();
+        let frames = Frames::default();
+        let heartbeat = Heartbeat::new(status.clone(), runtime.clone());
+        let secret_update = SecretUpdate::new(
+            status.clone(),
+            runtime.clone(),
+            config.auth_provider.clone(),
+        );
+        let rpc = InternalRPC::new(
+            runtime,
+            heartbeat,
+            secret_update,
+            frames.clone(),
+            socket.handle(),
+        );
+        let events = crate::events::Events::new();
+        let mut listener = Box::pin(events.listener());
+        let channels = Channels::new(
+            config,
+            status.clone(),
+            socket.handle(),
+            rpc.handle(),
+            frames,
+            events,
+        );
+        // Channel creation queued its status command already; fill the queue
+        // before polling its owner, so the exhaustion is deterministic.
+        let handle = rpc.handle();
+        while !handle.sender.is_full() {
+            handle.send_heartbeat();
+        }
+        handle.send_heartbeat();
+        assert!(
+            futures_lite::future::poll_once(rpc.run(channels))
+                .await
+                .is_some(),
+            "the full RPC queue must end its owner without waiting"
+        );
+        assert_eq!(status.state(), crate::ConnectionState::Error);
+        let crate::Event::Error(error) =
+            futures_lite::future::poll_once(futures_lite::StreamExt::next(&mut listener))
+                .await
+                .expect("the owner must have published its error")
+                .unwrap()
+        else {
+            panic!("RPC overflow must end the connection");
+        };
+        assert!(
+            matches!(
+                error.kind(),
+                ErrorKind::ResourceLimitExceeded {
+                    limit: crate::ResourceLimit::InternalRpcQueueMessages,
+                    maximum: 256,
+                    observed: Some(257),
+                }
+            ),
+            "{error}"
+        );
+        assert!(!error.can_be_recovered());
     }
 }

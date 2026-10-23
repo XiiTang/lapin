@@ -7,7 +7,7 @@ use crate::{
     heartbeat::Heartbeat,
     internal_rpc::InternalRPCHandle,
     killswitch::KillSwitch,
-    protocol::{self, AMQPError, AMQPHardError},
+    protocol,
     socket_state::SocketState,
     thread::JoinHandle,
     types::FrameSize,
@@ -625,7 +625,11 @@ impl<
                 return self
                     .critical_error(
                         connection_killswitch,
-                        ErrorKind::ResourceLimitExceeded.into(),
+                        ErrorKind::FrameTooLarge {
+                            maximum,
+                            observed: size,
+                        }
+                        .into(),
                     )
                     .map(|_| None);
             }
@@ -636,14 +640,16 @@ impl<
                 let frame_max = self.configuration.frame_max() as usize;
                 if frame_max > 0 && consumed > frame_max {
                     error!(bytes = consumed, "received large frame");
-                    let error = AMQPError::new(
-                        AMQPHardError::FRAMEERROR.into(),
-                        format!("frame too large: {consumed} bytes").into(),
-                    );
-                    self.channels
-                        .channel0()
-                        .report_protocol_violation(error, 0, 0)
-                        .or_else(|err| self.critical_error(connection_killswitch, err))?;
+                    return self
+                        .critical_error(
+                            connection_killswitch,
+                            ErrorKind::FrameTooLarge {
+                                maximum: frame_max as u64,
+                                observed: consumed as u64,
+                            }
+                            .into(),
+                        )
+                        .map(|_| None);
                 }
                 self.receive_buffer.consume(consumed);
                 Ok(Some(f))
