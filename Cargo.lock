@@ -16,11 +16,11 @@ dependencies = [
 [[package]]
 name = "amq-protocol"
 version = "10.6.3"
-source = "git+https://github.com/XiiTang/amq-protocol?rev=de2feaa979724a30af28cbb2d94a0c4fd74e916f#de2feaa979724a30af28cbb2d94a0c4fd74e916f"
+source = "git+https://github.com/XiiTang/amq-protocol?rev=83c33d2497d84653a5ce1ad0402d8d702bf940db#83c33d2497d84653a5ce1ad0402d8d702bf940db"
 dependencies = [
- "amq-protocol-codegen 10.6.3 (git+https://github.com/XiiTang/amq-protocol?rev=de2feaa979724a30af28cbb2d94a0c4fd74e916f)",
+ "amq-protocol-codegen 10.6.3 (git+https://github.com/XiiTang/amq-protocol?rev=83c33d2497d84653a5ce1ad0402d8d702bf940db)",
  "amq-protocol-tcp",
- "amq-protocol-types 10.6.3 (git+https://github.com/XiiTang/amq-protocol?rev=de2feaa979724a30af28cbb2d94a0c4fd74e916f)",
+ "amq-protocol-types 10.6.3 (git+https://github.com/XiiTang/amq-protocol?rev=83c33d2497d84653a5ce1ad0402d8d702bf940db)",
  "amq-protocol-uri",
  "cookie-factory",
  "nom 8.0.0",
@@ -42,9 +42,9 @@ dependencies = [
 [[package]]
 name = "amq-protocol-codegen"
 version = "10.6.3"
-source = "git+https://github.com/XiiTang/amq-protocol?rev=de2feaa979724a30af28cbb2d94a0c4fd74e916f#de2feaa979724a30af28cbb2d94a0c4fd74e916f"
+source = "git+https://github.com/XiiTang/amq-protocol?rev=83c33d2497d84653a5ce1ad0402d8d702bf940db#83c33d2497d84653a5ce1ad0402d8d702bf940db"
 dependencies = [
- "amq-protocol-types 10.6.3 (git+https://github.com/XiiTang/amq-protocol?rev=de2feaa979724a30af28cbb2d94a0c4fd74e916f)",
+ "amq-protocol-types 10.6.3 (git+https://github.com/XiiTang/amq-protocol?rev=83c33d2497d84653a5ce1ad0402d8d702bf940db)",
  "handlebars",
  "serde",
  "serde_json",
@@ -53,7 +53,7 @@ dependencies = [
 [[package]]
 name = "amq-protocol-tcp"
 version = "10.6.3"
-source = "git+https://github.com/XiiTang/amq-protocol?rev=de2feaa979724a30af28cbb2d94a0c4fd74e916f#de2feaa979724a30af28cbb2d94a0c4fd74e916f"
+source = "git+https://github.com/XiiTang/amq-protocol?rev=83c33d2497d84653a5ce1ad0402d8d702bf940db#83c33d2497d84653a5ce1ad0402d8d702bf940db"
 dependencies = [
  "amq-protocol-uri",
  "async-rs",
@@ -77,7 +77,7 @@ dependencies = [
 [[package]]
 name = "amq-protocol-types"
 version = "10.6.3"
-source = "git+https://github.com/XiiTang/amq-protocol?rev=de2feaa979724a30af28cbb2d94a0c4fd74e916f#de2feaa979724a30af28cbb2d94a0c4fd74e916f"
+source = "git+https://github.com/XiiTang/amq-protocol?rev=83c33d2497d84653a5ce1ad0402d8d702bf940db#83c33d2497d84653a5ce1ad0402d8d702bf940db"
 dependencies = [
  "cookie-factory",
  "nom 8.0.0",
@@ -89,9 +89,9 @@ dependencies = [
 [[package]]
 name = "amq-protocol-uri"
 version = "10.6.3"
-source = "git+https://github.com/XiiTang/amq-protocol?rev=de2feaa979724a30af28cbb2d94a0c4fd74e916f#de2feaa979724a30af28cbb2d94a0c4fd74e916f"
+source = "git+https://github.com/XiiTang/amq-protocol?rev=83c33d2497d84653a5ce1ad0402d8d702bf940db#83c33d2497d84653a5ce1ad0402d8d702bf940db"
 dependencies = [
- "amq-protocol-types 10.6.3 (git+https://github.com/XiiTang/amq-protocol?rev=de2feaa979724a30af28cbb2d94a0c4fd74e916f)",
+ "amq-protocol-types 10.6.3 (git+https://github.com/XiiTang/amq-protocol?rev=83c33d2497d84653a5ce1ad0402d8d702bf940db)",
  "percent-encoding",
  "url",
 ]
@@ -2008,9 +2008,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -2670,9 +2670,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]

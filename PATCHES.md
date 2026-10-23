@@ -158,3 +158,22 @@ storage with no limit or a zero limit, preserved broker results and routing,
 empty exchange/queue recovery snapshots, and unchanged default collection.
 `cargo clippy --locked --no-default-features --features tokio --lib -- -D warnings`
 and `cargo fmt --all -- --check` also pass (both exit 0).
+
+## Refresh locked certificate verification dependencies (#312)
+
+Update the fork lockfile's rustls-webpki 0.103.15 to 0.103.16 and
+webpki-root-certs 1.0.9 to 1.0.10, the smallest patched releases for
+RUSTSEC-2026-0382 and RUSTSEC-2026-0383. They reject distrusted emSign
+intermediates and remove the affected bundled trust anchors. The manifest's
+compatible dependency constraints and lapin behavior are unchanged.
+
+Regression coverage: the Tokio-only lapin library suite and Boundless's
+AMQP module, with the main lockfile resolving the same fixed TLS packages.
+
+## Keep the advisory-fixed AMQP source in the pin closure (#312)
+
+Pin amq-protocol 83c33d2497d84653a5ce1ad0402d8d702bf940db in Cargo.toml
+and Cargo.lock. That fork refreshes its own webpki and root-certificate locks;
+its protocol implementation is unchanged. The webpki 0.103.16 and roots
+1.0.10 resolutions above remain fixed. Regression coverage: the complete
+Tokio-enabled library suite and Boundless's complete AMQP library tests.
