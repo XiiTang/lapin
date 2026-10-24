@@ -1,5 +1,5 @@
 use crate::{
-    Error, ErrorKind, Result,
+    Error, ErrorKind, RemoteClose, Result,
     connection_step::{HandshakeResolver, WeakHandshakeResolver},
     types::ShortString,
     uri::AMQPUri,
@@ -112,9 +112,33 @@ impl ConnectionStatus {
 
     pub(crate) fn ensure_connected(&self) -> Result<()> {
         if !self.connected() {
-            return Err(ErrorKind::InvalidConnectionState(self.state()).into());
+            return Err(self.state_error());
         }
         Ok(())
+    }
+
+    pub(crate) fn state_error(&self) -> Error {
+        let inner = self.read();
+        Error::from(ErrorKind::InvalidConnectionState(inner.state))
+            .with_remote_close(inner.remote_close.clone())
+    }
+
+    pub(crate) fn set_remote_close(&self, close: Arc<RemoteClose>) {
+        self.write().remote_close = Some(close);
+    }
+
+    // An invalid channel Close can end the connection too. Retain its facts
+    // at the terminal boundary without inferring its scope from the error kind.
+    pub(crate) fn retain_remote_close(&self, error: Error) -> Error {
+        let mut inner = self.write();
+        if inner.remote_close.is_none() {
+            inner.remote_close = error.remote_close_shared();
+        }
+        error.with_remote_close(inner.remote_close.clone())
+    }
+
+    pub(crate) fn remote_close(&self) -> Option<Arc<RemoteClose>> {
+        self.read().remote_close.clone()
     }
 
     /// Returns `true` if the connection is in [`ConnectionState::Connecting`].
@@ -224,10 +248,12 @@ struct StateInner {
     blocked: bool,
     poison: Option<Error>,
     rejection: Option<Error>,
+    remote_close: Option<Arc<RemoteClose>>,
 }
 
 impl StateInner {
     fn set_connecting(&mut self) -> Result<()> {
+        self.remote_close = None;
         self.state = ConnectionState::Connecting;
         self.poison.take().map(Err).unwrap_or(Ok(()))
     }

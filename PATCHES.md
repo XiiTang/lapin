@@ -750,3 +750,143 @@ Regression evidence on macOS arm64, through `build-slot`:
   generated-source format checks pass (exit 0). The retained QueueDeclareOk/
   ConsumeOk, reservation, queue-bound, completion, partial-get and freeze
   regressions are included. No new fork API is added.
+
+## Retain complete peer Close facts on existing errors (plan W5d, Rule 18)
+
+At `234fb729`, `src/channel.rs:1093-1115,1179-1190` converted native
+Connection.Close and Channel.Close through `AMQPError::try_from`. In the pinned
+amq-protocol `83c33d2`, `protocol/src/protocol.rs:23-27,62-77` retains only
+recognized reply codes and text in `AMQPError`; both conversions discard
+class/method identifiers.
+Unrecognized or successful connection closes became InvalidConnectionState(Closed),
+and channel closes used normal cancellation without retaining any peer fields.
+Upstream lapin v4.11.0 `src/channel.rs:946-969,1033-1044` uses the same
+conversions. Its existing Error kind/accessor
+and private shared notifier, and h2's accessors over its private error data, were
+inspected before choosing this additive mechanism.
+
+`Error::remote_close() -> Option<&RemoteClose>` exposes either
+`RemoteClose::Connection(protocol::connection::Close)` or
+`RemoteClose::Channel(protocol::channel::Close)`. The generated receivers capture the complete method before validation or
+conversion, then pass the immutable capture into the native handler. Private shared error metadata is attached at
+`Error::with_remote_close`, which preserves an already captured Close across
+clones, notifier attachment and shutdown boundaries. Connection/channel status
+keeps that metadata for the existing state-error fallbacks, including normal
+cancellation, connection-wide closing and late operations. Child statuses refer
+to their parent's connection status, so the closing transition cannot bypass the
+capture while asynchronous shutdown is pending. Serialized-frame completions and
+the I/O error return retain it too. A replacement handshake clears connection
+metadata; channel generation changes and recovery finalization retire its status
+metadata while errors already returned keep their original immutable Close.
+
+No ErrorKind payload, equality, display/source, AMQP soft/hard classification,
+recovery decision or lifecycle changes. In particular, unrecognized/successful
+channel Close still emits no new consumer error or Event::Error. The enum's
+variant is the received scope, even when a reply code's soft/hard class differs.
+All four peer fields are verbatim, including zero class/method identifiers.
+Boundless W5d must read the accessor before matching ErrorKind, add class_id and
+method_id to Amqp.RemoteError, and take scope from the received method. Peer text
+belongs to that response rather than an inferred cause or classification.
+
+Regression evidence on macOS arm64, through build-slot with CARGO_INCREMENTAL=0:
+
+- On `234fb729`, the native dispatcher regression with only an accessor scaffold
+  returning None fails the raw Close retention assertion (exit 101). The scaffold
+  adds no capture or propagation; both native Close handlers are unchanged in
+  that before run. With this patch it passes (exit 0).
+- `connection::remote_close_tests` drives the actual frame dispatcher and internal
+  RPC owner for success, unknown, known soft and known hard codes in both scopes.
+  It checks pending RPCs, partial basic.get, confirms, consumer/event errors,
+  connection admission and channel fallback errors, plus unchanged normal channel
+  cancellation and an unaffected sibling channel. An abandoned native handshake
+  completes to its W4d sink with the complete Close. A status checkpoint test
+  checks that replacement generations cannot inherit retired peer facts while
+  the original error keeps them.
+- Complete Tokio suite against owned RabbitMQ 4.3.5: 60 unit tests, 19 integration
+  tests and 7 doctests pass (86 total, exit 0). Strict all-target Clippy, code
+  generation and both crate/generated-source format checks pass (all exit 0).
+  The generated Close receivers match the updated template; regeneration is
+  repeatable.
+
+The fresh W5d review found three uncovered paths at `7a13dfd1`:
+`src/generated/channel.rs:1329` validated channel zero before capture;
+`src/channel.rs:1555` rejected canceled authentication with a bare ConnectionAborted;
+`src/io_loop.rs:268` enriched a clone at shutdown while returning a bare fallback.
+The Close-specific generator metadata now captures both native Close types before
+channel/state validation, retaining the same ProtocolViolation or state error.
+All three authentication phases share a status-aware guard: explicit failure and
+cancellation attach the recorded Close before resolver rejection and return.
+Connector failure, handshake EOF and exhausted-backoff errors attach it before
+propagation and driver return. Their error kinds and retry/close decisions stay.
+
+The class search also reproduced missing fields when a Close targets a nonexistent
+channel and when queued settlements run after Close removes their channel.
+`Channels::receive_method` now retains either native Close on routing failure;
+`invalid_channel_error` reuses the existing frame poison or connection capture for
+removed-channel errors (including RPC lookup, repeated removal and header/body
+fallbacks). No tombstone or extra retention map is added. Connection terminal
+boundaries retain a Close supplied by their error too, so late errors keep a
+channel-scoped Close that ended the connection, without reclassifying its scope.
+
+Checked construction and return paths in the amended source:
+- `src/error.rs:123,132,304`: the accessor and idempotent attachment preserve the
+  error kind; ordinary constructors still start without inferred Close data.
+- `templates/channel.rs:212` and `src/generated/channel.rs:1329,1638`: capture
+  before both Close validators; handler capture passed explicitly.
+- `src/channel.rs:904,1004,1042,1557`: start/continue/finish authentication guard;
+  finish and Drop preserve the rejection kind and captured native fields.
+- `src/io_loop.rs:218,244,270`: connector return, EOF and backoff fallback;
+  attach before cloning, rejecting or returning.
+- `src/channels.rs:113,122,143,171,183` and `src/internal_rpc.rs:440`: missing
+  native-channel routing, removal and RPC/header/body fallback errors now retain
+  actual Close facts; `src/frames.rs:220` reads existing channel poison.
+- `src/channels.rs:189,196,212,308,348` and `src/connection_status.rs:80,92`:
+  connection closing, closed/error/recovery/shutdown fan-out and late state errors.
+- `src/channel.rs:176,194,204,796,811,881,1161,1226` and
+  `src/channel_status.rs:126,298,314,333`: explicit channel fallbacks,
+  connection-process rejection, close completion, recovery cause and generation
+  retirement preserve metadata. Existing state/context and notifier semantics stay.
+- `src/io_loop.rs:361,380,518,562,579,610,625,697`: critical I/O errors,
+  serialized completions, state fallback, EOF, serialization, dispatch, parsing
+  and Drop flow through the enriched boundary before public failure returns.
+- `src/connection.rs:53,92,115,281,565` and `src/thread.rs:36`: stop, stop handle,
+  driver join, Connection.run, handshake start and thread join either use the
+  enriched terminal boundary or forward its exact Result; no new join error.
+- `src/internal_rpc.rs:408,420,436`, `src/task_scope.rs:85,93`,
+  `src/promise.rs:158,178,189,193,233` and `src/frames.rs:114,181,192,198,325`:
+  RPC forwarding, scope cancellation, last-resolver fallback and frame/reply
+  completion preserve typed errors; authentication's detached resolver is guarded.
+- `src/internal_rpc.rs:265,339,344,465,480,495` and
+  `src/frames.rs:38,45,61`: rejected/abandoned queued commands and generation skips
+  retain actual poison facts before dropping a resolver. The existing poison map
+  is shared independently of frame buffers, without a second map or an ownership
+  cycle. `PromiseResolver::retain_remote_close` records metadata only; last-resolver
+  drop keeps its BrokenPipe kind, message and State::complete ownership.
+- `src/basic_get_delivery.rs:13`, `src/acknowledgement.rs:57,176`,
+  `src/consumers.rs:96,102`, `src/consumer.rs:268,279,288`,
+  `src/returned_messages.rs:53` and `src/error_holder.rs:17`: get, confirms,
+  consumers, abandoned results and retained errors pass the original Error along.
+- `src/channel_status.rs:29`, `src/acker.rs:120`, `src/heartbeat.rs:129`,
+  `src/secret_update.rs:51` and `src/promise.rs:127`: stale-generation/admission,
+  poisoned-settlement success, heartbeat, refresh logging and repoll failures are
+  distinct local paths; no Close is fabricated. Heartbeat terminal errors use
+  the same enriched connection boundary. Pre-I/O configuration/URI and native
+  frame-limit/parser failures remain their existing independent errors.
+
+Review regressions on `7a13dfd1`: nonzero-channel Close and real supplied-stream
+async-auth Close fail (exit 101), with both handshake and driver errors checked.
+The routing/state and queued-settlement regressions also fail before (exit 101).
+After repair all eight dispatcher tests and the supplied-stream regression pass
+(exit 0); the latter checks ordinary shutdown, missing-channel routing in both
+native scopes and EOF, and joins all owners before comparing fields. ProtocolViolation, InvalidChannel, channel state and
+IOError(ConnectionAborted) assertions protect the original classifications.
+
+A further class regression on intermediate `fabaadcb` reproduces last-resolver
+loss after a complete basic.get, received Close and RPC exit (exit 101). The
+same test now passes after joining and dropping the driver-side fixture, leaving
+only the retained message's settlement handle. The resolver checkpoint test
+checks two resolver clones, an abandoned receiver/sink, one completion and the
+unchanged BrokenPipe kind. Final macOS arm64 validation through build-slot:
+60 unit + 19 integration + 7 doctests (86), strict all-target Clippy, fmt and
+repeatable template generation all pass (exit 0). Queue admission, capacity,
+stop behavior, retry decisions and error classification are unchanged.

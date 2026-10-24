@@ -209,16 +209,20 @@ impl Channel {
       None => self.connection_process_error(self.connection_status.state(), None, None),
     }
   {{else}}
+    {{#if method.metadata.remote_close ~}}
+    let close = Arc::new(RemoteClose::{{method.metadata.remote_close}}(method.clone()));
+    self.{{#if class.metadata.channel0_only ~}}connection_status{{else}}status{{/if ~}}.set_remote_close(close.clone());
+    {{/if ~}}
     {{#if class.metadata.channel0_only ~}}
     self.assert_channel0(
       method.get_amqp_class_id(),
       method.get_amqp_method_id(),
-    )?;
+    ){{#if method.metadata.remote_close ~}}.map_err(|error| error.with_remote_close(Some(close.clone()))){{/if ~}}?;
     {{/if ~}}
     if !self.status.can_receive_messages() {
-      return Err(self.status.state_error("{{class.name}}.{{method.name}}"));
+      return Err(self.status.state_error("{{class.name}}.{{method.name}}"){{#if method.metadata.remote_close ~}}.with_remote_close(Some(close.clone())){{/if ~}});
     }
-    self.on_{{snake class.name false}}_{{snake method.name false}}_received(method)
+    self.on_{{snake class.name false}}_{{snake method.name false}}_received(method{{#if method.metadata.remote_close ~}}, close{{/if ~}})
   {{/if ~}}
   }
   {{/if ~}}

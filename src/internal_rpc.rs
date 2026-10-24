@@ -5,7 +5,7 @@ use crate::{
     connection_step::HandshakeResolver,
     consumer_status::ConsumerStatus,
     error_holder::ErrorHolder,
-    frames::Frames,
+    frames::{FrameErrorContext, Frames},
     future::InternalFuture,
     heartbeat::Heartbeat,
     killswitch::KillSwitch,
@@ -26,7 +26,7 @@ const INTERNAL_RPC_QUEUE_MESSAGES: usize = 256;
 const REJECTION_CLOSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct InternalRPC<RK: RuntimeKit + Clone + Send + 'static> {
-    rpc: Receiver<Option<InternalCommand>>,
+    rpc: Receiver<Option<QueuedCommand>>,
     handle: InternalRPCHandle,
     channels_status: HashMap<ChannelId, KillSwitch>,
     frames: Frames,
@@ -37,7 +37,8 @@ pub(crate) struct InternalRPC<RK: RuntimeKit + Clone + Send + 'static> {
 
 #[derive(Clone)]
 pub(crate) struct InternalRPCHandle {
-    sender: Sender<Option<InternalCommand>>,
+    sender: Sender<Option<QueuedCommand>>,
+    error_context: FrameErrorContext,
     waker: SocketStateHandle,
     pub(crate) task_scope: crate::task_scope::TaskScope,
     pub(crate) explicit_close: Arc<std::sync::atomic::AtomicBool>,
@@ -316,6 +317,10 @@ impl InternalRPCHandle {
     fn send(&self, command: InternalCommand) {
         trace!(?command, "Queuing internal RPC command");
         // The only scenario where this can fail if this is the IoLoop already exited
+        let command = QueuedCommand {
+            command: Some(command),
+            error_context: self.error_context.clone(),
+        };
         if self.sender.try_send(Some(command)).is_err() {
             self.overflow
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -388,6 +393,40 @@ enum InternalCommand {
     UpdateSecret(LongString, ShortString, PromiseResolver<()>),
 }
 
+// A queue rejection, receiver exit or generation skip must keep the same
+// last-resolver-drop completion, while retaining an already received Close.
+#[derive(Debug)]
+struct QueuedCommand {
+    command: Option<InternalCommand>,
+    error_context: FrameErrorContext,
+}
+impl Drop for QueuedCommand {
+    fn drop(&mut self) {
+        match self.command.as_ref() {
+            Some(InternalCommand::BasicAck(id, _, _, resolver, _))
+            | Some(InternalCommand::BasicNack(id, _, _, resolver, _))
+            | Some(InternalCommand::BasicReject(id, _, _, resolver, _)) => {
+                resolver.retain_remote_close(self.error_context.remote_close(*id));
+            }
+            Some(InternalCommand::CloseConnection(_, _, _, _, Some(resolver)))
+            | Some(InternalCommand::UpdateSecret(_, _, resolver)) => {
+                resolver.retain_remote_close(self.error_context.remote_close(0));
+            }
+            Some(InternalCommand::CreateChannel(_, resolver)) => {
+                resolver.retain_remote_close(self.error_context.remote_close(0));
+            }
+            Some(InternalCommand::InitConnectionShutdown(error, Some(resolver))) => {
+                resolver.retain_remote_close(
+                    error
+                        .remote_close_shared()
+                        .or_else(|| self.error_context.remote_close(0)),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
     pub(crate) fn new(
         runtime: Runtime<RK>,
@@ -401,6 +440,7 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
         let handle = InternalRPCHandle {
             connection_status,
             sender,
+            error_context: frames.error_context(),
             waker,
             task_scope: Default::default(),
             explicit_close: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -476,10 +516,10 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
         let get_channel = |id| {
             channels
                 .get(id)
-                .ok_or::<Error>(ErrorKind::InvalidChannel(id).into())
+                .ok_or_else(|| channels.invalid_channel_error(id))
         };
 
-        while let Ok(Some(command)) = rpc.recv_async().await {
+        while let Ok(Some(mut queued)) = rpc.recv_async().await {
             if self
                 .handle
                 .overflow
@@ -493,10 +533,14 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                 );
                 break;
             }
+            let command = queued.command.take().expect("queued RPC command");
             trace!(?command, "Handling internal RPC command");
             match command {
                 BasicAck(channel_id, delivery_tag, options, resolver, error) => {
                     if !self.channel_ok(channel_id) {
+                        resolver.retain_remote_close(
+                            self.handle.error_context.remote_close(channel_id),
+                        );
                         continue;
                     }
                     let completion = (|| {
@@ -509,6 +553,9 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                 }
                 BasicNack(channel_id, delivery_tag, options, resolver, error) => {
                     if !self.channel_ok(channel_id) {
+                        resolver.retain_remote_close(
+                            self.handle.error_context.remote_close(channel_id),
+                        );
                         continue;
                     }
                     let completion = (|| {
@@ -521,6 +568,9 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                 }
                 BasicReject(channel_id, delivery_tag, options, resolver, error) => {
                     if !self.channel_ok(channel_id) {
+                        resolver.retain_remote_close(
+                            self.handle.error_context.remote_close(channel_id),
+                        );
                         continue;
                     }
                     let completion = (|| {
@@ -707,6 +757,7 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ErrorKind;
 
     #[derive(Clone, Default)]
     pub(super) struct CloseCommandGap {

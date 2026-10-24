@@ -160,7 +160,7 @@ pub use connection_builder::{ConnectionBuilder, DefaultConnectionBuilder};
 pub use connection_properties::ConnectionProperties;
 pub use connection_status::{ConnectionState, ConnectionStatus};
 pub use consumer::{Consumer, ConsumerDelegate};
-pub use error::{Error, ErrorKind, Result};
+pub use error::{Error, ErrorKind, RemoteClose, Result};
 pub use events::Event;
 pub use exchange::ExchangeKind;
 pub use promise::Completion;

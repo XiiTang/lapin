@@ -218,7 +218,9 @@ impl<
                     let connect = || (self.connect)(self.uri.clone(), self.runtime.clone());
                     let runtime = self.runtime.clone();
                     let connect = connect.retry(self.backoff).sleep(move |dur| runtime.sleep(dur));
-                    let mut stream = self.runtime.block_on(connect).inspect_err(|err| {
+                    let mut stream = self.runtime.block_on(connect)
+                        .map_err(|error| error.with_remote_close(self.connection_status.remote_close()))
+                        .inspect_err(|err| {
                         trace!("Poison connection attempt");
                         self.connection_status.poison(err.clone());
                         self.frames.clear_connection_steps(err);
@@ -242,7 +244,8 @@ impl<
 
                     trace!(status=?self.status, connection_status=?self.connection_status.state(), "io_loop exiting for {}", if reconnect { "reconnection" } else if connecting { "connection" } else { "shutdown" });
                     if self.first_connection && connecting && self.half_closed && res.is_ok() {
-                        let error = Error::from(io::Error::from(io::ErrorKind::ConnectionAborted));
+                        let error = Error::from(io::Error::from(io::ErrorKind::ConnectionAborted))
+                            .with_remote_close(self.connection_status.remote_close());
                         if self.frames.retry_connection_header() {
                             // Before Connection.Start, retry the protocol header with
                             // the same promise, including if it was only partly sent.
@@ -256,7 +259,8 @@ impl<
                         }
                     }
                     self.clear_serialized_frames(self.frames.poison().or_else(|| res.clone().err()).unwrap_or(
-                        ErrorKind::InvalidConnectionState(ConnectionState::Closed).into(),
+                        Error::from(ErrorKind::InvalidConnectionState(ConnectionState::Closed))
+                            .with_remote_close(self.connection_status.remote_close()),
                     ));
 
                     if self.connection_status.rejection().is_some() || (!connecting && !reconnect) {
@@ -269,7 +273,7 @@ impl<
                             error!("Exponential backoff attempts exhausted, aborting recovery");
                             let error = res.err().unwrap_or_else(|| {
                                 io::Error::from(io::ErrorKind::ConnectionAborted).into()
-                            });
+                            }).with_remote_close(self.connection_status.remote_close());
                             self.channels.set_connection_error(error.clone());
                             break (stream, Err(error));
                         }
@@ -358,6 +362,7 @@ impl<
     }
 
     fn critical_error(&mut self, connection_killswitch: &KillSwitch, error: Error) -> Result<()> {
+        let error = self.connection_status.retain_remote_close(error);
         // The receive path queued its local close before returning this error.
         // Keep I/O and its RPC scope alive until that close's write completion
         // applies the original error. Later input can abandon the attempt, but
@@ -394,6 +399,7 @@ impl<
     }
 
     fn clear_serialized_frames(&mut self, error: Error) {
+        let error = error.with_remote_close(self.connection_status.remote_close());
         if !self.serialized_frames.is_empty() {
             trace!(
                 "We're quitting but had leftover frames, tag them as 'not sent' with current error"
@@ -538,9 +544,10 @@ impl<
     ) -> Result<bool> {
         match self.connection_status.state() {
             ConnectionState::Closed => Ok(true),
-            ConnectionState::Error => {
-                Err(ErrorKind::InvalidConnectionState(ConnectionState::Error).into())
-            }
+            ConnectionState::Error => Err(Error::from(ErrorKind::InvalidConnectionState(
+                ConnectionState::Error,
+            ))
+            .with_remote_close(self.connection_status.remote_close())),
             _ => {
                 let res = self
                     .receive_buffer

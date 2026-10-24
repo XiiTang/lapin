@@ -1,6 +1,6 @@
 use crate::{
     BasicProperties, ChannelState, ChannelStatus, Connection, ConnectionState, ConnectionStatus,
-    Error, ErrorKind, ExchangeKind, Promise, PromiseResolver, Result,
+    Error, ErrorKind, ExchangeKind, Promise, PromiseResolver, RemoteClose, Result,
     acknowledgement::Acknowledgements,
     auth::AuthProvider,
     basic_get_delivery::BasicGetDelivery,
@@ -110,7 +110,8 @@ impl Channel {
         events_sender: EventsSender,
     ) -> Channel {
         let returned_messages = ReturnedMessages::default();
-        let status = ChannelStatus::new(channel_id, internal_rpc.clone());
+        let status =
+            ChannelStatus::new(channel_id, internal_rpc.clone(), connection_status.clone());
         let channel_closer = if channel_id == 0 {
             None
         } else {
@@ -176,7 +177,11 @@ impl Channel {
         self.set_state(ChannelState::Closing);
         self.basic_get_delivery
             .cancel(error.clone().unwrap_or_else(|| {
-                ErrorKind::InvalidChannelState(ChannelState::Closing, "channel closing").into()
+                Error::from(ErrorKind::InvalidChannelState(
+                    ChannelState::Closing,
+                    "channel closing",
+                ))
+                .with_remote_close(self.status.remote_close())
             }));
         if let Some(error) = error {
             self.error_publisher_confirms(error.clone());
@@ -187,6 +192,7 @@ impl Channel {
     }
 
     pub(crate) fn set_closed(&self, error: Error) {
+        let error = error.with_remote_close(self.status.remote_close());
         self.set_state(ChannelState::Closed);
         self.basic_get_delivery.cancel(error.clone());
         self.error_publisher_confirms(error.clone());
@@ -196,6 +202,7 @@ impl Channel {
 
     // Only called in case of a protocol failure
     pub(crate) fn set_connection_error(&self, error: Error) {
+        let error = error.with_remote_close(self.status.remote_close());
         self.set_state(ChannelState::Error);
         self.basic_get_delivery.cancel(error.clone());
         self.error_publisher_confirms(error.clone());
@@ -828,11 +835,11 @@ impl Channel {
     fn next_expected_close_ok_reply(&self) -> Option<Reply> {
         self.frames.next_expected_close_ok_reply(
             self.id,
-            ErrorKind::InvalidChannelState(
+            Error::from(ErrorKind::InvalidChannelState(
                 ChannelState::Closed,
                 "unexpected channel.close-ok received",
-            )
-            .into(),
+            ))
+            .with_remote_close(self.status.remote_close()),
         )
     }
 
@@ -842,7 +849,11 @@ impl Channel {
 
     fn on_channel_close_ok_sent(&self, error: Option<Error>) {
         let err = error.clone().unwrap_or_else(|| {
-            ErrorKind::InvalidChannelState(ChannelState::Closing, "channel.close-ok sent").into()
+            Error::from(ErrorKind::InvalidChannelState(
+                ChannelState::Closing,
+                "channel.close-ok sent",
+            ))
+            .with_remote_close(self.status.remote_close())
         });
         self.poison(err.clone());
         self.set_closed(err);
@@ -917,7 +928,8 @@ impl Channel {
             step = step.as_ref().map(ConnectionStep::name),
             "connection process error: invalid state"
         );
-        let error: Error = ErrorKind::InvalidConnectionState(state).into();
+        let error = Error::from(ErrorKind::InvalidConnectionState(state))
+            .with_remote_close(self.connection_status.remote_close());
         self.internal_rpc.set_connection_error(error.clone());
         if let Some((resolver, _)) = step.map(ConnectionStep::into_connection_resolver) {
             resolver.reject(error.clone());
@@ -998,7 +1010,10 @@ impl Channel {
 
                 let channel = self.clone();
                 let client_properties = configuration.amqp_client_properties.clone();
-                let guard = AuthenticationGuard(Some(resolver.clone()));
+                let guard = AuthenticationGuard {
+                    resolver: Some(resolver.clone()),
+                    status: self.connection_status.clone(),
+                };
                 self.internal_rpc.spawn(async move {
                     let auth_starter = match auth_provider.auth_starter_async().await {
                         Ok(response) => response,
@@ -1041,7 +1056,10 @@ impl Channel {
             ConnectionStep::StartOk(resolver, connection, auth_provider)
             | ConnectionStep::SecureOk(resolver, connection, auth_provider) => {
                 let channel = self.clone();
-                let guard = AuthenticationGuard(Some(resolver.clone()));
+                let guard = AuthenticationGuard {
+                    resolver: Some(resolver.clone()),
+                    status: self.connection_status.clone(),
+                };
                 self.internal_rpc.spawn(async move {
                     let response = match auth_provider.continue_auth_async(method.challenge).await {
                         Ok(response) => response,
@@ -1084,7 +1102,10 @@ impl Channel {
                 let channel = self.clone();
                 let configuration = self.configuration.clone();
                 let vhost = self.connection_status.vhost();
-                let guard = AuthenticationGuard(Some(resolver.clone()));
+                let guard = AuthenticationGuard {
+                    resolver: Some(resolver.clone()),
+                    status: self.connection_status.clone(),
+                };
                 self.internal_rpc.spawn(async move {
                     let result = async {
                         auth_provider
@@ -1129,7 +1150,11 @@ impl Channel {
         Ok(())
     }
 
-    fn on_connection_close_received(&self, method: protocol::connection::Close) -> Result<()> {
+    fn on_connection_close_received(
+        &self,
+        method: protocol::connection::Close,
+        close: Arc<RemoteClose>,
+    ) -> Result<()> {
         let error: Error = AMQPError::try_from(method.clone())
             .map(|error| {
                 error!(
@@ -1144,6 +1169,7 @@ impl Channel {
                 info!(channel=%self.id, "Connection closed");
                 ErrorKind::InvalidConnectionState(ConnectionState::Closed).into()
             });
+        let error = error.with_remote_close(Some(close));
         let handshake = self.connection_status.defer_handshake_close(error.clone());
         if self.recovery_config.can_recover(&error) {
             self.internal_rpc.init_connection_recovery(error.clone());
@@ -1172,7 +1198,8 @@ impl Channel {
 
     fn on_connection_close_ok_received(&self) -> Result<()> {
         self.internal_rpc.set_connection_closed(
-            ErrorKind::InvalidConnectionState(ConnectionState::Closed).into(),
+            Error::from(ErrorKind::InvalidConnectionState(ConnectionState::Closed))
+                .with_remote_close(self.connection_status.remote_close()),
         );
         Ok(())
     }
@@ -1214,14 +1241,19 @@ impl Channel {
         Ok(())
     }
 
-    fn on_channel_close_received(&self, method: protocol::channel::Close) -> Result<()> {
+    fn on_channel_close_received(
+        &self,
+        method: protocol::channel::Close,
+        close: Arc<RemoteClose>,
+    ) -> Result<()> {
         let error = AMQPError::try_from(method.clone()).map(|error| {
                 error!(
                     channel=%self.id, ?error,
                     "Channel closed"
                 );
                 Error::from(ErrorKind::ProtocolError(error))
-            }).map_err(|error| info!(channel=%self.id, code_to_error=%error, "Channel closed with a non-error code")).ok();
+            }).map_err(|error| info!(channel=%self.id, code_to_error=%error, "Channel closed with a non-error code")).ok()
+            .map(|error| error.with_remote_close(Some(close)));
         self.set_closing(error.clone());
         let channel = self.clone();
         self.internal_rpc
@@ -1231,8 +1263,11 @@ impl Channel {
 
     fn on_channel_close_ok_received(&self) -> Result<()> {
         self.set_closed(
-            ErrorKind::InvalidChannelState(ChannelState::Closed, "channel.close-ok received")
-                .into(),
+            Error::from(ErrorKind::InvalidChannelState(
+                ChannelState::Closed,
+                "channel.close-ok received",
+            ))
+            .with_remote_close(self.status.remote_close()),
         );
         Ok(())
     }
@@ -1557,10 +1592,14 @@ include!("generated/channel.rs");
 
 // A handshake waiter must also finish when its asynchronous authentication
 // future is canceled before the next connection step is installed.
-struct AuthenticationGuard(Option<HandshakeResolver>);
+struct AuthenticationGuard {
+    resolver: Option<HandshakeResolver>,
+    status: ConnectionStatus,
+}
 impl AuthenticationGuard {
     fn finish(mut self, result: Result<()>) -> Result<()> {
-        match self.0.take() {
+        let result = result.map_err(|error| error.with_remote_close(self.status.remote_close()));
+        match self.resolver.take() {
             Some(resolver) => resolver.finish_auth(result),
             None => result,
         }
@@ -1568,8 +1607,10 @@ impl AuthenticationGuard {
 }
 impl Drop for AuthenticationGuard {
     fn drop(&mut self) {
-        if let Some(resolver) = self.0.take() {
-            resolver.reject(std::io::Error::from(std::io::ErrorKind::ConnectionAborted).into());
+        if let Some(resolver) = self.resolver.take() {
+            let error = Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionAborted))
+                .with_remote_close(self.status.remote_close());
+            resolver.reject(error);
         }
     }
 }

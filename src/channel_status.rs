@@ -1,5 +1,5 @@
 use crate::{
-    Error, ErrorKind, Result,
+    ConnectionStatus, Error, ErrorKind, RemoteClose, Result,
     channel_receiver_state::{ChannelReceiverStates, DeliveryCause},
     channel_recovery_context::ChannelRecoveryContext,
     internal_rpc::InternalRPCHandle,
@@ -40,8 +40,16 @@ impl ChannelStatus {
         Ok(Some(GenerationGuard { _guard: guard }))
     }
 
-    pub(crate) fn new(id: ChannelId, internal_rpc: InternalRPCHandle) -> Self {
-        Self(Arc::new(RwLock::new(Inner::new(id, internal_rpc))))
+    pub(crate) fn new(
+        id: ChannelId,
+        internal_rpc: InternalRPCHandle,
+        connection_status: ConnectionStatus,
+    ) -> Self {
+        Self(Arc::new(RwLock::new(Inner::new(
+            id,
+            internal_rpc,
+            connection_status,
+        ))))
     }
 
     /// Returns `true` if the channel is in the process of opening (not yet ready).
@@ -117,11 +125,20 @@ impl ChannelStatus {
 
     pub(crate) fn state_error(&self, context: &'static str) -> Error {
         let inner = self.read();
-        let error = Error::from(ErrorKind::InvalidChannelState(inner.state, context));
+        let error = Error::from(ErrorKind::InvalidChannelState(inner.state, context))
+            .with_remote_close(inner.remote_close());
         if inner.state == ChannelState::Reconnecting {
             return error.with_notifier(inner.notifier());
         }
         error
+    }
+
+    pub(crate) fn set_remote_close(&self, close: Arc<RemoteClose>) {
+        self.write().remote_close = Some(close);
+    }
+
+    pub(crate) fn remote_close(&self) -> Option<Arc<RemoteClose>> {
+        self.read().remote_close()
     }
 
     pub(crate) fn set_reconnecting(&self, error: Error, topology: ChannelDefinition) -> Error {
@@ -251,10 +268,16 @@ struct Inner {
     recovery_context: Option<ChannelRecoveryContext>,
     killswitch: KillSwitch,
     internal_rpc: InternalRPCHandle,
+    connection_status: ConnectionStatus,
+    remote_close: Option<Arc<RemoteClose>>,
 }
 
 impl Inner {
-    fn new(id: ChannelId, internal_rpc: InternalRPCHandle) -> Self {
+    fn new(
+        id: ChannelId,
+        internal_rpc: InternalRPCHandle,
+        connection_status: ConnectionStatus,
+    ) -> Self {
         let this = Self {
             id,
             generation: 0,
@@ -265,9 +288,22 @@ impl Inner {
             recovery_context: None,
             killswitch: KillSwitch::default(),
             internal_rpc,
+            connection_status,
+            remote_close: None,
         };
         this.update_rpc_status();
         this
+    }
+
+    fn remote_close(&self) -> Option<Arc<RemoteClose>> {
+        self.remote_close
+            .clone()
+            .or_else(|| self.connection_status.remote_close())
+            .or_else(|| {
+                self.recovery_context
+                    .as_ref()
+                    .and_then(|ctx| ctx.cause().remote_close_shared())
+            })
     }
 
     fn update_rpc_status(&self) {
@@ -277,6 +313,7 @@ impl Inner {
 
     fn set_reconnecting(&mut self, error: Error, topology: ChannelDefinition) -> Error {
         if self.state != ChannelState::Reconnecting {
+            self.remote_close = None;
             self.generation = self.generation.saturating_add(1);
         }
         self.state = ChannelState::Reconnecting;

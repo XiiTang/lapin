@@ -1056,3 +1056,6 @@ mod tests {
         assert!(!frames.has_pending());
     }
 }
+
+#[cfg(all(test, feature = "tokio"))]
+mod remote_close_tests;

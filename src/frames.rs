@@ -32,7 +32,36 @@ impl fmt::Debug for ExpectedReply {
 #[derive(Clone, Default)]
 pub(crate) struct Frames(Arc<Mutex<Inner>>);
 
+// Share only existing poison facts with queued RPCs. This has no reference to
+// Frames or a Connection, so a dropped command cannot create an ownership cycle.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FrameErrorContext(Arc<Mutex<Poison>>);
+#[derive(Debug, Default)]
+struct Poison {
+    connection: Option<Error>,
+    channels: HashMap<ChannelId, Error>,
+}
+impl FrameErrorContext {
+    pub(crate) fn remote_close(&self, id: ChannelId) -> Option<Arc<crate::RemoteClose>> {
+        self.channel_poison(id)
+            .and_then(|error| error.remote_close_shared())
+    }
+
+    fn channel_poison(&self, id: ChannelId) -> Option<Error> {
+        let poison = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        poison
+            .channels
+            .get(&id)
+            .or(poison.connection.as_ref())
+            .cloned()
+    }
+}
+
 impl Frames {
+    pub(crate) fn error_context(&self) -> FrameErrorContext {
+        self.lock_inner().errors.clone()
+    }
+
     pub(crate) fn push(
         &self,
         channel_id: ChannelId,
@@ -176,19 +205,47 @@ impl Frames {
     }
 
     pub(crate) fn poison_channel(&self, channel_id: ChannelId, error: Error) {
-        self.lock_inner().channels_poison.insert(channel_id, error);
+        self.lock_inner()
+            .errors
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .channels
+            .insert(channel_id, error);
+    }
+
+    pub(crate) fn channel_poison(&self, channel_id: ChannelId) -> Option<Error> {
+        self.lock_inner().check_poison(channel_id)
     }
 
     pub(crate) fn poison(&self) -> Option<Error> {
-        self.lock_inner().poison.clone()
+        self.lock_inner()
+            .errors
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .connection
+            .clone()
     }
 
     pub(crate) fn drop_poison(&self) {
-        self.lock_inner().poison.take();
+        self.lock_inner()
+            .errors
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .connection
+            .take();
     }
 
     pub(crate) fn drop_channel_poison(&self, channel_id: ChannelId) {
-        self.lock_inner().channels_poison.remove(&channel_id);
+        self.lock_inner()
+            .errors
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .channels
+            .remove(&channel_id);
     }
 
     fn lock_inner(&self) -> MutexGuard<'_, Inner> {
@@ -286,8 +343,7 @@ struct Inner {
     frames: VecDeque<FrameEntry>,
     low_prio_frames: VecDeque<FrameEntry>,
     expected_replies: HashMap<ChannelId, VecDeque<ExpectedReply>>,
-    poison: Option<Error>,
-    channels_poison: HashMap<ChannelId, Error>,
+    errors: FrameErrorContext,
 }
 
 impl fmt::Debug for Frames {
@@ -372,10 +428,7 @@ impl Inner {
     }
 
     fn check_poison(&self, channel_id: ChannelId) -> Option<Error> {
-        self.channels_poison
-            .get(&channel_id)
-            .or(self.poison.as_ref())
-            .cloned()
+        self.errors.channel_poison(channel_id)
     }
 
     fn pop(&mut self, flow: bool) -> Option<FrameEntry> {
@@ -429,7 +482,11 @@ impl Inner {
         Self::drop_pending_frames(&mut self.frames, error.clone(), internal_rpc);
         Self::drop_pending_frames(&mut self.low_prio_frames, error.clone(), internal_rpc);
         self.clear_all_expected_replies(error.clone());
-        self.poison = Some(error);
+        self.errors
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .connection = Some(error);
     }
 
     fn drop_pending_frames(

@@ -443,3 +443,78 @@ async fn eof_during_authentication_ends_handshake_without_explicit_stop() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn close_during_async_authentication_retains_peer_facts() {
+    use amq_protocol::{
+        frame::{AMQPFrame, gen_frame},
+        protocol::{AMQPClass, channel, connection},
+    };
+    for eof_after_start in [false, true] {
+        for route in 0..3 {
+            let close = connection::Close {
+                reply_code: 403,
+                reply_text: "private peer text".into(),
+                class_id: 0,
+                method_id: 0,
+            };
+            let (id, method, expected) = match route {
+                0 | 1 => (
+                    if route == 0 { 0 } else { 7 },
+                    AMQPClass::Connection(connection::AMQPMethod::Close(close.clone())),
+                    lapin::RemoteClose::Connection(close),
+                ),
+                _ => {
+                    let close = channel::Close {
+                        reply_code: close.reply_code,
+                        reply_text: close.reply_text,
+                        class_id: close.class_id,
+                        method_id: close.method_id,
+                    };
+                    (
+                        7,
+                        AMQPClass::Channel(channel::AMQPMethod::Close(close.clone())),
+                        lapin::RemoteClose::Channel(close),
+                    )
+                }
+            };
+            let mut stream = StartStream::new();
+            stream.eof_after_start = eof_after_start;
+            let frame = AMQPFrame::Method(id, method);
+            stream
+                .bytes
+                .get_mut()
+                .extend(gen_frame(&frame)(Vec::new().into()).unwrap().into_inner().0);
+            let (owner, handshake) = Connection::from_stream(
+                "amqp://invalid.invalid/%2f".parse().unwrap(),
+                Runtime::tokio_current(),
+                stream,
+                ConnectionProperties::default().with_auth_provider(PendingAuth {
+                    entered: Arc::new(AtomicBool::new(false)),
+                    dropped: Arc::new(AtomicBool::new(false)),
+                }),
+            )
+            .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(10), handshake).await;
+            until(|| owner.is_finished()).await;
+            let driver = tokio::task::spawn_blocking(move || owner.join())
+                .await
+                .unwrap()
+                .unwrap_err();
+            let handshake = result.unwrap().unwrap_err();
+            assert!(matches!(handshake.kind(), lapin::ErrorKind::IOError(cause)
+                if cause.kind() == io::ErrorKind::ConnectionAborted));
+            if route == 0 {
+                assert!(matches!(driver.kind(), lapin::ErrorKind::IOError(cause)
+                    if cause.kind() == io::ErrorKind::ConnectionAborted));
+            } else {
+                assert!(matches!(driver.kind(), lapin::ErrorKind::InvalidChannel(7)));
+            }
+            assert_eq!(
+                (handshake.remote_close(), driver.remote_close()),
+                (Some(&expected), Some(&expected)),
+                "handshake and driver errors"
+            );
+        }
+    }
+}

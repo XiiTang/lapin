@@ -1133,11 +1133,17 @@ impl Channel {
         promise.await
     }
     fn receive_connection_close(&self, method: protocol::connection::Close) -> Result<()> {
-        self.assert_channel0(method.get_amqp_class_id(), method.get_amqp_method_id())?;
+        let close = Arc::new(RemoteClose::Connection(method.clone()));
+        self.connection_status.set_remote_close(close.clone());
+        self.assert_channel0(method.get_amqp_class_id(), method.get_amqp_method_id())
+            .map_err(|error| error.with_remote_close(Some(close.clone())))?;
         if !self.status.can_receive_messages() {
-            return Err(self.status.state_error("connection.close"));
+            return Err(self
+                .status
+                .state_error("connection.close")
+                .with_remote_close(Some(close.clone())));
         }
-        self.on_connection_close_received(method)
+        self.on_connection_close_received(method, close)
     }
     /// Acknowledgement of a `connection.close` request; the TCP connection may now be closed.
     pub(crate) async fn connection_close_ok(&self) -> Result<()> {
@@ -1385,10 +1391,15 @@ impl Channel {
         promise.await
     }
     fn receive_channel_close(&self, method: protocol::channel::Close) -> Result<()> {
+        let close = Arc::new(RemoteClose::Channel(method.clone()));
+        self.status.set_remote_close(close.clone());
         if !self.status.can_receive_messages() {
-            return Err(self.status.state_error("channel.close"));
+            return Err(self
+                .status
+                .state_error("channel.close")
+                .with_remote_close(Some(close.clone())));
         }
-        self.on_channel_close_received(method)
+        self.on_channel_close_received(method, close)
     }
     /// Acknowledgement of a `channel.close` request; the channel is now closed.
     async fn channel_close_ok(&self, error: Option<Error>) -> Result<()> {

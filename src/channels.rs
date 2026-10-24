@@ -1,6 +1,6 @@
 use crate::{
     BasicProperties, Channel, ChannelState, Configuration, Connection, ConnectionState,
-    ConnectionStatus, Error, ErrorKind, Result,
+    ConnectionStatus, Error, ErrorKind, RemoteClose, Result,
     configuration::{NegotiatedConfig, RecoveryConfig},
     connection_closer::ConnectionCloser,
     events::{Events, EventsSender},
@@ -110,7 +110,17 @@ impl Channels {
         }
     }
 
+    pub(crate) fn invalid_channel_error(&self, id: ChannelId) -> Error {
+        Error::from(ErrorKind::InvalidChannel(id)).with_remote_close(
+            self.frames
+                .channel_poison(id)
+                .and_then(|error| error.remote_close_shared())
+                .or_else(|| self.connection_status.remote_close()),
+        )
+    }
+
     pub(crate) fn remove(&self, id: ChannelId, error: Error) -> Result<()> {
+        let close = error.remote_close_shared();
         self.frames.clear_expected_replies(id, error);
 
         if id == 0 {
@@ -120,7 +130,9 @@ impl Channels {
         if self.write().channels.remove(&id).is_some() {
             Ok(())
         } else {
-            Err(ErrorKind::InvalidChannel(id).into())
+            Err(Error::from(ErrorKind::InvalidChannel(id))
+                .with_remote_close(close)
+                .with_remote_close(self.invalid_channel_error(id).remote_close_shared()))
         }
     }
 
@@ -132,9 +144,27 @@ impl Channels {
         if id == 0 {
             self.channel0.receive_method(method)
         } else {
-            self.get(id)
-                .map(|channel| channel.receive_method(method))
-                .unwrap_or_else(|| Err(ErrorKind::InvalidChannel(id).into()))
+            if let Some(channel) = self.get(id) {
+                return channel.receive_method(method);
+            }
+            // Routing can reject a Close before a generated receiver is reached.
+            let close = match method {
+                AMQPClass::Connection(crate::protocol::connection::AMQPMethod::Close(close)) => {
+                    Some(RemoteClose::Connection(close))
+                }
+                AMQPClass::Channel(crate::protocol::channel::AMQPMethod::Close(close)) => {
+                    Some(RemoteClose::Channel(close))
+                }
+                _ => None,
+            };
+            Err(match close {
+                Some(close) => {
+                    let close = Arc::new(close);
+                    self.connection_status.set_remote_close(close.clone());
+                    Error::from(ErrorKind::InvalidChannel(id)).with_remote_close(Some(close))
+                }
+                None => self.invalid_channel_error(id),
+            })
         }
     }
 
@@ -147,13 +177,13 @@ impl Channels {
     ) -> Result<()> {
         self.get(id)
             .map(|channel| channel.handle_content_header_frame(class_id, size, properties))
-            .unwrap_or_else(|| Err(ErrorKind::InvalidChannel(id).into()))
+            .unwrap_or_else(|| Err(self.invalid_channel_error(id)))
     }
 
     pub(crate) fn handle_body_frame(&self, id: ChannelId, payload: Vec<u8>) -> Result<()> {
         self.get(id)
             .map(|channel| channel.handle_body_frame(payload))
-            .unwrap_or_else(|| Err(ErrorKind::InvalidChannel(id).into()))
+            .unwrap_or_else(|| Err(self.invalid_channel_error(id)))
     }
 
     pub(crate) fn set_connection_closing(&self) {
@@ -187,6 +217,7 @@ impl Channels {
             self.apply_connection_error(error);
             return;
         }
+        let error = self.connection_status.retain_remote_close(error);
         self.frames.clear_all_expected_replies(error.clone());
         self.connection_status.set_state(ConnectionState::Closed);
         for channel in self.read().channels.values() {
@@ -208,6 +239,7 @@ impl Channels {
     }
 
     fn apply_connection_error(&self, error: Error) {
+        let error = self.connection_status.retain_remote_close(error);
         // Do nothing if we were already in error
         if let ConnectionState::Error = self.connection_status.set_state(ConnectionState::Error) {
             return;
@@ -337,6 +369,7 @@ impl Channels {
             return error;
         }
         trace!("init connection recovery");
+        let error = self.connection_status.retain_remote_close(error);
         self.connection_status.set_reconnecting();
         self.frames.clear_connection_steps(&error);
         let error = self
@@ -380,6 +413,7 @@ impl Channels {
             self.apply_connection_error(error);
             return;
         }
+        let error = self.connection_status.retain_remote_close(error);
         self.frames.drop_pending(error, &self.internal_rpc);
     }
 

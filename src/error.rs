@@ -20,6 +20,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Error {
     kind: ErrorKind,
     notifier: Option<Notifier>,
+    remote_close: Option<Arc<RemoteClose>>,
+}
+
+/// The complete Close method received from the peer.
+///
+/// The variant identifies the received method's scope. Reply codes and the
+/// reported class/method identifiers are retained verbatim, without inference.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RemoteClose {
+    /// A received `Connection.Close`.
+    Connection(crate::protocol::connection::Close),
+    /// A received `Channel.Close`.
+    Channel(crate::protocol::channel::Close),
 }
 
 /// The type of error that can be returned in this crate.
@@ -100,6 +113,27 @@ impl Error {
     #[must_use]
     pub fn kind(&self) -> &ErrorKind {
         &self.kind
+    }
+
+    /// Return the complete peer Close associated with this error, if any.
+    ///
+    /// This is independent of the error kind: unrecognized or successful reply
+    /// codes retain their Close too. Without a received peer Close this is `None`.
+    #[must_use]
+    pub fn remote_close(&self) -> Option<&RemoteClose> {
+        self.remote_close.as_deref()
+    }
+
+    pub(crate) fn remote_close_shared(&self) -> Option<Arc<RemoteClose>> {
+        self.remote_close.clone()
+    }
+
+    // Keep an already captured Close when an error crosses another boundary.
+    pub(crate) fn with_remote_close(mut self, close: Option<Arc<RemoteClose>>) -> Self {
+        if self.remote_close.is_none() {
+            self.remote_close = close;
+        }
+        self
     }
 
     pub(crate) fn notifier(&self) -> Option<Notifier> {
@@ -270,6 +304,7 @@ impl From<ErrorKind> for Error {
         Self {
             kind,
             notifier: None,
+            remote_close: None,
         }
     }
 }

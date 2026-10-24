@@ -1,4 +1,4 @@
-use crate::{Error, Result, listener::Listener};
+use crate::{Error, RemoteClose, Result, listener::Listener};
 use std::{
     fmt,
     future::Future,
@@ -181,6 +181,15 @@ impl<T> Drop for PromiseResolver<T> {
 }
 
 impl<T> PromiseResolver<T> {
+    // A dropped RPC command still completes through the ordinary last-resolver
+    // checkpoint, with its original error kind, text and completion ownership.
+    pub(crate) fn retain_remote_close(&self, close: Option<Arc<RemoteClose>>) {
+        let mut state = self.shared.lock_state();
+        if !state.completed && state.resolver_close.is_none() {
+            state.resolver_close = close;
+        }
+    }
+
     pub(crate) fn resolve(&self, data: T) {
         self.complete(Ok(data))
     }
@@ -224,6 +233,7 @@ struct State<T> {
     sink: Option<CompletionSink<T>>,
     rejection: Option<crate::ConnectionStatus>,
     retirement: Option<Arc<dyn crate::task_scope::RetiringReply>>,
+    resolver_close: Option<Arc<RemoteClose>>,
 }
 
 type CompletionSink<T> = Box<dyn FnOnce(Result<T>) + Send>;
@@ -281,6 +291,7 @@ impl<T> Shared<T> {
             sink: None,
             rejection: None,
             retirement: None,
+            resolver_close: None,
         };
         if let Some(data) = data {
             // A ready receiver uses the same once-only completion checkpoint.
@@ -354,6 +365,41 @@ mod tests {
     impl Wake for Woken {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn recorded_close_survives_only_the_last_resolver_drop() {
+        let close = Arc::new(RemoteClose::Channel(crate::protocol::channel::Close {
+            reply_code: 599,
+            reply_text: "peer Close".into(),
+            class_id: 0,
+            method_id: 17,
+        }));
+        for abandoned in [false, true] {
+            let (promise, resolver) = Completion::<()>::new("recorded Close");
+            let other = resolver.clone();
+            resolver.retain_remote_close(Some(close.clone()));
+            let (send, receive) = std::sync::mpsc::channel();
+            let promise = promise.with_sink(move |result| {
+                send.send(result).unwrap();
+            });
+            drop(resolver);
+            assert!(promise.try_wait().is_none());
+            if abandoned {
+                drop(promise);
+                drop(other);
+                let error = receive.try_recv().unwrap().unwrap_err();
+                assert_eq!(error.remote_close(), Some(close.as_ref()));
+                assert!(receive.try_recv().is_err());
+            } else {
+                drop(other);
+                let error = promise.try_wait().unwrap().unwrap_err();
+                assert_eq!(error.remote_close(), Some(close.as_ref()));
+                assert!(
+                    matches!(error.kind(), ErrorKind::IOError(cause) if cause.kind() == std::io::ErrorKind::BrokenPipe)
+                );
+            }
         }
     }
 

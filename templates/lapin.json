@@ -83,6 +83,7 @@
     },
     "close": {
       "metadata": {
+        "remote_close": "Connection",
         "internal": true
       }
     },
@@ -139,6 +140,7 @@
     },
     "close": {
       "metadata": {
+        "remote_close": "Channel",
         "require_wrapper": true,
         "start_hook": true
       }
