@@ -50,8 +50,8 @@ impl ReturnedMessages {
         self.lock_inner().waiting_messages.pop_front()
     }
 
-    pub(crate) fn clear_dropped_confirms(&self) {
-        self.lock_inner().dropped_confirms.clear();
+    pub(crate) fn take_dropped_confirms(&self) -> Vec<Promise<Confirmation>> {
+        std::mem::take(&mut self.lock_inner().dropped_confirms)
     }
 
     fn lock_inner(&self) -> MutexGuard<'_, Inner> {
@@ -65,7 +65,6 @@ impl fmt::Debug for ReturnedMessages {
         if let Ok(inner) = self.0.try_lock() {
             debug
                 .field("waiting_messages", &inner.waiting_messages)
-                .field("messages", &inner.messages)
                 .field("non_confirm_messages", &inner.non_confirm_messages);
         }
         debug.finish()
@@ -77,7 +76,6 @@ struct Inner {
     current_message: Option<BasicReturnMessage>,
     non_confirm_messages: Vec<BasicReturnMessage>,
     waiting_messages: VecDeque<BasicReturnMessage>,
-    messages: Vec<BasicReturnMessage>,
     dropped_confirms: Vec<Promise<Confirmation>>,
 }
 
@@ -126,10 +124,8 @@ impl Inner {
     fn process_dropped_confirm(
         &mut self,
         promise: Promise<Confirmation>,
-        messages: Option<&mut Vec<BasicReturnMessage>>,
+        messages: &mut Vec<BasicReturnMessage>,
     ) {
-        let messages = messages.unwrap_or(&mut self.messages);
-
         if let Some(confirmation) = promise.try_wait() {
             if let Ok(Confirmation::Nack(Some(message))) | Ok(Confirmation::Ack(Some(message))) =
                 confirmation
@@ -147,20 +143,15 @@ impl Inner {
 
     fn register_dropped_confirm(&mut self, promise: Promise<Confirmation>) {
         trace!("Registering new dropped PublisherConfirm");
-        self.process_dropped_confirm(promise, None)
+        self.dropped_confirms.push(promise);
     }
 
     fn drain(&mut self) -> Vec<BasicReturnMessage> {
-        let mut messages = std::mem::take(&mut self.messages);
-        if !self.non_confirm_messages.is_empty() {
-            let mut non_confirm_messages = std::mem::take(&mut self.non_confirm_messages);
-            non_confirm_messages.append(&mut messages);
-            messages = non_confirm_messages;
-        }
+        let mut messages = std::mem::take(&mut self.non_confirm_messages);
         let before = self.dropped_confirms.len();
         if before != 0 {
             for promise in std::mem::take(&mut self.dropped_confirms) {
-                self.process_dropped_confirm(promise, Some(&mut messages))
+                self.process_dropped_confirm(promise, &mut messages)
             }
             trace!(
                 %before,
@@ -169,5 +160,62 @@ impl Inner {
             );
         }
         messages
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use crate::{
+        ErrorKind, acknowledgement::Acknowledgements, publisher_confirm::PublisherConfirm,
+    };
+
+    #[test]
+    fn dropped_confirms_retain_ack_nack_and_error_for_their_owner() {
+        for ready_before_drop in [false, true] {
+            for outcome in 0..3 {
+                let returned = ReturnedMessages::default();
+                let acknowledgements = Acknowledgements::new(1, returned.clone());
+                let confirm = acknowledgements.register_pending();
+                let complete = || match outcome {
+                    0 => acknowledgements.ack(1).unwrap(),
+                    1 => acknowledgements.nack(1).unwrap(),
+                    _ => acknowledgements.on_channel_error(ErrorKind::MissingHeartbeatError.into()),
+                };
+                if ready_before_drop {
+                    complete();
+                    drop(confirm);
+                } else {
+                    drop(confirm);
+                    complete();
+                }
+                let mut inner = returned.lock_inner();
+                assert_eq!(
+                    inner.dropped_confirms.len(),
+                    1,
+                    "outcome {outcome}, ready before drop {ready_before_drop}"
+                );
+                let result = inner.dropped_confirms.pop().unwrap().try_wait().unwrap();
+                match outcome {
+                    0 => assert!(matches!(result, Ok(Confirmation::Ack(None)))),
+                    1 => assert!(matches!(result, Ok(Confirmation::Nack(None)))),
+                    _ => assert!(
+                        matches!(result, Err(error) if matches!(error.kind(), ErrorKind::MissingHeartbeatError))
+                    ),
+                }
+            }
+        }
+        // A confirm which never needed a broker result still retains that fact.
+        let returned = ReturnedMessages::default();
+        drop(PublisherConfirm::not_requested(returned.clone()));
+        assert!(matches!(
+            returned
+                .lock_inner()
+                .dropped_confirms
+                .pop()
+                .unwrap()
+                .try_wait(),
+            Some(Ok(Confirmation::NotRequested))
+        ));
     }
 }

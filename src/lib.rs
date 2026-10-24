@@ -163,6 +163,7 @@ pub use consumer::{Consumer, ConsumerDelegate};
 pub use error::{Error, ErrorKind, Result};
 pub use events::Event;
 pub use exchange::ExchangeKind;
+pub use promise::Completion;
 pub use publisher_confirm::{Confirmation, PublisherConfirm};
 pub use queue::Queue;
 
@@ -173,7 +174,7 @@ pub mod message;
 /// Runtime selection and helpers.
 pub mod runtime;
 
-use promise::{Promise, PromiseResolver};
+use promise::{Completion as Promise, PromiseResolver};
 
 mod acker;
 mod acknowledgement;

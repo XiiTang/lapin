@@ -67,6 +67,18 @@ impl Confirmation {
 }
 
 impl PublisherConfirm {
+    /// Transfer this publication's native receiver to its outcome owner.
+    /// Unlike the legacy returned-message drain, this retains Ack, Nack and
+    /// errors, including an attached returned message and its reservation.
+    pub fn into_completion(mut self) -> crate::Completion<Confirmation> {
+        self.inner.take().unwrap_or_else(|| {
+            Promise::new_with_data(
+                "publisher-confirms.completed",
+                Err(ErrorKind::FutureCompleted.into()),
+            )
+        })
+    }
+
     pub(crate) fn new(inner: Promise<Confirmation>, returned_messages: ReturnedMessages) -> Self {
         Self {
             inner: Some(inner),

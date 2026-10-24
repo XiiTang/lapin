@@ -235,8 +235,15 @@ impl Connection {
     /// an error if the connection is not in the [`crate::ConnectionState::Connected`]
     /// state or if the channel limit negotiated with the server has been reached.
     pub async fn create_channel(&self) -> Result<Channel> {
+        self.create_channel_completion()?.await
+    }
+
+    /// Admit this operation and expose its native completion receiver.
+    pub fn create_channel_completion(&self) -> Result<crate::Completion<Channel>> {
         self.status.ensure_connected()?;
-        self.internal_rpc.create_channel(self.closer.clone()).await
+        Ok(self
+            .internal_rpc
+            .create_channel_completion(self.closer.clone()))
     }
 
     /// Return a [`Stream`] of connection-level [`Event`]s.
@@ -282,6 +289,15 @@ impl Connection {
     /// An admitted protocol rejection keeps its verdict and abandons its pending
     /// close write. Otherwise the connection must be connected.
     pub async fn close(&self, reply_code: ReplyCode, reply_text: ShortString) -> Result<()> {
+        self.close_completion(reply_code, reply_text)?.await
+    }
+
+    /// Admit this operation and expose its native completion receiver.
+    pub fn close_completion(
+        &self,
+        reply_code: ReplyCode,
+        reply_text: ShortString,
+    ) -> Result<crate::Completion<()>> {
         if let Some(error) = self.status.rejection() {
             if self.status.errored() {
                 return Err(error);
@@ -289,9 +305,7 @@ impl Connection {
         } else {
             self.status.ensure_connected()?;
         }
-        self.internal_rpc
-            .close_connection_checked(reply_code, reply_text, 0, 0)
-            .await
+        Ok(self.internal_rpc.close_connection_checked_completion(reply_code, reply_text, 0, 0))
     }
 
     /// Update the authentication secret (e.g. rotate an OAuth2 token).
@@ -302,8 +316,19 @@ impl Connection {
     ///
     /// [`auth::TokenAuthProvider`]: crate::auth::TokenAuthProvider
     pub async fn update_secret(&self, new_secret: LongString, reason: ShortString) -> Result<()> {
+        self.update_secret_completion(new_secret, reason)?.await
+    }
+
+    /// Admit this operation and expose its native completion receiver.
+    pub fn update_secret_completion(
+        &self,
+        new_secret: LongString,
+        reason: ShortString,
+    ) -> Result<crate::Completion<()>> {
         self.status.ensure_connected()?;
-        self.internal_rpc.update_secret(new_secret, reason).await
+        Ok(self
+            .internal_rpc
+            .update_secret_completion(new_secret, reason))
     }
 
     /// Low-level entry point for custom transport implementations.
@@ -404,8 +429,35 @@ impl Connection {
         uri: AMQPUri,
         runtime: Runtime<RK>,
         stream: S,
-        mut options: ConnectionProperties,
+        options: ConnectionProperties,
     ) -> Result<(ConnectionDriver, impl Future<Output = Result<Self>> + Send)> {
+        let (owner, conn, channel0) = Self::from_stream_parts(uri, runtime, stream, options)?;
+        Ok((owner, conn.start(channel0)))
+    }
+
+    /// Admit a supplied handshake and expose its native completion receiver.
+    pub fn from_stream_completion<
+        RK: RuntimeKit + Clone + Send + 'static,
+        S: futures_io::AsyncRead + futures_io::AsyncWrite + Unpin + Send + 'static,
+    >(
+        uri: AMQPUri,
+        runtime: Runtime<RK>,
+        stream: S,
+        options: ConnectionProperties,
+    ) -> Result<(ConnectionDriver, crate::Completion<Self>)> {
+        let (owner, conn, channel0) = Self::from_stream_parts(uri, runtime, stream, options)?;
+        Ok((owner, conn.start_completion(channel0)?))
+    }
+
+    fn from_stream_parts<
+        RK: RuntimeKit + Clone + Send + 'static,
+        S: futures_io::AsyncRead + futures_io::AsyncWrite + Unpin + Send + 'static,
+    >(
+        uri: AMQPUri,
+        runtime: Runtime<RK>,
+        stream: S,
+        mut options: ConnectionProperties,
+    ) -> Result<(ConnectionDriver, Self, Channel)> {
         if options.auto_recover
             || options
                 .auth_provider
@@ -434,7 +486,7 @@ impl Connection {
         conn.internal_rpc
             .explicit_close
             .store(true, std::sync::atomic::Ordering::Release);
-        Ok((ConnectionDriver(control), conn.start(channel0)))
+        Ok((ConnectionDriver(control), conn, channel0))
     }
 
     /// Start a caller-owned connector under declared retry and recovery policy.
@@ -449,6 +501,33 @@ impl Connection {
         connect: impl AsyncFn(AMQPUri, Runtime<RK>) -> Result<S> + Send + Sync + 'static,
         options: ConnectionProperties,
     ) -> Result<(ConnectionDriver, impl Future<Output = Result<Self>> + Send)> {
+        let (owner, conn, channel0) = Self::from_connector_parts(uri, runtime, connect, options)?;
+        Ok((owner, conn.start(channel0)))
+    }
+
+    /// Admit a supplied handshake and expose its native completion receiver.
+    pub fn from_connector_completion<
+        RK: RuntimeKit + Clone + Send + 'static,
+        S: futures_io::AsyncRead + futures_io::AsyncWrite + Unpin + Send + 'static,
+    >(
+        uri: AMQPUri,
+        runtime: Runtime<RK>,
+        connect: impl AsyncFn(AMQPUri, Runtime<RK>) -> Result<S> + Send + Sync + 'static,
+        options: ConnectionProperties,
+    ) -> Result<(ConnectionDriver, crate::Completion<Self>)> {
+        let (owner, conn, channel0) = Self::from_connector_parts(uri, runtime, connect, options)?;
+        Ok((owner, conn.start_completion(channel0)?))
+    }
+
+    fn from_connector_parts<
+        RK: RuntimeKit + Clone + Send + 'static,
+        S: futures_io::AsyncRead + futures_io::AsyncWrite + Unpin + Send + 'static,
+    >(
+        uri: AMQPUri,
+        runtime: Runtime<RK>,
+        connect: impl AsyncFn(AMQPUri, Runtime<RK>) -> Result<S> + Send + Sync + 'static,
+        options: ConnectionProperties,
+    ) -> Result<(ConnectionDriver, Self, Channel)> {
         if options
             .auth_provider
             .as_ref()
@@ -464,10 +543,14 @@ impl Connection {
         conn.internal_rpc
             .explicit_close
             .store(true, std::sync::atomic::Ordering::Release);
-        Ok((ConnectionDriver(control), conn.start(channel0)))
+        Ok((ConnectionDriver(control), conn, channel0))
     }
 
     pub(crate) async fn start(self, channel0: Channel) -> Result<Self> {
+        self.start_completion(channel0)?.await
+    }
+
+    pub(crate) fn start_completion(self, channel0: Channel) -> Result<Promise<Self>> {
         let (promise, resolver) = HandshakeResolver::new();
         self.status.set_handshake(&resolver);
 
@@ -486,7 +569,7 @@ impl Connection {
         );
 
         trace!("Sent protocol header to server, waiting for connection flow");
-        promise.await
+        Ok(promise)
     }
 }
 

@@ -65,7 +65,16 @@ impl Channel {
   {{#each class.methods as |method| ~}}
   {{#unless method.metadata.skip ~}}
   {{#if method.c2s ~}}
+{{#unless method.metadata.completion_only ~}}
 {{include_more class.name method.name}}{{#unless method.metadata.require_wrapper ~}}{{#if method.is_reply ~}}{{#if method.metadata.internal ~}}pub(crate) {{/if ~}}{{else}}pub {{#if method.metadata.internal ~}}(crate) {{/if ~}}{{/if ~}}async fn {{else}}async fn do_{{/unless ~}}{{snake class.name false}}_{{snake method.name false}}(&self{{#unless method.ignore_args ~}}{{#each_argument method.arguments as |argument| ~}}{{#if @argument_is_value ~}}{{#unless argument.force_default ~}}, {{snake argument.name}}: {{argument.type}}{{/unless ~}}{{else}}{{#unless argument.ignore_flags ~}}, options: {{camel class.name}}{{camel method.name}}Options{{/unless ~}}{{/if ~}}{{/each_argument ~}}{{/unless ~}}{{#if method.metadata.extra_args ~}}{{#each method.metadata.extra_args as |arg| ~}}, {{arg.name}}: {{arg.type}}{{/each ~}}{{/if ~}}) -> Result<{{#if method.metadata.confirmation.type ~}}{{method.metadata.confirmation.type}}{{else}}(){{/if ~}}> {
+    self.{{#if method.metadata.require_wrapper ~}}do_{{/if ~}}{{snake class.name false}}_{{snake method.name false}}_completion({{#unless method.ignore_args ~}}{{#each_argument method.arguments as |argument| ~}}{{#if @argument_is_value ~}}{{#unless argument.force_default ~}}{{snake argument.name}}, {{/unless ~}}{{else}}{{#unless argument.ignore_flags ~}}options, {{/unless ~}}{{/if ~}}{{/each_argument ~}}{{/unless ~}}{{#if method.metadata.extra_args ~}}{{#each method.metadata.extra_args as |arg| ~}}{{arg.name}}, {{/each ~}}{{/if ~}})?.await
+  }
+
+  {{/unless ~}}
+  {{#if method.metadata.completion_only ~}}{{include_more class.name method.name}}{{/if ~}}
+  /// Admit this operation and return its native completion receiver.
+  /// Install a sink before handing the receiver to a bounded waiter.
+  {{#unless method.metadata.require_wrapper ~}}{{#if method.is_reply ~}}{{#if method.metadata.internal ~}}pub(crate) {{/if ~}}{{else}}pub {{#if method.metadata.internal ~}}(crate) {{/if ~}}{{/if ~}}fn {{else}}fn do_{{/unless ~}}{{snake class.name false}}_{{snake method.name false}}_completion(&self{{#unless method.ignore_args ~}}{{#each_argument method.arguments as |argument| ~}}{{#if @argument_is_value ~}}{{#unless argument.force_default ~}}, {{snake argument.name}}: {{argument.type}}{{/unless ~}}{{else}}{{#unless argument.ignore_flags ~}}, options: {{camel class.name}}{{camel method.name}}Options{{/unless ~}}{{/if ~}}{{/each_argument ~}}{{/unless ~}}{{#if method.metadata.extra_args ~}}{{#each method.metadata.extra_args as |arg| ~}}, {{arg.name}}: {{arg.type}}{{/each ~}}{{/if ~}}) -> Result<crate::Completion<{{#if method.metadata.confirmation.type ~}}{{method.metadata.confirmation.type}}{{else}}(){{/if ~}}>> {
     {{#unless class.metadata.channel0_only ~}}
     {{#if method.metadata.channel_init ~}}
     if !self.status.initializing() {
@@ -130,7 +139,7 @@ impl Channel {
     }));
 
     {{#if method.metadata.carry_headers ~}}
-    self.send_method_frame_with_body("{{class.name}}.{{method.name}}", method, payload, properties, start_hook_res).await
+    self.send_method_frame_with_body("{{class.name}}.{{method.name}}", method, payload, properties, start_hook_res)
     {{else}}
     {{#if method.metadata.resolver_hook ~}}{{method.metadata.resolver_hook}}{{/if ~}}
     self.send_method_frame(method, Box::new(resolver.clone()), {{#if method.synchronous ~}}Some(ExpectedReply(reply, Box::new(resolver))), None{{else if method.metadata.connection_step ~}}Some(ExpectedReply(Reply::ConnectionStep(ConnectionStep::{{method.metadata.connection_step}}), Box::new(resolver.clone()))), Some(resolver){{else}}None, Some(resolver){{/if ~}});
@@ -145,7 +154,7 @@ impl Channel {
     }
     {{/if ~}}
     {{/if ~}}
-    promise.await
+    Ok(promise)
     {{/if ~}}
   }
   {{/if ~}}

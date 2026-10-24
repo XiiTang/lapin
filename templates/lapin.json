@@ -105,7 +105,8 @@
     },
     "update-secret": {
       "metadata": {
-        "internal": true
+        "internal": true,
+        "completion_only": true
       }
     }
   },

@@ -55,7 +55,12 @@ impl Acker {
     /// Returns `Ok(true)` on success, `Ok(false)` if the acker is already used
     /// or poisoned.
     pub async fn ack(&self, options: BasicAckOptions) -> Result<bool> {
-        self.rpc("basic.ack", |internal_rpc, resolver| {
+        self.ack_completion(options).await
+    }
+
+    /// Admit an acknowledgement and expose its native completion receiver.
+    pub fn ack_completion(&self, options: BasicAckOptions) -> crate::Completion<bool> {
+        self.rpc_completion("basic.ack", |internal_rpc, resolver| {
             internal_rpc.basic_ack(
                 self.channel_id,
                 self.delivery_tag,
@@ -64,7 +69,6 @@ impl Acker {
                 self.error.clone(),
             )
         })
-        .await
     }
 
     /// Negatively acknowledge the delivery.
@@ -74,7 +78,12 @@ impl Acker {
     /// Returns `Ok(true)` on success, `Ok(false)` if the acker is already used
     /// or poisoned.
     pub async fn nack(&self, options: BasicNackOptions) -> Result<bool> {
-        self.rpc("basic.nack", |internal_rpc, resolver| {
+        self.nack_completion(options).await
+    }
+
+    /// Admit a negative acknowledgement and expose its native completion receiver.
+    pub fn nack_completion(&self, options: BasicNackOptions) -> crate::Completion<bool> {
+        self.rpc_completion("basic.nack", |internal_rpc, resolver| {
             internal_rpc.basic_nack(
                 self.channel_id,
                 self.delivery_tag,
@@ -83,7 +92,6 @@ impl Acker {
                 self.error.clone(),
             )
         })
-        .await
     }
 
     /// Reject the delivery.
@@ -93,7 +101,12 @@ impl Acker {
     /// otherwise it is discarded or dead-lettered. Returns `Ok(true)` on
     /// success, `Ok(false)` if the acker is already used or poisoned.
     pub async fn reject(&self, options: BasicRejectOptions) -> Result<bool> {
-        self.rpc("basic.reject", |internal_rpc, resolver| {
+        self.reject_completion(options).await
+    }
+
+    /// Admit a rejection and expose its native completion receiver.
+    pub fn reject_completion(&self, options: BasicRejectOptions) -> crate::Completion<bool> {
+        self.rpc_completion("basic.reject", |internal_rpc, resolver| {
             internal_rpc.basic_reject(
                 self.channel_id,
                 self.delivery_tag,
@@ -102,26 +115,27 @@ impl Acker {
                 self.error.clone(),
             )
         })
-        .await
     }
 
-    async fn rpc<F: Fn(&InternalRPCHandle, PromiseResolver<()>)>(
+    fn rpc_completion<F: Fn(&InternalRPCHandle, PromiseResolver<()>)>(
         &self,
         marker: &str,
         f: F,
-    ) -> Result<bool> {
+    ) -> Promise<bool> {
         if self.poisoned() || !self.killswitch.kill() {
-            return Ok(false);
+            return Promise::new_with_data(marker, Ok(false));
         }
-        if let Some(error) = self.error.as_ref() {
-            error.check()?;
+        if let Some(error) = self.error.as_ref()
+            && let Err(error) = error.check()
+        {
+            return Promise::new_with_data(marker, Err(error));
         }
         if let Some(internal_rpc) = self.internal_rpc.as_ref() {
-            let (promise, resolver) = Promise::new(marker);
+            let (promise, resolver) = internal_rpc.reply(marker);
             f(internal_rpc, resolver);
-            internal_rpc.await_reply(promise).await?;
+            return promise.map(marker, |()| true);
         }
-        Ok(true)
+        Promise::new_with_data(marker, Ok(true))
     }
 
     /// True if our channel got closed or encountered an error

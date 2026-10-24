@@ -9,7 +9,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-fn channel(
+pub(super) fn channel(
     properties: ConnectionProperties,
 ) -> (Channel, InternalRPC<crate::runtime::DefaultRuntimeKit>) {
     let runtime = crate::runtime::default_runtime().unwrap();

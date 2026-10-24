@@ -537,3 +537,64 @@ CARGO_INCREMENTAL=0 and this worktree's target.
 - `cargo test --no-default-features --features tokio,smol --locked
   --no-fail-fast`: **0**, 73 unit/integration tests and seven doctests, zero
   ignored, with isolated owned RabbitMQ 4.3.5. #369's regressions are unchanged.
+## Preserve native completion and abandoned confirm ownership (plan W4d)
+
+Rule 7 requires the owner of an untaken native answer to retain its disposition.
+At the preceding fork revision `f34c12f`, `src/promise.rs:24-30` only logged receiver
+drop; `Shared::set` stored an answer in private receiver state. Dropping an outer
+RPC/get future could therefore discard a completed result or its later answer.
+`src/returned_messages.rs:126-150` flattened abandoned Ack/Nack values to returned
+messages, losing their distinction and errors, and `src/acknowledgement.rs:176-183`
+cleared abandoned confirms when the channel failed.
+
+The native receiver is now public as `Completion<T>`. Its `with_sink`,
+`close_and_take` and `try_take` transfer the actual typed result. Receiver drop
+closes and takes under the same private state mutex used by `State::complete`;
+that checkpoint owns explicit success/error and last-resolver-drop completion.
+Only the receiver or its sink can take an answer. The sink runs once, outside
+the completion mutex; it must hand work to the embedding owner's queue without
+blocking or reentering lapin. A consumed answer cannot be completed again.
+Tokio 1.53.3's oneshot `Receiver::drop` (close then consume), `Sender::send`
+(return an untaken value) and futures-channel 0.3.31's sender-drop completion
+were inspected in their source before implementing this handoff.
+
+Channel RPCs expose synchronous `*_completion` admission methods generated from
+the same template as their unchanged lazy async entry points, including
+`basic_get_completion` and `basic_publish_completion`. The publish write's
+completion hands over its `PublisherConfirm`; `PublisherConfirm::into_completion`
+then transfers the broker-confirm receiver. `Channel::take_dropped_confirms`
+transfers abandoned native receivers, pending or ready, preserving Ack, Nack,
+NotRequested, errors, returned bodies and reservations. The legacy explicit
+`wait_for_confirms` drain retains its returned-message API. Connection RPCs,
+supplied-stream/connector handshakes and Acker RPCs expose the same typed native
+receiver through their `*_completion` entry points. Pre-admission errors are
+returned directly; the sink owns only an admitted operation's untaken result.
+Internal RPC forwards its native receiver directly to the caller's resolver,
+without an intermediate task poll that could lose a committed reply at stop.
+This covers channel creation, connection close, secret update and Acker replies;
+maintenance tasks keep their existing owner and scheduling.
+
+Regression evidence (macOS arm64):
+
+- `cargo test --locked --no-default-features --features tokio --lib
+  dropped_confirms_retain_ack_nack_and_error_for_their_owner` with only the test
+  added to `f34c12f` fails its retained-error assertion (exit 101); the patch
+  preserves all three outcomes both before and after receiver drop, and also
+  NotRequested.
+- `promise::tests` forces send-before-drop, drop-before-send, close-then-take,
+  concurrent send/drop, explicit error and last-resolver loss. It verifies one
+  handoff and that the sink runs outside the completion mutex.
+- `channel::completion_tests` drives actual expected-reply dispatch, complete
+  get bodies and receive-budget release, empty/error get results, Ack/Nack with
+  returned bodies, and publish-write completion handing off its confirm.
+- `abandoned_native_handshake_completes_to_its_owner_on_stop` drives a supplied
+  transport, abandons the native handshake receiver, stops and joins the physical
+  owner, and observes its one error completion with transport destruction.
+
+The crate's Tokio suite runs against an owned isolated RabbitMQ 4.3.5, including
+the upstream broker tests, retry and supplied-driver tests and doctests.
+Clippy checks all targets with `-D warnings`; formatting checks the crate and
+the separately generated channel source. No Boundless adapter or pin changes
+belong to this phase-0 patch; W14c consumes the confirm handoff.
+The complete suite passes 40 unit tests, 17 integration tests and 7 doctests
+(exit 0); Clippy, both formatting checks and code generation pass (exit 0).

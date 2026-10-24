@@ -2,7 +2,7 @@ use event_listener::{Event, EventListener};
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, Weak},
     task::{Context, Poll},
 };
 
@@ -18,8 +18,41 @@ struct Inner {
 struct State {
     stopped: bool,
     active: usize,
+    retiring: bool,
+    replies: Vec<Weak<dyn RetiringReply>>,
 }
+pub(crate) trait RetiringReply: Send + Sync { fn retire(&self); }
+
 impl TaskScope {
+    pub(crate) fn register_reply(&self, reply: Arc<dyn RetiringReply>) {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopped && state.active == 0 {
+            drop(state);
+            reply.retire();
+        } else {
+            state.replies.retain(|reply| reply.strong_count() != 0);
+            state.replies.push(Arc::downgrade(&reply));
+        }
+    }
+
+    fn retire_replies(&self) {
+        let replies = {
+            let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.stopped || state.active != 0 || state.retiring { return; }
+            state.retiring = true;
+            std::mem::take(&mut state.replies)
+        };
+        // Never run completion sinks with the scope state lock held.
+        for reply in replies {
+            if let Some(reply) = reply.upgrade() { reply.retire(); }
+        }
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.retiring = false;
+        self.0.drained.notify_all();
+        drop(state);
+        self.0.stopped.notify(usize::MAX);
+    }
+
     pub(crate) fn wrap(&self, future: impl Future<Output = ()> + Send + 'static) -> ScopedFuture {
         let listener = Box::pin(self.0.stopped.listen());
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -39,23 +72,6 @@ impl TaskScope {
             guard: Some(Guard(self.clone())),
         }
     }
-    pub(crate) async fn retired(&self) {
-        // Let scoped tasks propagate already-ready replies before cancelling
-        // their external callers. Listen before checking to avoid missed stops
-        // or the final drain, including callers arriving after retirement.
-        loop {
-            let listener = self.0.stopped.listen();
-            let retired = {
-                let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-                state.stopped && state.active == 0
-            };
-            if retired {
-                return;
-            }
-            listener.await;
-        }
-    }
-
     pub(crate) fn stop(&self) {
         self.0
             .state
@@ -63,18 +79,15 @@ impl TaskScope {
             .unwrap_or_else(|e| e.into_inner())
             .stopped = true;
         self.0.stopped.notify(usize::MAX);
+        self.retire_replies();
     }
     pub(crate) fn is_finished(&self) -> bool {
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .active
-            == 0
+        let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.active == 0 && !state.retiring
     }
     pub(crate) fn wait(&self) {
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        while state.active != 0 {
+        while state.active != 0 || state.retiring {
             state = self
                 .0
                 .drained
@@ -88,14 +101,10 @@ impl Drop for Guard {
     fn drop(&mut self) {
         let mut state = self.0.0.state.lock().unwrap_or_else(|e| e.into_inner());
         state.active -= 1;
-        if state.active == 0 {
-            self.0.0.drained.notify_all();
-        }
         let retired = state.stopped && state.active == 0;
+        if !retired && state.active == 0 { self.0.0.drained.notify_all(); }
         drop(state);
-        if retired {
-            self.0.0.stopped.notify(usize::MAX);
-        }
+        if retired { self.0.retire_replies(); }
     }
 }
 pub(crate) struct ScopedFuture {

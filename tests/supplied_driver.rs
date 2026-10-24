@@ -76,6 +76,32 @@ fn probe(mode: Mode) -> (Probe, Arc<AtomicBool>, Arc<AtomicUsize>) {
         writes,
     )
 }
+
+#[tokio::test]
+async fn abandoned_native_handshake_completes_to_its_owner_on_stop() {
+    let (stream, dropped, writes) = probe(Mode::Write);
+    let (owner, handshake) = Connection::from_stream_completion(
+        "amqp://invalid.invalid/%2f".parse().unwrap(),
+        Runtime::tokio_current(),
+        stream,
+        ConnectionProperties::default().with_auth_provider(External),
+    )
+    .unwrap();
+    let (send, recv) = std::sync::mpsc::channel();
+    drop(handshake.with_sink(move |result| {
+        let _ = send.send(result);
+    }));
+    until(|| writes.load(Ordering::SeqCst) != 0).await;
+    owner.stop();
+    until(|| owner.is_finished()).await;
+    tokio::task::spawn_blocking(move || owner.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(recv.try_recv().unwrap().is_err());
+    assert!(recv.try_recv().is_err());
+    assert!(dropped.load(Ordering::SeqCst));
+}
 async fn until(mut check: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(3), async {
         while !check() {

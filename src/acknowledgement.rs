@@ -180,7 +180,6 @@ impl Inner {
                 resolvers.1.reject(error.clone());
             }
         }
-        self.returned_messages.clear_dropped_confirms();
     }
 
     fn reset(&mut self, error: Error) {

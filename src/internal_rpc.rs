@@ -50,43 +50,32 @@ pub(crate) struct InternalRPCHandle {
 }
 
 impl InternalRPCHandle {
-    // Every public RPC-queue caller waits here. Keep completed successes and
-    // errors; resolve proven abandonment through the shutdown owner.
-    pub(crate) async fn await_reply<T>(&self, mut promise: Promise<T>) -> Result<T> {
-        use crate::promise::Completion;
-        use std::task::Poll;
+    // The promise owner decides cancellation before any read or sink delivery.
+    pub(crate) fn reply<T: Send + 'static>(&self, marker: &str) -> (Promise<T>, PromiseResolver<T>) {
+        Promise::rpc(marker, self.connection_status.clone(), &self.task_scope)
+    }
 
-        let mut retired = std::pin::pin!(self.task_scope.retired());
+    #[cfg(test)]
+    async fn await_reply<T>(&self, mut promise: Promise<T>) -> Result<T> {
         std::future::poll_fn(|cx| {
-            let completion = match promise.poll_completion(cx) {
-                Poll::Ready(completion) => Some(completion),
-                Poll::Pending => {
-                    #[cfg(test)]
-                    tests::after_pending_reply_poll(self);
-                    if retired.as_mut().poll(cx).is_pending() {
-                        return Poll::Pending;
-                    }
-                    // The last producer can complete between the first poll
-                    // and releasing its guard. Retirement synchronizes with
-                    // that release; recheck the final reply before cancelling.
-                    match promise.poll_completion(cx) {
-                        Poll::Ready(completion) => Some(completion),
-                        Poll::Pending => None,
-                    }
-                }
-            };
-            let error = match completion {
-                Some(Completion::Completed(result)) => return Poll::Ready(result),
-                Some(Completion::Abandoned(error)) => error,
-                None => std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "RPC scope retired before reply completion",
-                )
-                .into(),
-            };
-            Poll::Ready(Err(self.connection_status.rejection().unwrap_or(error)))
-        })
-        .await
+            let result = std::pin::Pin::new(&mut promise).poll(cx);
+            if result.is_pending() {
+                tests::after_pending_reply_poll(self);
+            }
+            result
+        }).await
+    }
+
+    #[cfg(test)]
+    async fn close_connection_checked(&self, code: ReplyCode, text: ShortString, class: Identifier, method: Identifier) -> Result<()> {
+        self.set_connection_closing();
+        tests::pause_between_close_commands(self).await;
+        self.enqueue_connection_close(code, text, class, method).await
+    }
+
+    #[cfg(test)]
+    async fn create_channel(&self, closer: Arc<ConnectionCloser>) -> Result<Channel> {
+        self.create_channel_completion(closer).await
     }
 
     pub(crate) fn basic_ack(
@@ -191,17 +180,19 @@ impl InternalRPCHandle {
         ));
     }
 
-    pub(crate) async fn close_connection_checked(
+    pub(crate) fn close_connection_checked_completion(
         &self,
         reply_code: ReplyCode,
         reply_text: ShortString,
         class_id: Identifier,
         method_id: Identifier,
-    ) -> Result<()> {
+    ) -> Promise<()> {
         self.set_connection_closing();
-        #[cfg(test)]
-        tests::pause_between_close_commands(self).await;
-        let (promise, resolver) = Promise::new("connection.close");
+        self.enqueue_connection_close(reply_code, reply_text, class_id, method_id)
+    }
+
+    fn enqueue_connection_close(&self, reply_code: ReplyCode, reply_text: ShortString, class_id: Identifier, method_id: Identifier) -> Promise<()> {
+        let (promise, resolver) = self.reply("connection.close");
         self.send(InternalCommand::CloseConnection(
             reply_code,
             reply_text,
@@ -209,16 +200,16 @@ impl InternalRPCHandle {
             method_id,
             Some(resolver),
         ));
-        self.await_reply(promise).await
+        promise
     }
 
-    pub(crate) async fn create_channel(
+    pub(crate) fn create_channel_completion(
         &self,
         connection_closer: Arc<ConnectionCloser>,
-    ) -> Result<Channel> {
-        let (promise, resolver) = Promise::new("channel.create");
+    ) -> Promise<Channel> {
+        let (promise, resolver) = self.reply("channel.create");
         self.send(InternalCommand::CreateChannel(connection_closer, resolver));
-        self.await_reply(promise).await
+        promise
     }
 
     pub(crate) fn deregister_consumer(&self, channel_id: ChannelId, consumer_tag: ShortString) {
@@ -297,9 +288,17 @@ impl InternalRPCHandle {
         secret: LongString,
         reason: ShortString,
     ) -> Result<()> {
-        let (promise, resolver) = Promise::new("connection.update-secret");
+        self.update_secret_completion(secret, reason).await
+    }
+
+    pub(crate) fn update_secret_completion(
+        &self,
+        secret: LongString,
+        reason: ShortString,
+    ) -> Promise<()> {
+        let (promise, resolver) = self.reply("connection.update-secret");
         self.send(InternalCommand::UpdateSecret(secret, reason, resolver));
-        self.await_reply(promise).await
+        promise
     }
 
     pub(crate) fn stop(&self) {
@@ -444,16 +443,14 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
         }));
     }
 
-    pub(crate) fn register_internal_future_with_resolver<T: Send + 'static>(
-        &self,
-        fut: impl Future<Output = Result<T>> + Send + 'static,
+    fn forward_completion<T: Send + 'static>(
+        completion: Result<Promise<T>>,
         resolver: PromiseResolver<T>,
     ) {
-        self.register_internal_future(async move {
-            let res = fut.await;
-            resolver.complete(res);
-            Ok(())
-        });
+        match completion {
+            Ok(completion) => drop(completion.with_sink(move |result| resolver.complete(result))),
+            Err(error) => resolver.reject(error),
+        }
     }
 
     fn apply_connection_error(&self, channels: &Channels, error: Error) {
@@ -502,46 +499,37 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                     if !self.channel_ok(channel_id) {
                         continue;
                     }
-                    let channel = get_channel(channel_id);
-                    self.register_internal_future_with_resolver(
-                        async move {
-                            if let Some(error) = error {
-                                error.check()?;
-                            }
-                            channel?.basic_ack(delivery_tag, options).await
-                        },
-                        resolver,
-                    )
+                    let completion = (|| {
+                        if let Some(error) = error {
+                            error.check()?;
+                        }
+                        get_channel(channel_id)?.basic_ack_completion(delivery_tag, options)
+                    })();
+                    Self::forward_completion(completion, resolver)
                 }
                 BasicNack(channel_id, delivery_tag, options, resolver, error) => {
                     if !self.channel_ok(channel_id) {
                         continue;
                     }
-                    let channel = get_channel(channel_id);
-                    self.register_internal_future_with_resolver(
-                        async move {
-                            if let Some(error) = error {
-                                error.check()?;
-                            }
-                            channel?.basic_nack(delivery_tag, options).await
-                        },
-                        resolver,
-                    )
+                    let completion = (|| {
+                        if let Some(error) = error {
+                            error.check()?;
+                        }
+                        get_channel(channel_id)?.basic_nack_completion(delivery_tag, options)
+                    })();
+                    Self::forward_completion(completion, resolver)
                 }
                 BasicReject(channel_id, delivery_tag, options, resolver, error) => {
                     if !self.channel_ok(channel_id) {
                         continue;
                     }
-                    let channel = get_channel(channel_id);
-                    self.register_internal_future_with_resolver(
-                        async move {
-                            if let Some(error) = error {
-                                error.check()?;
-                            }
-                            channel?.basic_reject(delivery_tag, options).await
-                        },
-                        resolver,
-                    )
+                    let completion = (|| {
+                        if let Some(error) = error {
+                            error.check()?;
+                        }
+                        get_channel(channel_id)?.basic_reject_completion(delivery_tag, options)
+                    })();
+                    Self::forward_completion(completion, resolver)
                 }
                 CancelConsumer(channel_id, consumer_tag, consumer_status) => {
                     if !self.channel_ok(channel_id) {
@@ -576,15 +564,19 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                         continue;
                     }
                     let channel0 = channels.channel0();
-                    let fut = async move {
-                        channel0
-                            .connection_close(reply_code, reply_text, class_id, method_id)
-                            .await
-                    };
                     if let Some(resolver) = resolver {
-                        self.register_internal_future_with_resolver(fut, resolver)
+                        Self::forward_completion(
+                            channel0.connection_close_completion(
+                                reply_code, reply_text, class_id, method_id,
+                            ),
+                            resolver,
+                        )
                     } else {
-                        self.register_internal_future(fut)
+                        self.register_internal_future(async move {
+                            channel0
+                                .connection_close(reply_code, reply_text, class_id, method_id)
+                                .await
+                        })
                     }
                 }
                 RejectFrame(channel_id, error, class_id, method_id, handshake) => {
@@ -623,8 +615,8 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                     channels.set_connection_error(error);
                 }
                 CreateChannel(closer, resolver) => match channels.create(closer) {
-                    Ok(channel) => self.register_internal_future_with_resolver(
-                        async move { channel.clone().channel_open(channel).await },
+                    Ok(channel) => Self::forward_completion(
+                        channel.channel_open_completion(channel.clone()),
                         resolver,
                     ),
                     Err(err) => resolver.reject(err),
@@ -699,18 +691,12 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                     self.heartbeat.start(self.handle());
                     self.secret_update.start(self.handle());
                 }
-                UpdateSecret(secret, reason, resolver) => {
-                    let channels = channels.clone();
-                    self.register_internal_future_with_resolver(
-                        async move {
-                            channels
-                                .channel0()
-                                .connection_update_secret(secret, reason)
-                                .await
-                        },
-                        resolver,
-                    )
-                }
+                UpdateSecret(secret, reason, resolver) => Self::forward_completion(
+                    channels
+                        .channel0()
+                        .connection_update_secret_completion(secret, reason),
+                    resolver,
+                ),
             }
             self.handle.waker.wake();
         }
@@ -915,7 +901,7 @@ mod tests {
             status.clone(),
         );
         let handle = rpc.handle();
-        let (promise, resolver) = Promise::new("ready scoped reply");
+        let (promise, resolver) = handle.reply("ready scoped reply");
         let task = handle.task_scope.wrap(async move {
             resolver.resolve(7);
         });
@@ -970,7 +956,7 @@ mod tests {
 
     async fn reply_completed_between_polls(result: Result<u8>) -> Result<u8> {
         let handle = reserved_reply_handle();
-        let (promise, resolver) = Promise::new("reply completed between polls");
+        let (promise, resolver) = handle.reply("reply completed between polls");
         let task = handle.task_scope.wrap(async move {
             resolver.complete(result);
         });
@@ -999,7 +985,7 @@ mod tests {
     #[tokio::test]
     async fn rpc_completed_broken_pipe_keeps_its_result() {
         let handle = reserved_reply_handle();
-        let (promise, resolver) = Promise::<()>::new("completed transport error");
+        let (promise, resolver) = handle.reply::<()>("completed transport error");
         resolver.reject(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
         let error = handle.await_reply(promise).await.unwrap_err();
         assert!(matches!(error.kind(), ErrorKind::IOError(cause)
@@ -1009,13 +995,53 @@ mod tests {
     #[tokio::test]
     async fn rpc_abandoned_resolver_uses_the_reserved_rejection() {
         let handle = reserved_reply_handle();
-        let (promise, resolver) = Promise::<()>::new("abandoned reply");
+        let (promise, resolver) = handle.reply::<()>("abandoned reply");
         drop(resolver);
         let error = handle.await_reply(promise).await.unwrap_err();
         assert!(matches!(error.kind(), ErrorKind::ProtocolViolation(cause)
             if cause.get_id() == 503));
     }
 
+    #[test]
+    fn native_rpc_forwarding_preserves_the_result_without_another_task_poll() {
+        for ready in [false, true] {
+            for error in [false, true] {
+                let (native, resolver) = Promise::new("native reply");
+                let (reply, reply_resolver) = Promise::new("RPC caller");
+                let complete = || {
+                    if error {
+                        resolver.reject(ErrorKind::MissingHeartbeatError.into());
+                    } else {
+                        resolver.resolve(7);
+                    }
+                };
+                if ready {
+                    complete();
+                }
+                InternalRPC::<crate::runtime::DefaultRuntimeKit>::forward_completion(
+                    Ok(native),
+                    reply_resolver,
+                );
+                let (send, recv) = std::sync::mpsc::channel();
+                drop(reply.with_sink(move |result| {
+                    let _ = send.send(result);
+                }));
+                if !ready {
+                    complete();
+                }
+                let result = recv.try_recv().unwrap();
+                if error {
+                    assert!(
+                        matches!(result, Err(error) if matches!(error.kind(), ErrorKind::MissingHeartbeatError))
+                    );
+                } else {
+                    assert!(matches!(result, Ok(7)));
+                }
+                drop(resolver);
+                assert!(recv.try_recv().is_err());
+            }
+        }
+    }
     #[tokio::test]
     async fn a_full_internal_rpc_queue_reports_its_command_count() {
         let runtime = Runtime::tokio_current();

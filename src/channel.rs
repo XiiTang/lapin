@@ -17,7 +17,7 @@ use crate::{
     message::{BasicGetMessage, BasicReturnMessage, Delivery},
     promise::Cancelable,
     protocol::{self, AMQPClass, AMQPError, AMQPHardError},
-    publisher_confirm::PublisherConfirm,
+    publisher_confirm::{Confirmation, PublisherConfirm},
     queue::Queue,
     registry::Registry,
     returned_messages::ReturnedMessages,
@@ -264,6 +264,15 @@ impl Channel {
         self.do_channel_close(reply_code, reply_text, 0, 0).await
     }
 
+    /// Admit a channel close and expose its native completion receiver.
+    pub fn close_completion(
+        &self,
+        reply_code: ReplyCode,
+        reply_text: ShortString,
+    ) -> Result<crate::Completion<()>> {
+        self.do_channel_close_completion(reply_code, reply_text, 0, 0)
+    }
+
     /// Start a message consumer on `queue`.
     ///
     /// Returns a [`Consumer`] stream that yields [`Delivery`] values.
@@ -284,6 +293,22 @@ impl Channel {
         Ok(consumer.external(self.id))
     }
 
+    /// Admit a consumer and expose its native completion receiver.
+    pub fn basic_consume_completion(
+        &self,
+        queue: ShortString,
+        consumer_tag: ShortString,
+        options: BasicConsumeOptions,
+        arguments: FieldTable,
+    ) -> Result<crate::Completion<Consumer>> {
+        let id = self.id;
+        Ok(self
+            .do_basic_consume_completion(queue, consumer_tag, options, arguments, None)?
+            .map("basic.consume.external", move |consumer| {
+                consumer.external(id)
+            }))
+    }
+
     /// Synchronously fetch a single message from `queue`.
     ///
     /// Returns `None` if the queue is empty, or `Some(`[`BasicGetMessage`]`)`.
@@ -298,6 +323,16 @@ impl Channel {
         options: BasicGetOptions,
     ) -> Result<Option<BasicGetMessage>> {
         self.do_basic_get(queue, options, None).await
+    }
+
+    /// Admit a get and expose its native completion receiver, including the
+    /// complete body and its receive reservation, or the empty/error result.
+    pub fn basic_get_completion(
+        &self,
+        queue: ShortString,
+        options: BasicGetOptions,
+    ) -> Result<crate::Completion<Option<BasicGetMessage>>> {
+        self.do_basic_get_completion(queue, options, None)
     }
 
     /// Declare an exchange, creating it if it does not already exist.
@@ -324,6 +359,31 @@ impl Channel {
         .await
     }
 
+    /// Admit an exchange declaration and expose its native completion receiver.
+    pub fn exchange_declare_completion(
+        &self,
+        exchange: ShortString,
+        kind: ExchangeKind,
+        options: ExchangeDeclareOptions,
+        arguments: FieldTable,
+    ) -> Result<crate::Completion<()>> {
+        self.do_exchange_declare_completion(
+            exchange,
+            kind.kind().into(),
+            options,
+            arguments,
+            kind.clone(),
+        )
+    }
+
+    /// Transfer abandoned publisher-confirm receivers without flattening Ack,
+    /// Nack, errors or returned messages. Each receiver is removed exactly once.
+    /// The legacy `wait_for_confirms` drain consumes these same receivers.
+    #[must_use]
+    pub fn take_dropped_confirms(&self) -> Vec<crate::Completion<Confirmation>> {
+        self.returned_messages.take_dropped_confirms()
+    }
+
     /// Wait for all outstanding publisher confirms and return any returned messages.
     ///
     /// Blocks until every [`PublisherConfirm`] produced by prior
@@ -336,13 +396,20 @@ impl Channel {
     /// [`basic_publish`]: Self::basic_publish
     /// [`confirm_select`]: Self::confirm_select
     pub async fn wait_for_confirms(&self) -> Result<Vec<BasicReturnMessage>> {
+        self.wait_for_confirms_completion().await
+    }
+
+    /// Admit the legacy confirm drain and expose its native completion receiver.
+    /// Use `take_dropped_confirms` for individual Ack/Nack/error ownership.
+    pub fn wait_for_confirms_completion(&self) -> crate::Completion<Vec<BasicReturnMessage>> {
         if let Some(last_pending) = self.acknowledgements.get_last_pending() {
             trace!("Waiting for pending confirms");
-            last_pending.await?;
+            let returned_messages = self.returned_messages.clone();
+            last_pending.map("wait_for_confirms", move |()| returned_messages.drain())
         } else {
             trace!("No confirms to wait for");
+            Promise::new_with_data("wait_for_confirms", Ok(self.returned_messages.drain()))
         }
-        Ok(self.returned_messages.drain())
     }
 
     #[cfg(test)]
@@ -571,14 +638,14 @@ impl Channel {
         self.wake();
     }
 
-    async fn send_method_frame_with_body(
+    fn send_method_frame_with_body(
         &self,
         ctx: &'static str,
         method: AMQPClass,
         payload: &[u8],
         properties: BasicProperties,
         publisher_confirms_result: Option<PublisherConfirm>,
-    ) -> Result<PublisherConfirm> {
+    ) -> Result<Promise<PublisherConfirm>> {
         let class_id = method.get_amqp_class_id();
         let header = AMQPContentHeader {
             class_id,
@@ -608,9 +675,11 @@ impl Channel {
             self.frames.push_frames(self.id, frames, resolver);
         }
         self.wake();
-        promise.await?;
-        Ok(publisher_confirms_result
-            .unwrap_or_else(|| PublisherConfirm::not_requested(self.returned_messages.clone())))
+        let returned_messages = self.returned_messages.clone();
+        Ok(promise.map(ctx, move |()| {
+            publisher_confirms_result
+                .unwrap_or_else(|| PublisherConfirm::not_requested(returned_messages))
+        }))
     }
 
     pub(crate) fn report_protocol_violation(
@@ -1578,6 +1647,9 @@ impl Drop for AuthenticationGuard {
 
 #[cfg(all(test, feature = "tokio"))]
 mod topology_collection_tests;
+
+#[cfg(all(test, feature = "tokio"))]
+mod completion_tests;
 
 #[cfg(all(test, feature = "tokio"))]
 mod partial_get_tests {
