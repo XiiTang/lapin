@@ -527,7 +527,6 @@ impl Channel {
         mut topology: ChannelDefinition,
         names: &std::collections::HashMap<ShortString, ShortString>,
     ) -> Result<()> {
-        let (consumer_prefetch, global_prefetch) = self.status.qos_snapshot();
         for queue in &mut topology.queues {
             if let Some(name) = names.get(&queue.name) {
                 self.local_registry.remap_queue(&queue.name, name)?;
@@ -562,19 +561,8 @@ impl Channel {
             }
         }
 
-        // Restore acknowledged channel QoS before any consumer can receive.
-        if let Some(count) = global_prefetch {
-            self.basic_qos(count, BasicQosOptions { global: true })
-                .await?;
-        }
-        // Consumers created before an explicit QoS retain the broker default.
-        // Recreate those first, before applying limits captured by later ones.
-        topology.consumers.sort_by_key(|consumer| consumer.prefetch);
+        // Finally, redeclare all consumers.
         for consumer in topology.consumers.iter().cloned() {
-            if let Some(count) = consumer.prefetch {
-                self.basic_qos(count, BasicQosOptions { global: false })
-                    .await?;
-            }
             if let Some(name) = names.get(&consumer.queue()) {
                 consumer.set_queue(name.clone());
             }
@@ -589,10 +577,6 @@ impl Channel {
             .await?;
         }
 
-        if let Some(count) = consumer_prefetch {
-            self.basic_qos(count, BasicQosOptions { global: false })
-                .await?;
-        }
         Ok(())
     }
 
@@ -1453,11 +1437,6 @@ impl Channel {
         }
     }
 
-    fn on_basic_qos_ok_received(&self, prefetch_count: u16, global: bool) -> Result<()> {
-        self.status.qos_confirmed(prefetch_count, global);
-        Ok(())
-    }
-
     fn on_basic_consume_ok_received(
         &self,
         method: protocol::basic::ConsumeOk,
@@ -1469,16 +1448,14 @@ impl Channel {
         original: Option<Consumer>,
     ) -> Result<()> {
         let consumer = original.unwrap_or_else(|| {
-            let mut consumer = Consumer::new(
+            Consumer::new(
                 method.consumer_tag.clone(),
                 self.internal_rpc.clone(),
                 channel_closer,
                 queue,
                 options,
                 arguments,
-            );
-            consumer.prefetch = self.status.qos_snapshot().0;
-            consumer
+            )
         });
         self.consumers
             .register(method.consumer_tag, consumer.clone());

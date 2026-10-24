@@ -659,3 +659,25 @@ suite against owned RabbitMQ 4.3.5 passes 46 unit tests, 18 integration tests
 `cargo clippy --locked --no-default-features --features tokio --all-targets --
 -D warnings`, `cargo fmt --all -- --check` and the generated-source rustfmt
 check also pass (exit 0).
+
+## Retire automatic QoS snapshots and replay (owner audit, Rule 23/W7d)
+
+Remove the local extension from `04c282a`: at `0b6c75f4`,
+`src/channel_status.rs:59-70` retained confirmed QoS, `src/channel.rs:536-601`
+replayed it during recovery, and `src/consumer.rs:137` retained per-consumer
+prefetch. Boundless disables native automatic recovery and Registry collection
+under W1b; its W7d journal owns restoration. Ordinary `basic.qos`, including its
+native completion receiver, remains unchanged. The QoS reply now completes at
+the ordinary generated reply dispatcher without a snapshot hook. Consumer
+creation and all recovery paths have no local QoS snapshot to read.
+
+Source comparison: upstream v4.11.0 `src/channel.rs:377-463` restores consumers
+without these snapshots or QoS replay. The shared generator metadata and generated
+reply variant return to that behavior while retaining W4d completion ownership.
+
+Regression: `qos_replies_complete_without_adding_recovery_work` dispatches and
+acknowledges both global and non-global QoS, then checks that an otherwise empty
+recovery has no further QoS work. On `0b6c75f4` it fails (exit 101); after removal
+it passes (exit 0). Validation uses `build-slot`, `CARGO_INCREMENTAL=0`, on macOS
+arm64: Tokio fork suite, strict all-target Clippy, generator build and both normal
+and generated-source format checks (all exit 0).

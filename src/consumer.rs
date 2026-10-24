@@ -134,7 +134,6 @@ impl<
 /// ```
 #[derive(Clone)]
 pub struct Consumer {
-    pub(crate) prefetch: Option<u16>,
     consumer_tag: ShortString,
     inner: Arc<Mutex<Inner>>,
     status: ConsumerStatus,
@@ -161,7 +160,6 @@ impl Consumer {
         let (sender, receiver) = flume::unbounded();
         let status = ConsumerStatus::default();
         Self {
-            prefetch: None,
             consumer_tag: consumer_tag.clone(),
             inner: Arc::new(Mutex::new(Inner::new(
                 consumer_tag,

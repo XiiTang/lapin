@@ -215,3 +215,28 @@ fn default_collection_still_retains_topology() {
     assert_eq!(topology.queues.len(), 1);
     assert!(topology.queues[0].is_declared);
 }
+
+#[test]
+fn qos_replies_complete_without_adding_recovery_work() {
+    let (channel, _rpc) = channel(ConnectionProperties::default().enable_auto_recover());
+    for global in [false, true] {
+        reply(
+            &channel,
+            channel.basic_qos(7, BasicQosOptions { global }),
+            AMQPClass::Basic(protocol::basic::AMQPMethod::QosOk(
+                protocol::basic::QosOk {},
+            )),
+        );
+    }
+    channel.init_recovery(ErrorKind::MissingHeartbeatError.into());
+    let topology = channel.update_recovery().unwrap();
+    channel.set_state(ChannelState::Connected);
+    let names = std::collections::HashMap::new();
+    let mut recovery = pin!(channel.finish_recovery(topology, &names));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        matches!(recovery.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+        "recovery unexpectedly replays previously acknowledged QoS"
+    );
+    assert!(channel.frames.pop(true).is_none());
+}

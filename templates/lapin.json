@@ -584,40 +584,6 @@
           "params": ["multiple", "delivery_tag"]
         }
       }
-    },
-    "qos": {
-      "metadata": {
-        "state": [
-          {
-            "name": "prefetch_count",
-            "type": "ShortUInt"
-          },
-          {
-            "name": "global",
-            "type": "bool"
-          }
-        ]
-      }
-    },
-    "qos-ok": {
-      "metadata": {
-        "state": [
-          {
-            "name": "prefetch_count",
-            "type": "ShortUInt"
-          },
-          {
-            "name": "global",
-            "type": "bool"
-          }
-        ],
-        "received_hook": {
-          "params": [
-            "prefetch_count",
-            "global"
-          ]
-        }
-      }
     }
   },
   "metadata": {

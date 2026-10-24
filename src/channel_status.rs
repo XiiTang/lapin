@@ -56,18 +56,6 @@ impl ChannelStatus {
         [ChannelState::Closing, ChannelState::Reconnecting].contains(&self.read().state)
     }
 
-    pub(crate) fn qos_confirmed(&self, count: u16, global: bool) {
-        let mut state = self.write();
-        if global {
-            state.global_prefetch = Some(count);
-        } else {
-            state.consumer_prefetch = Some(count);
-        }
-    }
-    pub(crate) fn qos_snapshot(&self) -> (Option<u16>, Option<u16>) {
-        let state = self.read();
-        (state.consumer_prefetch, state.global_prefetch)
-    }
     /// Generation of delivery tags and transaction state; changes before recovery.
     #[must_use]
     pub fn generation(&self) -> u64 {
@@ -256,8 +244,6 @@ impl fmt::Debug for ChannelStatus {
 struct Inner {
     id: ChannelId,
     generation: u64,
-    consumer_prefetch: Option<u16>,
-    global_prefetch: Option<u16>,
     confirm: bool,
     send_flow: bool,
     state: ChannelState,
@@ -272,8 +258,6 @@ impl Inner {
         let this = Self {
             id,
             generation: 0,
-            consumer_prefetch: None,
-            global_prefetch: None,
             confirm: false,
             send_flow: true,
             state: ChannelState::default(),

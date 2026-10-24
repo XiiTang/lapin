@@ -217,7 +217,7 @@ use options::*;
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum Reply {
     ConnectionStep(ConnectionStep),
-    BasicQosOk(PromiseResolver<()>, ShortUInt, bool),
+    BasicQosOk(PromiseResolver<()>),
     BasicConsumeOk(
         PromiseResolver<Consumer>,
         Option<Arc<ChannelCloser>>,
@@ -425,7 +425,7 @@ impl Channel {
 
         let BasicQosOptions { global } = options;
         let (promise, resolver) = Promise::new("basic.qos");
-        let reply = Reply::BasicQosOk(resolver.clone(), prefetch_count, global);
+        let reply = Reply::BasicQosOk(resolver.clone());
         let method = AMQPClass::Basic(protocol::basic::AMQPMethod::Qos(protocol::basic::Qos {
             prefetch_count,
             global,
@@ -448,8 +448,8 @@ impl Channel {
             .frames
             .find_expected_reply(self.id, |reply| matches!(&reply.0, Reply::BasicQosOk(..)))
         {
-            Some(Reply::BasicQosOk(resolver, prefetch_count, global)) => {
-                let res = self.on_basic_qos_ok_received(prefetch_count, global);
+            Some(Reply::BasicQosOk(resolver)) => {
+                let res = Ok(());
                 resolver.complete(res.clone());
                 res
             }
