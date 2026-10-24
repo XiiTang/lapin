@@ -102,6 +102,36 @@ async fn abandoned_native_handshake_completes_to_its_owner_on_stop() {
     assert!(recv.try_recv().is_err());
     assert!(dropped.load(Ordering::SeqCst));
 }
+
+#[tokio::test]
+async fn ingress_can_be_frozen_before_handshake_and_after_candidate_stop() {
+    let (stream, dropped, _) = probe(Mode::Write);
+    let (owner, handshake) = Connection::from_stream_completion(
+        "amqp://invalid.invalid/%2f".parse().unwrap(),
+        Runtime::tokio_current(),
+        stream,
+        ConnectionProperties::default().with_auth_provider(External),
+    )
+    .unwrap();
+    let (send, recv) = std::sync::mpsc::channel();
+    drop(handshake.with_sink(move |result| {
+        let _ = send.send(result);
+    }));
+    let frozen = owner.freeze_ingress();
+    assert!(frozen.is_empty());
+    owner.stop();
+    assert_eq!(owner.freeze_ingress(), frozen);
+    until(|| owner.is_finished()).await;
+    tokio::task::spawn_blocking(move || owner.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(recv.try_recv(), Ok(Err(error)) if matches!(error.kind(), lapin::ErrorKind::IOError(cause) if cause.kind() == io::ErrorKind::ConnectionAborted))
+    );
+    assert!(recv.try_recv().is_err());
+    assert!(dropped.load(Ordering::SeqCst));
+}
 async fn until(mut check: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(3), async {
         while !check() {

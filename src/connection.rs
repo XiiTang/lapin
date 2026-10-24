@@ -15,14 +15,14 @@ use crate::{
     socket_state::SocketState,
     tcp::{AMQPUriTcpExt, OwnedTLSConfig},
     thread::ThreadHandle,
-    types::{LongString, ReplyCode, ShortString},
+    types::{ChannelId, DeliveryTag, LongString, ReplyCode, ShortString},
     uri::AMQPUri,
 };
 use amq_protocol::frame::{AMQPFrame, ProtocolVersion};
 use async_rs::{Runtime, traits::*};
 use async_trait::async_trait;
 use futures_core::Stream;
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 use tracing::trace;
 
 /// A TCP connection to the AMQP server.
@@ -66,6 +66,24 @@ impl ConnectorControl {
 /// this owner requests an immediate stop; it never emits AMQP cleanup commands.
 pub struct ConnectionDriver(ConnectorControl);
 impl ConnectionDriver {
+    /// Permanently stop native frame ingress and return each channel's final
+    /// incoming delivery-tag high-water mark (an absent channel has mark zero).
+    /// Consumer and basic.get tags share a mark; publisher confirms do not.
+    /// Reusing a native channel id starts a fresh mark before freeze. Use with
+    /// automatic recovery disabled for one physical generation per owner.
+    ///
+    /// This joins any in-flight native dispatch. Complete consumer/get results
+    /// already accepted remain available with their original generation and
+    /// tags. Partial messages cannot complete after this fence. The hook sends
+    /// no settlement or close and does not itself stop I/O or resolve pending
+    /// operations. Stop and join this owner after taking the snapshot, before
+    /// admitting replacement data. Freezing an already stopped/failed candidate
+    /// also retains its marks. There is no unfreeze or reset for this owner.
+    #[must_use]
+    pub fn freeze_ingress(&self) -> BTreeMap<ChannelId, DeliveryTag> {
+        self.0.channels.freeze_ingress()
+    }
+
     /// Stop physical I/O immediately without sending protocol cleanup.
     pub fn stop(&self) {
         self.0.stop();

@@ -598,3 +598,64 @@ the separately generated channel source. No Boundless adapter or pin changes
 belong to this phase-0 patch; W14c consumes the confirm handoff.
 The complete suite passes 40 unit tests, 17 integration tests and 7 doctests
 (exit 0); Clippy, both formatting checks and code generation pass (exit 0).
+
+## Freeze physical ingress with final channel delivery tags (plan W7d, fork part)
+
+Rule 23 needs a final old-generation high-water mark before replacement data is
+admitted. At W4d revision `02ed755`, `src/channels.rs:187-239` dispatched methods,
+headers and bodies without a fence. A caller could neither stop that admission
+atomically nor account for tags already retained in native consumer/get buffers.
+
+`ConnectionDriver::freeze_ingress() -> BTreeMap<ChannelId, DeliveryTag>` is an
+irreversible native frame fence. `Channels::handle_frame`, the I/O loop's one
+dispatch entry point, holds the same private mutex as freeze through dispatch,
+content assembly and receiver completion. Each Basic.Deliver and Basic.GetOk
+updates its channel's maximum before dispatch, including no_ack, buffered and
+partial messages. Publisher-confirm tags do not enter this map. Entries survive
+native channel removal and candidate failure. A channel absent from the map has
+mark zero; repeated freezes return the same values, without offset arithmetic.
+Creating a new native channel lifetime on a reused id resets that id's mark
+under the same fence before its first delivery. This prevents an ended
+channel's tag 13 from inflating a replacement's actual high-water tag 1; a
+regression reproduces that wrong snapshot before the reset. Creation after
+freeze cannot change the retirement snapshot. Automatic recovery is disabled
+by the embedding caller when the owner represents one physical generation.
+
+Complete results already accepted remain takeable from their consumer queues and
+get receivers with the original generation, tag, body and reservation. Later
+frames are not dispatched, so a partial body cannot become a complete delivery
+after the fence. Freeze itself sends no settlement/close and ends no feed. The
+retirement owner takes the snapshot, stops and joins the driver, then admits
+replacement data; it can also freeze an already stopped/failed candidate.
+Stop/error and resolver-drop completion still use W4d's completion checkpoint.
+Checked cumulative offsets and captured settlement belong to Boundless W7d;
+structured close remains W5d's separate patch.
+
+Source precedent inspected before implementation: RabbitMQ Java client's
+[ConsumerDispatcher.quiesce](https://github.com/rabbitmq/rabbitmq-java-client/blob/main/src/main/java/com/rabbitmq/client/impl/ConsumerDispatcher.java)
+separates new work admission from queued work, and
+[RecoveryAwareChannelN](https://github.com/rabbitmq/rabbitmq-java-client/blob/main/src/main/java/com/rabbitmq/client/impl/recovery/RecoveryAwareChannelN.java)
+keeps the maximum seen delivery tag separately from the active offset. This
+patch uses lapin's existing frame dispatcher, includes get tags, and leaves
+logical offsets and recovery policy to its caller.
+
+Regressions exercise the actual dispatcher with two consumers and get on one
+channel, a second independent channel, no_ack, unpolled complete bodies and
+GetOk, distinct confirm tags, a pending late GetOk, partial bodies, a failed
+candidate, removed/reused native channels and u64::MAX. A blocking test waker establishes an
+in-flight handoff; the test observes the dispatch mutex held and joins freeze
+before checking its snapshot and later-delivery refusal, without a scheduling
+sleep. The supplied-driver test freezes before handshake and after stop, then
+checks the original aborted-handshake error and transport destruction.
+
+The before test uses unchanged production code at `02ed755` and a test-only
+no-op stand-in for the not-yet-existing freeze API. Its assertion checks that a
+complete post-fence delivery cannot reach the consumer; the final tests use
+the real hook, with no stand-in.
+On macOS arm64 that before test fails the post-freeze delivery assertion
+(exit 101). With this patch all six dispatcher tests pass. The complete Tokio
+suite against owned RabbitMQ 4.3.5 passes 46 unit tests, 18 integration tests
+(including the public supplied-driver freeze test) and 7 doctests (exit 0).
+`cargo clippy --locked --no-default-features --features tokio --all-targets --
+-D warnings`, `cargo fmt --all -- --check` and the generated-source rustfmt
+check also pass (exit 0).

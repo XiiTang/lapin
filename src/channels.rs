@@ -10,18 +10,19 @@ use crate::{
     killswitch::KillSwitch,
     protocol::{AMQPClass, AMQPError, AMQPHardError, channel, connection},
     socket_state::SocketStateHandle,
-    types::{ChannelId, Identifier, PayloadSize},
+    types::{ChannelId, DeliveryTag, Identifier, PayloadSize},
 };
 use amq_protocol::frame::{AMQPFrame, ProtocolVersion};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt,
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 use tracing::{debug, error, trace};
 
 #[derive(Clone)]
 pub(crate) struct Channels {
+    ingress: Arc<Mutex<Ingress>>,
     inner: Arc<RwLock<Inner>>,
     channel0: Channel,
     configuration: Configuration,
@@ -30,6 +31,12 @@ pub(crate) struct Channels {
     frames: Frames,
     connection_killswitch: KillSwitch,
     events: Events,
+}
+
+#[derive(Default)]
+struct Ingress {
+    frozen: bool,
+    high_water: BTreeMap<ChannelId, DeliveryTag>,
 }
 
 impl Channels {
@@ -57,6 +64,7 @@ impl Channels {
         channel0.set_state(ChannelState::Connected);
 
         Self {
+            ingress: Arc::default(),
             inner: Arc::new(RwLock::new(inner)),
             channel0,
             configuration,
@@ -69,13 +77,21 @@ impl Channels {
     }
 
     pub(crate) fn create(&self, connection_closer: Arc<ConnectionCloser>) -> Result<Channel> {
-        self.write().create(
+        let mut ingress = self.ingress.lock().unwrap_or_else(|e| e.into_inner());
+        let channel = self.write().create(
             self.connection_status.clone(),
             self.internal_rpc.clone(),
             self.frames.clone(),
             self.events.sender(),
             connection_closer,
-        )
+        )?;
+        // A reopened native id is a new channel lifetime with a new tag
+        // sequence. Creation and ingress share the fence, so no first delivery
+        // can race this reset, and a frozen retirement snapshot stays final.
+        if !ingress.frozen {
+            ingress.high_water.remove(&channel.id());
+        }
+        Ok(channel)
     }
 
     pub(crate) fn channel0(&self) -> Channel {
@@ -219,6 +235,13 @@ impl Channels {
     }
 
     pub(crate) fn handle_frame(&self, f: AMQPFrame) -> Result<()> {
+        // The I/O loop's only native frame-dispatch entry point. Retain this
+        // guard through content assembly and receiver completion, so a freeze
+        // joins any in-flight handoff before returning the final tag snapshot.
+        let mut ingress = self.ingress.lock().unwrap_or_else(|e| e.into_inner());
+        if ingress.frozen {
+            return Ok(());
+        }
         let _shutdown = self.connection_status.shutdown_guard();
         if let Some(error) = self.connection_status.rejection() {
             // Closing ignores ordinary input. A competing close may abandon
@@ -241,6 +264,17 @@ impl Channels {
                 return Err(error);
             }
             return Ok(());
+        }
+        if let AMQPFrame::Method(id, AMQPClass::Basic(method)) = &f {
+            let tag = match method {
+                crate::protocol::basic::AMQPMethod::Deliver(method) => Some(method.delivery_tag),
+                crate::protocol::basic::AMQPMethod::GetOk(method) => Some(method.delivery_tag),
+                _ => None,
+            };
+            if let Some(tag) = tag {
+                let high_water = ingress.high_water.entry(*id).or_default();
+                *high_water = (*high_water).max(tag);
+            }
         }
         trace!(channel = f.channel_id(), "will handle frame");
         match f {
@@ -368,6 +402,12 @@ impl Channels {
         self.connection_killswitch.kill();
     }
 
+    pub(crate) fn freeze_ingress(&self) -> BTreeMap<ChannelId, DeliveryTag> {
+        let mut ingress = self.ingress.lock().unwrap_or_else(|e| e.into_inner());
+        ingress.frozen = true;
+        ingress.high_water.clone()
+    }
+
     fn read(&self) -> RwLockReadGuard<'_, Inner> {
         self.inner.read().unwrap_or_else(|e| e.into_inner())
     }
@@ -376,6 +416,9 @@ impl Channels {
         self.inner.write().unwrap_or_else(|e| e.into_inner())
     }
 }
+
+#[cfg(all(test, feature = "tokio"))]
+mod ingress_tests;
 
 impl fmt::Debug for Channels {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
