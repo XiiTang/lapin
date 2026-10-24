@@ -2,7 +2,7 @@
 
 Upstream: https://github.com/amqp-rs/lapin, tag v4.11.0,
 base `0dc84fc1f6736817b75f7699e18ea2b08d3ed45f`.
-Branch: `codex/runtime-driver`. Original upstream history is retained.
+Boundless patches are maintained on `boundless`; original upstream history is retained.
 
 The existing connector, parser, channel state, content assembly, confirms,
 transactions and recovery engine remain the only protocol implementation.
@@ -16,12 +16,12 @@ transactions and recovery engine remain the only protocol implementation.
 - ReceiveLimits checks advertised frame/body sizes before body allocation and
   reserves aggregate message bytes/count until Delivery/Get/Return values drop.
   Event and internal RPC queues are bounded and fail closed on overflow.
-- Topology retention has an aggregate metadata budget; duplicate bindings are
-  deduplicated. Consumer payload queues retain the native delivery reservations.
-- Reconnect, topology restoration and consumer restoration are separate settings.
-  The caller bounds connector attempts. Pending publications and transactions
-  are never replayed. Channel generation invalidation is synchronized with frame
-  admission; stale acknowledgement/publication handles cannot enqueue work.
+- Boundless disables Registry collection with `with_topology_collection(false)`;
+  its journal owns structural restoration. Consumer payload queues retain native
+  delivery reservations. Upstream automatic recovery remains opt-in and unchanged.
+- The caller bounds supplied connector attempts. Pending publications and
+  transactions are never replayed. Channel generation invalidation is synchronized
+  with frame admission; stale acknowledgement/publication handles cannot enqueue work.
 - The existing amq-protocol parser fork bounds recursive field values to 16
   containers and erases LongString allocations on drop. Transport buffers are
   erased on consume/reset/drop. Logs exclude payloads/auth frames; error Display
@@ -133,28 +133,27 @@ topology collection. Boundless's journal owns restoration once W7d adds explicit
 reconnect.
 `ConnectionProperties::with_topology_collection(bool)` defaults to `true` for
 existing callers. Setting it to `false` makes every Registry declaration,
-binding and queue-remapping growth path a no-op and topology extraction empty.
+binding growth path a no-op and topology extraction empty.
 This includes bindings to externally managed exchanges and queues that were
-never declared through the connection. Disabled collection reserves no topology
-budget, so a successful broker result cannot fail because of metadata retention.
+never declared through the connection. The retired topology budget cannot turn
+a successful broker result into a metadata retention refusal.
 
 The flag is authoritative even with automatic recovery enabled: recovery then
 restores no exchanges, queues or bindings. This combination is accepted.
 QueueDeclareOk still returns the broker's queue name and counts, and ConsumeOk
-still establishes live consumer routing. Consumer recovery remains separately
-configured. Boundless's pin and connection construction change in its later work;
+still establishes live consumer routing. Consumers still recover when upstream automatic recovery is enabled. Boundless's pin and connection construction change in its later work;
 this patch changes only the fork.
 
-Registry regressions inspect private storage and reservations, cloned registries,
+Registry regressions inspect private storage, cloned registries,
 external bindings and declarations in both modes. Channel regressions dispatch
 protocol replies through the expected-reply machinery, check caller results and
 a routed delivery, and inspect recovery snapshots with collection disabled in
-both recovery-builder orders. These tests require no running RabbitMQ instance.
+both collection/automatic-recovery builder orders. These tests require no running RabbitMQ instance.
 
 Regression: `cargo test --locked --no-default-features --features tokio --lib -- registry::tests channel::`.
 All 8 tests pass (exit 0) on macOS arm64, including the existing channel
 authentication and partial-get regressions. The new tests establish empty
-storage with no limit or a zero limit, preserved broker results and routing,
+storage, preserved broker results and routing,
 empty exchange/queue recovery snapshots, and unchanged default collection.
 `cargo clippy --locked --no-default-features --features tokio --lib -- -D warnings`
 and `cargo fmt --all -- --check` also pass (both exit 0).
@@ -713,3 +712,41 @@ and both format checks pass (exit 0).
 
 Boundless still has an inert `Event::QueueRecovered` match arm. Its landing owner
 must remove that arm with the new pin; this fork commit does not edit Boundless.
+
+## Split unused topology budget and recovery switches from 9556710 (Rule 23)
+
+At `3d3d385`, `src/connection_properties.rs:72-78,144-152` exposed
+`with_topology_limit` and `with_recovery`; `src/configuration.rs:108-141`
+constructed a second Budget and three recovery flags, and `src/registry.rs:27-59`
+counted retained metadata after successful protocol replies. W1b disables native
+recovery and Registry collection in Boundless. These unused local controls do not
+own the W7d journal's admission or restoration and are removed, together with
+metadata estimators, resizing, fallible Registry returns and budget-associated
+binding deduplication. Registry's collection gate and private storage remain.
+
+Kept from the mixed patch: Rules 10/11/19 delivery/frame reservations and their
+release ownership, bounded event/RPC queues, erasure, generation admission and
+explicit close ownership. All later promise, partial-get and close corrections,
+and W4d completion/W7d freeze, remain. Native recovery configuration and
+`Channel::start_recovery` now match upstream v4.11.0, apart from preserved
+correctness patches and Registry's optional collection gate.
+
+Regression evidence on macOS arm64, through `build-slot`:
+- `successful_topology_replies_are_independent_of_delivery_capacity` exercises
+  QueueDeclareOk, exchange declaration and both binding reply paths with zero
+  receive capacity. On `3d3d385`, the baseline fixture additionally selects the
+  soon-removed zero topology limit and fails (exit 101: metadata reported as a
+  MessageBytes refusal after broker success). After removal that obsolete fixture
+  builder is deleted; all four replies complete and their topology remains
+  available (exit 0). The test maintains ordinary result/capacity independence,
+  not a removed API shape.
+- `upstream_recovery_is_opt_in_and_preserves_explicit_backoff` verifies default
+  recovery off/zero retries, opt-in recovery with 16 retries and explicit backoff
+  preserved in either builder order (exit 0).
+- `upstream_recovery_restores_the_existing_consumer_and_tag` drives native
+  recovery through OpenOk and ConsumeOk, then receives on the original consumer
+  with the retained queue/tag and replacement generation (exit 0).
+- Complete Tokio fork suite (76 tests), strict all-target Clippy and normal plus
+  generated-source format checks pass (exit 0). The retained QueueDeclareOk/
+  ConsumeOk, reservation, queue-bound, completion, partial-get and freeze
+  regressions are included. No new fork API is added.

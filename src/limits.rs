@@ -83,19 +83,6 @@ impl PartialEq for Reservation {
         true
     }
 }
-impl Reservation {
-    pub(crate) fn resize(&mut self, bytes: usize) -> crate::Result<()> {
-        let mut used = self.budget.0.used.lock().unwrap_or_else(|e| e.into_inner());
-        let total = (used.0 - self.bytes).checked_add(bytes);
-        if total.is_none_or(|total| total > self.budget.0.limits.retained_bytes) {
-            return Err(ResourceLimit::RetainedBytes
-                .exceeded(self.budget.0.limits.retained_bytes, total.map(|n| n as u64)));
-        }
-        used.0 = total.unwrap();
-        self.bytes = bytes;
-        Ok(())
-    }
-}
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut used = self.budget.0.used.lock().unwrap_or_else(|e| e.into_inner());

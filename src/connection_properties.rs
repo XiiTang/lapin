@@ -31,11 +31,8 @@ pub struct ConnectionProperties {
     pub(crate) auth_provider: Option<Arc<dyn AuthProvider>>,
     pub(crate) backoff: ExponentialBuilder,
     pub(crate) auto_recover: bool,
-    pub(crate) recover_topology: bool,
-    pub(crate) recover_consumers: bool,
     backoff_configured: bool,
     pub(crate) receive_limits: Option<crate::ReceiveLimits>,
-    pub(crate) topology_bytes: Option<usize>,
     pub(crate) collect_topology: bool,
 }
 
@@ -47,11 +44,8 @@ impl Default for ConnectionProperties {
             auth_provider: None,
             backoff: ExponentialBuilder::default().with_max_times(0 /* no retry by default */),
             auto_recover: false,
-            recover_topology: true,
-            recover_consumers: true,
             backoff_configured: false,
             receive_limits: None,
-            topology_bytes: None,
             collect_topology: true,
         }
     }
@@ -63,17 +57,10 @@ impl ConnectionProperties {
     /// When `false`, the registry retains no exchange or queue topology, even if
     /// automatic recovery is enabled. Recovery then restores no exchanges, queues
     /// or bindings. Returned queue facts and live consumer routing remain available;
-    /// consumer recovery is still controlled separately.
+    /// consumer recovery remains available when automatic recovery is enabled.
     #[must_use]
     pub fn with_topology_collection(mut self, enabled: bool) -> Self {
         self.collect_topology = enabled;
-        self
-    }
-
-    /// Limit the total retained topology metadata across all channels.
-    #[must_use]
-    pub fn with_topology_limit(mut self, bytes: usize) -> Self {
-        self.topology_bytes = Some(bytes);
         self
     }
 
@@ -140,17 +127,6 @@ impl ConnectionProperties {
         self
     }
 
-    /// Enable reconnection with explicitly selected topology and consumer recovery.
-    /// The caller must separately configure a finite backoff. Pending publications
-    /// and transactions are never replayed by this setting.
-    #[must_use]
-    pub fn with_recovery(mut self, topology: bool, consumers: bool) -> Self {
-        self.auto_recover = true;
-        self.recover_topology = topology;
-        self.recover_consumers = consumers;
-        self
-    }
-
     /// Enable automatic connection and topology recovery after failures.
     ///
     /// When enabled the IO loop will transparently reconnect on network errors
@@ -187,5 +163,36 @@ impl fmt::Debug for ConnectionProperties {
             .field("auto_recover", &self.auto_recover)
             .field("collect_topology", &self.collect_topology)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use backon::BackoffBuilder;
+
+    #[test]
+    fn upstream_recovery_is_opt_in_and_preserves_explicit_backoff() {
+        let defaults = ConnectionProperties::default();
+        assert!(!defaults.auto_recover);
+        assert!(defaults.collect_topology);
+        assert_eq!(defaults.backoff.build().count(), 0);
+        let enabled = defaults.enable_auto_recover();
+        assert!(enabled.auto_recover);
+        assert_eq!(enabled.backoff.build().count(), 16);
+        for configured in [
+            ConnectionProperties::default()
+                .with_backoff(ExponentialBuilder::default().with_max_times(2))
+                .enable_auto_recover(),
+            ConnectionProperties::default()
+                .configure_backoff(|b| b.with_max_times(2))
+                .enable_auto_recover(),
+            ConnectionProperties::default()
+                .enable_auto_recover()
+                .configure_backoff(|b| b.with_max_times(2)),
+        ] {
+            assert!(configured.auto_recover);
+            assert_eq!(configured.backoff.build().count(), 2);
+        }
     }
 }

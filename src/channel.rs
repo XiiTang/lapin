@@ -123,10 +123,7 @@ impl Channel {
         Self {
             id: channel_id,
             expected_generation: None,
-            local_registry: Registry::new(
-                configuration.collect_topology,
-                configuration.topology_budget.clone(),
-            ),
+            local_registry: Registry::new(configuration.collect_topology),
             configuration,
             status,
             connection_status,
@@ -419,9 +416,7 @@ impl Channel {
         options: QueueDeclareOptions,
         arguments: FieldTable,
     ) {
-        self.local_registry
-            .register_queue(name, options, arguments)
-            .unwrap();
+        self.local_registry.register_queue(name, options, arguments);
     }
 
     #[cfg(test)]
@@ -465,18 +460,10 @@ impl Channel {
     }
 
     pub(crate) async fn start_recovery(&self) -> Result<()> {
-        let mut topology = self
+        let topology = self
             .update_recovery()
             .ok_or_else(|| self.status.state_error("start_recovery"))?;
 
-        if !self.recovery_config.1 {
-            topology.exchanges.clear();
-            topology.queues.clear();
-        }
-        if !self.recovery_config.2 {
-            topology.consumers.clear();
-            self.cancel_consumers();
-        }
         // First, reopen the channel
         self.channel_open(self.clone()).await?;
 
@@ -1257,12 +1244,8 @@ impl Channel {
         routing_key: ShortString,
         arguments: FieldTable,
     ) -> Result<()> {
-        self.local_registry.register_exchange_binding(
-            destination,
-            source,
-            routing_key,
-            arguments,
-        )?;
+        self.local_registry
+            .register_exchange_binding(destination, source, routing_key, arguments);
         Ok(())
     }
 
@@ -1291,7 +1274,7 @@ impl Channel {
         arguments: FieldTable,
     ) -> Result<()> {
         self.local_registry
-            .register_exchange(exchange, kind, options, arguments)?;
+            .register_exchange(exchange, kind, options, arguments);
         resolver.resolve(());
         Ok(())
     }
@@ -1329,7 +1312,7 @@ impl Channel {
         arguments: FieldTable,
     ) -> Result<()> {
         self.local_registry
-            .register_queue(method.queue.clone(), options, arguments)?;
+            .register_queue(method.queue.clone(), options, arguments);
         resolver.resolve(Queue::new(
             method.queue,
             method.message_count,
@@ -1346,7 +1329,7 @@ impl Channel {
         arguments: FieldTable,
     ) -> Result<()> {
         self.local_registry
-            .register_queue_binding(queue, exchange, routing_key, arguments)?;
+            .register_queue_binding(queue, exchange, routing_key, arguments);
         Ok(())
     }
 

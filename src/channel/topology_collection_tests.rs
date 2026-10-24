@@ -69,11 +69,10 @@ fn disabled_collection_preserves_broker_results_routing_and_empty_recovery_snaps
             .with_topology_collection(false)
             .enable_auto_recover(),
         ConnectionProperties::default()
-            .with_recovery(true, true)
+            .enable_auto_recover()
             .with_topology_collection(false),
     ] {
-        // No metadata fits: a successful result must not depend on topology admission.
-        let (channel, _rpc) = channel(properties.with_topology_limit(0));
+        let (channel, _rpc) = channel(properties);
         reply(
             &channel,
             channel.exchange_declare(
@@ -344,5 +343,162 @@ fn native_recovery_uses_retained_queue_names_and_literal_bindings() {
         recovery.as_mut().poll(&mut cx),
         Poll::Ready(Ok(()))
     ));
+    assert!(channel.frames.pop(true).is_none());
+}
+
+#[test]
+fn successful_topology_replies_are_independent_of_delivery_capacity() {
+    let properties = ConnectionProperties::default().with_receive_limits(crate::ReceiveLimits {
+        message_bytes: 0,
+        retained_bytes: 0,
+        retained_messages: 0,
+    });
+    let (channel, _rpc) = channel(properties);
+    let queue = reply(
+        &channel,
+        channel.queue_declare(
+            "".into(),
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        ),
+        AMQPClass::Queue(protocol::queue::AMQPMethod::DeclareOk(
+            protocol::queue::DeclareOk {
+                queue: "returned-name".into(),
+                message_count: 7,
+                consumer_count: 3,
+            },
+        )),
+    );
+    assert_eq!(
+        (
+            queue.name().as_str(),
+            queue.message_count(),
+            queue.consumer_count()
+        ),
+        ("returned-name", 7, 3)
+    );
+    reply(
+        &channel,
+        channel.exchange_declare(
+            "exchange".into(),
+            ExchangeKind::Direct,
+            ExchangeDeclareOptions::default(),
+            FieldTable::default(),
+        ),
+        AMQPClass::Exchange(protocol::exchange::AMQPMethod::DeclareOk(
+            protocol::exchange::DeclareOk {},
+        )),
+    );
+    reply(
+        &channel,
+        channel.queue_bind(
+            "returned-name".into(),
+            "exchange".into(),
+            "key".into(),
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        ),
+        AMQPClass::Queue(protocol::queue::AMQPMethod::BindOk(
+            protocol::queue::BindOk {},
+        )),
+    );
+    reply(
+        &channel,
+        channel.exchange_bind(
+            "external".into(),
+            "exchange".into(),
+            "key".into(),
+            ExchangeBindOptions::default(),
+            FieldTable::default(),
+        ),
+        AMQPClass::Exchange(protocol::exchange::AMQPMethod::BindOk(
+            protocol::exchange::BindOk {},
+        )),
+    );
+    let topology = channel.topology();
+    assert_eq!(topology.queues.len(), 1);
+    assert_eq!(topology.queues[0].bindings.len(), 1);
+    assert_eq!(topology.exchanges.len(), 2);
+    assert_eq!(
+        topology
+            .exchanges
+            .iter()
+            .map(|ex| ex.bindings.len())
+            .sum::<usize>(),
+        1
+    );
+}
+
+#[test]
+fn upstream_recovery_restores_the_existing_consumer_and_tag() {
+    let (channel, _rpc) = channel(ConnectionProperties::default().enable_auto_recover());
+    let mut consumer = reply(
+        &channel,
+        channel.basic_consume(
+            "external-queue".into(),
+            "kept-tag".into(),
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        ),
+        AMQPClass::Basic(protocol::basic::AMQPMethod::ConsumeOk(
+            protocol::basic::ConsumeOk {
+                consumer_tag: "kept-tag".into(),
+            },
+        )),
+    );
+    channel.init_recovery(ErrorKind::MissingHeartbeatError.into());
+    let mut recovery = pin!(channel.start_recovery());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(recovery.as_mut().poll(&mut cx).is_pending());
+    assert!(channel.frames.pop(true).is_some());
+    channel
+        .receive_method(AMQPClass::Channel(protocol::channel::AMQPMethod::OpenOk(
+            protocol::channel::OpenOk {},
+        )))
+        .unwrap();
+    assert!(recovery.as_mut().poll(&mut cx).is_pending());
+    let consume = channel.frames.pop(true).unwrap();
+    match &*consume {
+        AMQPFrame::Method(1, AMQPClass::Basic(protocol::basic::AMQPMethod::Consume(method))) => {
+            assert_eq!(
+                (method.queue.as_str(), method.consumer_tag.as_str()),
+                ("external-queue", "kept-tag")
+            )
+        }
+        other => panic!("expected restored consume: {other:?}"),
+    }
+    channel
+        .receive_method(AMQPClass::Basic(protocol::basic::AMQPMethod::ConsumeOk(
+            protocol::basic::ConsumeOk {
+                consumer_tag: "kept-tag".into(),
+            },
+        )))
+        .unwrap();
+    assert!(matches!(
+        recovery.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    channel
+        .receive_method(AMQPClass::Basic(protocol::basic::AMQPMethod::Deliver(
+            protocol::basic::Deliver {
+                consumer_tag: "kept-tag".into(),
+                delivery_tag: 1,
+                redelivered: false,
+                exchange: "".into(),
+                routing_key: "key".into(),
+            },
+        )))
+        .unwrap();
+    channel
+        .handle_content_header_frame(60, 4, BasicProperties::default())
+        .unwrap();
+    channel.handle_body_frame(b"data".to_vec()).unwrap();
+    match std::pin::Pin::new(&mut consumer).poll_next(&mut cx) {
+        Poll::Ready(Some(Ok(delivery))) => {
+            assert_eq!(delivery.data, b"data");
+            assert_eq!(delivery.generation, 1);
+        }
+        other => panic!("restored delivery did not reach the existing consumer: {other:?}"),
+    }
     assert!(channel.frames.pop(true).is_none());
 }

@@ -23,8 +23,6 @@ pub struct Configuration {
     pub(crate) backoff: ExponentialBuilder,
     pub(crate) negotiated_config: NegotiatedConfig,
     pub(crate) auto_recover: bool,
-    recover_topology: bool,
-    recover_consumers: bool,
 }
 
 impl Configuration {
@@ -45,12 +43,9 @@ impl Configuration {
             negotiated_config: NegotiatedConfig::new(
                 uri,
                 options.receive_limits,
-                options.topology_bytes,
                 options.collect_topology,
             ),
             auto_recover,
-            recover_topology: options.recover_topology,
-            recover_consumers: options.recover_consumers,
         }
     }
 
@@ -73,11 +68,7 @@ impl Configuration {
     }
 
     pub(crate) fn recovery_config(&self) -> RecoveryConfig {
-        RecoveryConfig(
-            self.auto_recover,
-            self.recover_topology,
-            self.recover_consumers,
-        )
+        RecoveryConfig(self.auto_recover)
     }
 }
 
@@ -90,8 +81,6 @@ impl Clone for Configuration {
             backoff: self.backoff,
             negotiated_config: self.negotiated_config.clone(),
             auto_recover: self.auto_recover,
-            recover_topology: self.recover_topology,
-            recover_consumers: self.recover_consumers,
         }
     }
 }
@@ -106,12 +95,11 @@ impl fmt::Debug for Configuration {
 pub(crate) struct NegotiatedConfig {
     inner: Arc<RwLock<Inner>>,
     pub(crate) budget: Option<crate::limits::Budget>,
-    pub(crate) topology_budget: Option<crate::limits::Budget>,
     pub(crate) collect_topology: bool,
 }
 
 #[derive(Default, Clone, Copy)]
-pub(crate) struct RecoveryConfig(pub(crate) bool, pub(crate) bool, pub(crate) bool);
+pub(crate) struct RecoveryConfig(pub(crate) bool);
 
 struct Inner {
     channel_max: ChannelId,
@@ -120,22 +108,10 @@ struct Inner {
 }
 
 impl NegotiatedConfig {
-    fn new(
-        uri: &AMQPUri,
-        limits: Option<crate::ReceiveLimits>,
-        topology_bytes: Option<usize>,
-        collect_topology: bool,
-    ) -> Self {
+    fn new(uri: &AMQPUri, limits: Option<crate::ReceiveLimits>, collect_topology: bool) -> Self {
         Self {
             collect_topology,
             budget: limits.map(crate::limits::Budget::new),
-            topology_budget: topology_bytes.map(|bytes| {
-                crate::limits::Budget::new(crate::ReceiveLimits {
-                    message_bytes: bytes,
-                    retained_bytes: bytes,
-                    retained_messages: 65536,
-                })
-            }),
             inner: Arc::new(RwLock::new(Inner {
                 frame_max: uri.query.frame_max.unwrap_or_default(),
                 channel_max: uri.query.channel_max.unwrap_or_default(),
