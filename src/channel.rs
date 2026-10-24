@@ -420,7 +420,7 @@ impl Channel {
         arguments: FieldTable,
     ) {
         self.local_registry
-            .register_queue(name, options, arguments, false)
+            .register_queue(name, options, arguments)
             .unwrap();
     }
 
@@ -464,10 +464,7 @@ impl Channel {
         })
     }
 
-    pub(crate) async fn prepare_recovery(
-        &self,
-        names: &mut std::collections::HashMap<ShortString, ShortString>,
-    ) -> Result<ChannelDefinition> {
+    pub(crate) async fn start_recovery(&self) -> Result<()> {
         let mut topology = self
             .update_recovery()
             .ok_or_else(|| self.status.state_error("start_recovery"))?;
@@ -501,38 +498,6 @@ impl Channel {
             }
         }
 
-        // Fifth, redeclare all queues
-        for queue in &topology.queues {
-            if queue.is_declared {
-                let restored = self
-                    .queue_declare(
-                        if queue.server_generated {
-                            ShortString::default()
-                        } else {
-                            queue.name.clone()
-                        },
-                        queue.options.unwrap_or_default(),
-                        queue.arguments.clone().unwrap_or_default(),
-                    )
-                    .await?;
-                if queue.server_generated {
-                    names.insert(queue.name.clone(), restored.name().clone());
-                }
-            }
-        }
-        Ok(topology)
-    }
-    pub(crate) async fn finish_recovery(
-        &self,
-        mut topology: ChannelDefinition,
-        names: &std::collections::HashMap<ShortString, ShortString>,
-    ) -> Result<()> {
-        for queue in &mut topology.queues {
-            if let Some(name) = names.get(&queue.name) {
-                self.local_registry.remap_queue(&queue.name, name)?;
-                queue.name = name.clone();
-            }
-        }
         // Fourth, redeclare all exchange bindings
         for ex in &topology.exchanges {
             for binding in &ex.bindings {
@@ -542,6 +507,18 @@ impl Channel {
                     binding.routing_key.clone(),
                     ExchangeBindOptions::default(),
                     binding.arguments.clone(),
+                )
+                .await?;
+            }
+        }
+
+        // Fifth, redeclare all queues
+        for queue in &topology.queues {
+            if queue.is_declared {
+                self.queue_declare(
+                    queue.name.clone(),
+                    queue.options.unwrap_or_default(),
+                    queue.arguments.clone().unwrap_or_default(),
                 )
                 .await?;
             }
@@ -561,11 +538,8 @@ impl Channel {
             }
         }
 
-        // Finally, redeclare all consumers.
+        // Finally, redeclare all consumers
         for consumer in topology.consumers.iter().cloned() {
-            if let Some(name) = names.get(&consumer.queue()) {
-                consumer.set_queue(name.clone());
-            }
             consumer.reset();
             self.do_basic_consume(
                 consumer.queue().clone(),
@@ -1353,14 +1327,9 @@ impl Channel {
         resolver: PromiseResolver<Queue>,
         options: QueueDeclareOptions,
         arguments: FieldTable,
-        requested_queue: ShortString,
     ) -> Result<()> {
-        self.local_registry.register_queue(
-            method.queue.clone(),
-            options,
-            arguments,
-            requested_queue.as_str().is_empty(),
-        )?;
+        self.local_registry
+            .register_queue(method.queue.clone(), options, arguments)?;
         resolver.resolve(Queue::new(
             method.queue,
             method.message_count,

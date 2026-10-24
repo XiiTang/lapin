@@ -134,7 +134,6 @@ impl Registry {
         name: ShortString,
         options: QueueDeclareOptions,
         arguments: FieldTable,
-        server_generated: bool,
     ) -> crate::Result<()> {
         if !self.collect_topology {
             return Ok(());
@@ -142,39 +141,11 @@ impl Registry {
         let mut inner = self.lock_inner();
         if let Some(queue) = inner.queues.get_mut(&name) {
             queue.set_declared(options, arguments);
-            queue.server_generated |= server_generated;
         } else {
             inner.queues.insert(
                 name.clone(),
-                QueueDefinition::declared(name, options, server_generated, arguments),
+                QueueDefinition::declared(name, options, arguments),
             );
-        }
-        drop(inner);
-        self.check_limit()
-    }
-
-    pub(crate) fn remap_queue(
-        &self,
-        previous: &ShortString,
-        current: &ShortString,
-    ) -> crate::Result<()> {
-        if !self.collect_topology || previous == current {
-            return Ok(());
-        }
-        let mut inner = self.lock_inner();
-        if let Some(mut queue) = inner.queues.remove(previous) {
-            queue.name = current.clone();
-            if let Some(existing) = inner.queues.get_mut(current) {
-                for binding in queue.bindings {
-                    existing.register_binding(
-                        binding.source,
-                        binding.routing_key,
-                        binding.arguments,
-                    );
-                }
-            } else {
-                inner.queues.insert(current.clone(), queue);
-            }
         }
         drop(inner);
         self.check_limit()
@@ -286,7 +257,6 @@ mod tests {
                         "queue".into(),
                         QueueDeclareOptions::default(),
                         FieldTable::default(),
-                        true,
                     )
                     .unwrap();
                 // Neither destination was declared through this registry.
@@ -306,12 +276,6 @@ mod tests {
                         FieldTable::default(),
                     )
                     .unwrap();
-                registry
-                    .remap_queue(&"queue".into(), &"renamed".into())
-                    .unwrap();
-                registry
-                    .remap_queue(&"external-queue".into(), &"renamed".into())
-                    .unwrap();
                 assert_empty(registry);
                 registry.deregister_exchange_binding(
                     "external-exchange",
@@ -326,7 +290,7 @@ mod tests {
                     &FieldTable::default(),
                 );
                 registry.deregister_exchange("declared");
-                registry.deregister_queue("renamed");
+                registry.deregister_queue("queue");
 
                 assert_empty(registry);
             }
@@ -334,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_collection_keeps_external_bindings_and_remaps_queues() {
+    fn enabled_collection_keeps_external_bindings_and_declarations() {
         let registry = Registry::new(true, None);
         registry
             .register_queue_binding(
@@ -349,21 +313,21 @@ mod tests {
                 "declared".into(),
                 QueueDeclareOptions::default(),
                 FieldTable::default(),
-                true,
             )
             .unwrap();
-        registry
-            .remap_queue(&"external".into(), &"declared".into())
-            .unwrap();
-        registry
-            .remap_queue(&"declared".into(), &"renamed".into())
-            .unwrap();
         let queues = registry.queues_topology();
-        assert_eq!(queues.len(), 1);
-        assert_eq!(queues[0].name.as_str(), "renamed");
-        assert!(queues[0].is_declared);
-        assert!(queues[0].server_generated);
-        assert_eq!(queues[0].bindings.len(), 1);
+        assert_eq!(queues.len(), 2);
+        let declared = queues
+            .iter()
+            .find(|q| q.name.as_str() == "declared")
+            .unwrap();
+        assert!(declared.is_declared);
+        let external = queues
+            .iter()
+            .find(|q| q.name.as_str() == "external")
+            .unwrap();
+        assert!(!external.is_declared);
+        assert_eq!(external.bindings.len(), 1);
         registry
             .register_exchange_binding(
                 "external".into(),

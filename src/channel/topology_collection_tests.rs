@@ -229,14 +229,120 @@ fn qos_replies_complete_without_adding_recovery_work() {
         );
     }
     channel.init_recovery(ErrorKind::MissingHeartbeatError.into());
-    let topology = channel.update_recovery().unwrap();
-    channel.set_state(ChannelState::Connected);
-    let names = std::collections::HashMap::new();
-    let mut recovery = pin!(channel.finish_recovery(topology, &names));
+    let mut recovery = pin!(channel.start_recovery());
     let mut cx = Context::from_waker(Waker::noop());
+    assert!(recovery.as_mut().poll(&mut cx).is_pending());
+    assert!(channel.frames.pop(true).is_some());
+    channel
+        .receive_method(AMQPClass::Channel(protocol::channel::AMQPMethod::OpenOk(
+            protocol::channel::OpenOk {},
+        )))
+        .unwrap();
     assert!(
         matches!(recovery.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
         "recovery unexpectedly replays previously acknowledged QoS"
     );
+    assert!(channel.frames.pop(true).is_none());
+}
+
+async fn recover(channel: &Channel) -> Result<()> {
+    channel.start_recovery().await
+}
+
+#[test]
+fn native_recovery_uses_retained_queue_names_and_literal_bindings() {
+    let (channel, _rpc) = channel(ConnectionProperties::default().enable_auto_recover());
+    let queue = reply(
+        &channel,
+        channel.queue_declare(
+            "".into(),
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        ),
+        AMQPClass::Queue(protocol::queue::AMQPMethod::DeclareOk(
+            protocol::queue::DeclareOk {
+                queue: "broker-name".into(),
+                message_count: 2,
+                consumer_count: 3,
+            },
+        )),
+    );
+    assert_eq!(
+        (
+            queue.name().as_str(),
+            queue.message_count(),
+            queue.consumer_count()
+        ),
+        ("broker-name", 2, 3)
+    );
+    reply(
+        &channel,
+        channel.queue_bind(
+            "broker-name".into(),
+            "external".into(),
+            "broker-name".into(),
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        ),
+        AMQPClass::Queue(protocol::queue::AMQPMethod::BindOk(
+            protocol::queue::BindOk {},
+        )),
+    );
+    channel.init_recovery(ErrorKind::MissingHeartbeatError.into());
+    let mut recovery = pin!(recover(&channel));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(recovery.as_mut().poll(&mut cx).is_pending());
+    assert!(matches!(
+        &*channel.frames.pop(true).unwrap(),
+        AMQPFrame::Method(
+            1,
+            AMQPClass::Channel(protocol::channel::AMQPMethod::Open(_))
+        )
+    ));
+    channel
+        .receive_method(AMQPClass::Channel(protocol::channel::AMQPMethod::OpenOk(
+            protocol::channel::OpenOk {},
+        )))
+        .unwrap();
+    assert!(recovery.as_mut().poll(&mut cx).is_pending());
+    let declaration = channel.frames.pop(true).unwrap();
+    match &*declaration {
+        AMQPFrame::Method(1, AMQPClass::Queue(protocol::queue::AMQPMethod::Declare(method))) => {
+            assert_eq!(
+                method.queue.as_str(),
+                "broker-name",
+                "native recovery must use upstream retained-name behavior"
+            )
+        }
+        other => panic!("expected queue declaration: {other:?}"),
+    }
+    channel
+        .receive_method(AMQPClass::Queue(protocol::queue::AMQPMethod::DeclareOk(
+            protocol::queue::DeclareOk {
+                queue: "broker-name".into(),
+                ..Default::default()
+            },
+        )))
+        .unwrap();
+    assert!(recovery.as_mut().poll(&mut cx).is_pending());
+    let binding = channel.frames.pop(true).unwrap();
+    match &*binding {
+        AMQPFrame::Method(1, AMQPClass::Queue(protocol::queue::AMQPMethod::Bind(method))) => {
+            assert_eq!(
+                (method.queue.as_str(), method.routing_key.as_str()),
+                ("broker-name", "broker-name")
+            )
+        }
+        other => panic!("expected queue binding: {other:?}"),
+    }
+    channel
+        .receive_method(AMQPClass::Queue(protocol::queue::AMQPMethod::BindOk(
+            protocol::queue::BindOk {},
+        )))
+        .unwrap();
+    assert!(matches!(
+        recovery.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
     assert!(channel.frames.pop(true).is_none());
 }

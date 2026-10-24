@@ -140,7 +140,7 @@ pub struct Consumer {
     internal_rpc: InternalRPCHandle,
     channel_closer: Option<Arc<ChannelCloser>>,
     consumer_canceler: Option<Arc<ConsumerCanceler>>,
-    queue: Arc<Mutex<ShortString>>,
+    queue: ShortString,
     options: BasicConsumeOptions,
     arguments: FieldTable,
     deliveries_in: Sender<DeliveryResult>,
@@ -170,7 +170,7 @@ impl Consumer {
             internal_rpc,
             channel_closer,
             consumer_canceler: None,
-            queue: Arc::new(Mutex::new(queue)),
+            queue,
             options,
             arguments,
             deliveries_in: sender,
@@ -206,11 +206,7 @@ impl Consumer {
     /// Get the name of the queue we're consuming
     #[must_use]
     pub fn queue(&self) -> ShortString {
-        self.queue.lock().unwrap().clone()
-    }
-
-    pub(crate) fn set_queue(&self, name: ShortString) {
-        *self.queue.lock().unwrap() = name;
+        self.queue.clone()
     }
 
     pub(crate) fn options(&self) -> BasicConsumeOptions {

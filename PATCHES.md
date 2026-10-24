@@ -146,7 +146,7 @@ configured. Boundless's pin and connection construction change in its later work
 this patch changes only the fork.
 
 Registry regressions inspect private storage and reservations, cloned registries,
-external bindings and queue remapping in both modes. Channel regressions dispatch
+external bindings and declarations in both modes. Channel regressions dispatch
 protocol replies through the expected-reply machinery, check caller results and
 a routed delivery, and inspect recovery snapshots with collection disabled in
 both recovery-builder orders. These tests require no running RabbitMQ instance.
@@ -681,3 +681,35 @@ recovery has no further QoS work. On `0b6c75f4` it fails (exit 101); after remov
 it passes (exit 0). Validation uses `build-slot`, `CARGO_INCREMENTAL=0`, on macOS
 arm64: Tokio fork suite, strict all-target Clippy, generator build and both normal
 and generated-source format checks (all exit 0).
+
+## Retire local two-stage topology restoration and queue remapping (Rule 23)
+
+Remove the restoration extension in `8dc9c39`, not its later correctness fixes.
+That commit's `src/channel.rs:389-513` and `src/channels.rs:274-289` added
+connection-wide prepare/finish passes; `src/registry.rs` retained
+`server_generated` provenance and remapped queue names, `src/consumer.rs`
+made queue names mutable, and `src/events.rs` added `QueueRecovered`.
+Boundless's W1b cutover disables native recovery and topology retention; Rule 23
+assigns symbolic names and restoration to its W7d journal instead.
+
+Ordinary opt-in native recovery returns to upstream v4.11.0's single
+`Channel::start_recovery` path: reopen, confirm mode, exchanges and bindings,
+queues and bindings, then consumers using retained names. No fork remapping
+pass or event remains. QueueDeclareOk still returns actual broker facts and
+ConsumeOk still installs live consumer routing. Registry collection mode remains
+private and every insertion still checks it. Promise completion, partial-get
+cancellation, confirmation reset, receive reservations, explicit close ownership
+and the W4d/W7d hooks are preserved.
+
+Regression: `native_recovery_uses_retained_queue_names_and_literal_bindings`
+checks QueueDeclareOk facts, the retained queue name used by recovery and literal
+binding keys. Against `8420aab` it fails (exit 101: empty requested name instead
+of the retained name). After removal it passes (exit 0); only its recovery-call
+adapter changes from the deleted prepare/finish pair to `start_recovery`.
+The existing disabled-Registry storage and QueueDeclareOk/ConsumeOk delivery
+regressions are adapted to the removed metadata/remap signatures. macOS arm64
+validation through `build-slot`: Tokio suite, strict all-target Clippy, codegen
+and both format checks pass (exit 0).
+
+Boundless still has an inert `Event::QueueRecovered` match arm. Its landing owner
+must remove that arm with the new pin; this fork commit does not edit Boundless.
