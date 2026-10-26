@@ -221,15 +221,18 @@ at queue admission; templates/lapin.json and regenerated src/generated/channel.r
 agree. This prevents non-200 closes from marking I/O errored before CloseOk is
 written. The command is the retirement hook's sole caller.
 
-Frames::take_connection_shutdown_reply retains the whole authentication-step or
-Open expected reply, including its cancellation resolver, until that same write
-ends. Rejecting a handshake earlier lets its caller stop the owned driver before
-CloseOk. Cancellation then follows the existing ExpectedReply cancellation
-checkpoint with the original error; ordinary RPCs still reject at shutdown.
-The optional retained reply is boxed so the bounded internal command queue does
-not carry a 400-byte enum in every slot (strict Clippy catches that regression).
-No new completion or sending path is introduced. ConnectionStatus::blocked's
-comment documents the closing handshake's release of the hold.
+HandshakeResolver is the private completion owner from ProtocolHeader through
+OpenOk, including auth_starter_async, continue_auth_async and finish_auth_async.
+ConnectionStatus holds only a weak handle, so it neither keeps an abandoned
+handshake alive nor cycles through a completed Connection. On peer Close this
+owner reserves the original cause before shutdown rejects ordinary work. Queued
+reply cancellation, AuthenticationGuard completion and cancellation all pass
+through it; auth errors cannot send a competing retirement command while CloseOk
+is pending. The same SendConnectionCloseOk command releases the owner after the
+write attempt ends. No queued-reply retention path remains. Ordinary RPCs still
+reject at shutdown, and the ordinary Promise completion latch is unchanged.
+ConnectionStatus::blocked's comment documents the closing handshake's release
+of the hold.
 
 RabbitMQ Java client's AMQConnection.handleConnectionClose and
 AMQChannel.quiescingTransmit were inspected: shutdown rejects application work
@@ -246,11 +249,18 @@ Regressions on macOS arm64:
   when its failed-handshake caller stops the driver; with deferred rejection
   it decodes CloseOk before returning the original 530 cause. The ordinary
   cases also check that CloseOk is the last and only close response.
+- The asynchronous-auth regressions hold each of the starter, continuation and
+  finish arms, then hold the actual CloseOk write. Releasing authentication
+  (both success and error) leaves the outer handshake pending. Releasing the
+  write lets the peer decode CloseOk and completes once with the original 530
+  peer cause. On the reviewed 1e71e38 baseline all three auth-arm tests read
+  EOF (exit 101). A shared-owner unit test checks reservation, late auth errors,
+  dropping an auth resolver and permanent completion directly.
 - `frames::close_ok_tests` checks the private admission checkpoint for both
   poisons, original Arc cause rejection, and admission versus write completion.
 
-Validation (all exit 0): `cargo test --lib --features tokio --locked` (31 tests);
-Tokio-only `connection_close`, `connection_retry` and `supplied_driver` (5, 3 and
+Validation (all exit 0): `cargo test --lib --features tokio --locked` (32 tests);
+Tokio-only `connection_close`, `connection_retry` and `supplied_driver` (8, 3 and
 8 tests); Tokio-only library build and strict Clippy (`--lib --tests -- -D
 warnings`); and rustfmt checks of every touched Rust file. `cargo fmt --check`
 also passed before the final handshake/blocked cases; those added files are

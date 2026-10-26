@@ -229,11 +229,7 @@ pub(crate) enum Reply {
     BasicCancelOk(PromiseResolver<()>),
     BasicGetOk(PromiseResolver<Option<BasicGetMessage>>),
     BasicRecoverOk(PromiseResolver<()>),
-    ConnectionOpenOk(
-        PromiseResolver<()>,
-        Box<Connection>,
-        PromiseResolver<Connection>,
-    ),
+    ConnectionOpenOk(PromiseResolver<()>, Box<Connection>, HandshakeResolver),
     ConnectionCloseOk(PromiseResolver<()>),
     ConnectionUpdateSecretOk(PromiseResolver<()>),
     ChannelOpenOk(PromiseResolver<Channel>, Channel),
@@ -968,7 +964,7 @@ impl Channel {
         mechanism: ShortString,
         response: LongString,
         locale: ShortString,
-        conn_resolver: PromiseResolver<Connection>,
+        conn_resolver: HandshakeResolver,
         connection: Connection,
         auth_provider: Arc<dyn AuthProvider>,
     ) -> Result<()> {
@@ -1012,7 +1008,7 @@ impl Channel {
     async fn connection_secure_ok(
         &self,
         response: LongString,
-        conn_resolver: PromiseResolver<Connection>,
+        conn_resolver: HandshakeResolver,
         connection: Connection,
         auth_provider: Arc<dyn AuthProvider>,
     ) -> Result<()> {
@@ -1071,7 +1067,7 @@ impl Channel {
         &self,
         virtual_host: ShortString,
         connection: Box<Connection>,
-        conn_resolver: PromiseResolver<Connection>,
+        conn_resolver: HandshakeResolver,
     ) -> Result<()> {
         let (promise, resolver) = Promise::new("connection.open");
         let reply = Reply::ConnectionOpenOk(resolver.clone(), connection, conn_resolver);

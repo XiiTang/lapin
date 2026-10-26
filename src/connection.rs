@@ -1,10 +1,10 @@
 use crate::{
-    ConnectionProperties, ConnectionStatus, Error, Event, Promise, Result,
+    ConnectionProperties, ConnectionStatus, Error, Event, Result,
     channel::{Channel, Reply},
     channels::Channels,
     configuration::Configuration,
     connection_closer::ConnectionCloser,
-    connection_step::ConnectionStep,
+    connection_step::{ConnectionStep, HandshakeResolver},
     events::Events,
     frames::{ExpectedReply, Frames},
     heartbeat::Heartbeat,
@@ -460,7 +460,8 @@ impl Connection {
     }
 
     pub(crate) async fn start(self, channel0: Channel) -> Result<Self> {
-        let (promise, resolver) = Promise::new("ProtocolHeader");
+        let (promise, resolver) = HandshakeResolver::new();
+        self.status.set_handshake(&resolver);
 
         trace!("Set connection as connecting");
         self.status.clone().set_connecting()?;
@@ -559,6 +560,7 @@ impl Connect for &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Promise;
     use crate::{
         BasicProperties, ChannelState, ConnectionProperties, ConnectionState, ErrorKind,
         channel_receiver_state::{ChannelReceiverState, DeliveryCause},
@@ -618,7 +620,7 @@ mod tests {
         let mut promises = Vec::new();
         for stage in 0..3 {
             let (conn, _, _) = create_connection();
-            let (promise, resolver) = Promise::new("handshake cleanup");
+            let (promise, resolver) = HandshakeResolver::new();
             let auth_provider = conn.configuration.auth_provider.clone();
             let step = match stage {
                 0 => ConnectionStep::ProtocolHeader(resolver.clone(), conn),

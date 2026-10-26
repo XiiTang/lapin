@@ -8,7 +8,7 @@ use crate::{
     channel_receiver_state::DeliveryCause,
     configuration::{NegotiatedConfig, RecoveryConfig},
     connection_closer::ConnectionCloser,
-    connection_step::ConnectionStep,
+    connection_step::{ConnectionStep, HandshakeResolver},
     consumer::Consumer,
     consumers::Consumers,
     events::EventsSender,
@@ -863,7 +863,7 @@ impl Channel {
         &self,
         state: ConnectionState,
         step: Option<ConnectionStep>,
-        resolver: Option<PromiseResolver<Connection>>,
+        resolver: Option<HandshakeResolver>,
     ) -> Result<()> {
         error!(
             ?state,
@@ -1069,7 +1069,7 @@ impl Channel {
         &self,
         _: protocol::connection::OpenOk,
         connection: Box<Connection>,
-        resolver: PromiseResolver<Connection>,
+        resolver: HandshakeResolver,
     ) -> Result<()> {
         let state = self.connection_status.state();
         if state != ConnectionState::Connecting {
@@ -1097,16 +1097,15 @@ impl Channel {
                 info!(channel=%self.id, "Connection closed");
                 ErrorKind::InvalidConnectionState(ConnectionState::Closed).into()
             });
-        let connection_reply = if self.recovery_config.can_recover(&error) {
+        let handshake = if self.recovery_config.can_recover(&error) {
             self.internal_rpc.init_connection_recovery(error.clone());
             None
         } else {
-            let reply = self.frames.take_connection_shutdown_reply(self.id);
+            let reply = self.connection_status.defer_handshake_close(error.clone());
             self.internal_rpc.init_connection_shutdown(error.clone());
             reply
         };
-        self.internal_rpc
-            .send_connection_close_ok(error, connection_reply);
+        self.internal_rpc.send_connection_close_ok(error, handshake);
         Ok(())
     }
 
@@ -1529,15 +1528,13 @@ include!("generated/channel.rs");
 
 // A handshake waiter must also finish when its asynchronous authentication
 // future is canceled before the next connection step is installed.
-struct AuthenticationGuard(Option<PromiseResolver<Connection>>);
+struct AuthenticationGuard(Option<HandshakeResolver>);
 impl AuthenticationGuard {
     fn finish(mut self, result: Result<()>) -> Result<()> {
-        if let Some(resolver) = self.0.take()
-            && let Err(error) = &result
-        {
-            resolver.reject(error.clone());
+        match self.0.take() {
+            Some(resolver) => resolver.finish_auth(result),
+            None => result,
         }
-        result
     }
 }
 impl Drop for AuthenticationGuard {
@@ -1769,7 +1766,7 @@ mod authentication_step_tests {
                 channel.internal_rpc.clone(),
                 Events::new(),
             );
-            let (overall, resolver) = Promise::new("overall handshake");
+            let (overall, resolver) = HandshakeResolver::new();
             let mut future: Pin<Box<dyn Future<Output = Result<()>>>> = if secure {
                 Box::pin(channel.connection_secure_ok(
                     "response".into(),

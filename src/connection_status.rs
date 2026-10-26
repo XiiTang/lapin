@@ -1,4 +1,9 @@
-use crate::{Error, ErrorKind, Result, types::ShortString, uri::AMQPUri};
+use crate::{
+    Error, ErrorKind, Result,
+    connection_step::{HandshakeResolver, WeakHandshakeResolver},
+    types::ShortString,
+    uri::AMQPUri,
+};
 use std::{
     fmt,
     sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -19,6 +24,14 @@ impl ConnectionStatus {
             username: uri.authority.userinfo.username.clone(),
             state: RwLock::new(StateInner::default()),
         }))
+    }
+
+    pub(crate) fn set_handshake(&self, resolver: &HandshakeResolver) {
+        self.write().handshake = resolver.downgrade();
+    }
+
+    pub(crate) fn defer_handshake_close(&self, error: Error) -> Option<HandshakeResolver> {
+        self.read().handshake.defer_close(error)
     }
 
     pub(crate) fn state(&self) -> ConnectionState {
@@ -178,6 +191,7 @@ impl Default for Inner {
 
 #[derive(Default)]
 struct StateInner {
+    handshake: WeakHandshakeResolver,
     state: ConnectionState,
     blocked: bool,
     poison: Option<Error>,

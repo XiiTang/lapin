@@ -13,7 +13,7 @@
         "extra_args": [
           {
             "name": "conn_resolver",
-            "type": "PromiseResolver<Connection>"
+            "type": "HandshakeResolver"
           },
           {
             "name": "connection",
@@ -37,7 +37,7 @@
         "extra_args": [
           {
             "name": "conn_resolver",
-            "type": "PromiseResolver<Connection>"
+            "type": "HandshakeResolver"
           },
           {
             "name": "connection",
@@ -66,7 +66,7 @@
           },
           {
             "name": "conn_resolver",
-            "type": "PromiseResolver<Connection>"
+            "type": "HandshakeResolver"
           }
         ],
         "extra_args": [
@@ -76,7 +76,7 @@
           },
           {
             "name": "conn_resolver",
-            "type": "PromiseResolver<Connection>"
+            "type": "HandshakeResolver"
           }
         ]
       }

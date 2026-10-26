@@ -2,9 +2,10 @@ use crate::{
     Channel, Error, ErrorKind, Promise, PromiseResolver, Result,
     channels::Channels,
     connection_closer::ConnectionCloser,
+    connection_step::HandshakeResolver,
     consumer_status::ConsumerStatus,
     error_holder::ErrorHolder,
-    frames::{ExpectedReply, Frames},
+    frames::Frames,
     future::InternalFuture,
     heartbeat::Heartbeat,
     killswitch::KillSwitch,
@@ -184,12 +185,9 @@ impl InternalRPCHandle {
     pub(crate) fn send_connection_close_ok(
         &self,
         error: Error,
-        connection_reply: Option<ExpectedReply>,
+        handshake: Option<HandshakeResolver>,
     ) {
-        self.send(InternalCommand::SendConnectionCloseOk(
-            error,
-            connection_reply.map(Box::new),
-        ));
+        self.send(InternalCommand::SendConnectionCloseOk(error, handshake));
     }
 
     pub(crate) fn send_heartbeat(&self) {
@@ -308,7 +306,7 @@ enum InternalCommand {
     InitConnectionRecovery(Error),
     InitConnectionShutdown(Error),
     RemoveChannel(ChannelId, Error),
-    SendConnectionCloseOk(Error, Option<Box<ExpectedReply>>),
+    SendConnectionCloseOk(Error, Option<HandshakeResolver>),
     SendHeartbeat,
     SetChannelStatus(ChannelId, KillSwitch),
     SetConnectionClosing,
@@ -522,7 +520,7 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                     let channels = channels.clone();
                     self.register_internal_future(async move { channels.remove(channel_id, error) })
                 }
-                SendConnectionCloseOk(error, connection_reply) => {
+                SendConnectionCloseOk(error, handshake) => {
                     let channel = channels.channel0();
                     self.register_internal_future(async move {
                         // Retire only after the frame-write completion. Merely
@@ -530,8 +528,8 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                         let sent = channel.connection_close_ok().await;
                         // A failed handshake releases its caller-owned driver.
                         // Keep its original cause, but not ahead of CloseOk.
-                        if let Some(reply) = connection_reply {
-                            reply.cancel(error.clone());
+                        if let Some(handshake) = handshake {
+                            handshake.finish_close();
                         }
                         sent?;
                         channel.on_connection_close_ok_sent(error);

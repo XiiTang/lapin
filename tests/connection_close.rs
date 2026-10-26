@@ -349,3 +349,214 @@ async fn handshake_close_is_written_before_its_error_releases_the_owner() {
 async fn blocked_peer_connection_close_is_acknowledged() {
     ends(peer_close(200, false, false, true)).await;
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum AuthArm {
+    Start,
+    Continue,
+    Finish,
+}
+struct HeldAuth {
+    arm: AuthArm,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    completed: tokio::sync::Notify,
+    fail: bool,
+}
+impl HeldAuth {
+    async fn run(&self, arm: AuthArm) -> Result<(), String> {
+        if self.arm == arm {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.completed.notify_one();
+            if self.fail {
+                return Err("late authentication failure".into());
+            }
+        }
+        Ok(())
+    }
+}
+struct HeldProvider(std::sync::Arc<HeldAuth>);
+impl lapin::auth::AuthProvider for HeldProvider {
+    fn mechanism(&self) -> lapin::types::ShortString {
+        "PLAIN".into()
+    }
+    fn auth_starter_async(
+        &self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<lapin::types::LongString, String>> + Send + '_>>
+    {
+        Box::pin(async { self.0.run(AuthArm::Start).await.map(|()| "".into()) })
+    }
+    fn continue_auth_async(
+        &self,
+        _: lapin::types::LongString,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<lapin::types::LongString, String>> + Send + '_>>
+    {
+        Box::pin(async { self.0.run(AuthArm::Continue).await.map(|()| "".into()) })
+    }
+    fn finish_auth_async(
+        &self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(self.0.run(AuthArm::Finish))
+    }
+}
+async fn close_during_auth(arm: AuthArm, fail: bool) {
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        task::Poll,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let gate = Arc::new(WriteGate::default());
+    let auth = Arc::new(HeldAuth {
+        arm,
+        entered: Default::default(),
+        release: Default::default(),
+        completed: Default::default(),
+        fail,
+    });
+    let peer_gate = gate.clone();
+    let peer_auth = auth.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut header = [0; 8];
+        stream.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header, b"AMQP\0\0\x09\x01");
+        send(
+            &mut stream,
+            0,
+            AMQPClass::Connection(connection::AMQPMethod::Start(connection::Start {
+                version_major: 0,
+                version_minor: 9,
+                mechanisms: "PLAIN".into(),
+                locales: "en_US".into(),
+                ..Default::default()
+            })),
+        )
+        .await;
+        if arm != AuthArm::Start {
+            assert!(matches!(
+                read(&mut stream).await,
+                AMQPFrame::Method(0, AMQPClass::Connection(connection::AMQPMethod::StartOk(_)))
+            ));
+            if arm == AuthArm::Continue {
+                send(
+                    &mut stream,
+                    0,
+                    AMQPClass::Connection(connection::AMQPMethod::Secure(connection::Secure {
+                        challenge: "challenge".into(),
+                    })),
+                )
+                .await;
+            } else {
+                send(
+                    &mut stream,
+                    0,
+                    AMQPClass::Connection(connection::AMQPMethod::Tune(connection::Tune {
+                        channel_max: 8,
+                        frame_max: 8192,
+                        heartbeat: 0,
+                    })),
+                )
+                .await;
+            }
+        }
+        peer_auth.entered.notified().await;
+        peer_gate.hold.store(true, Ordering::SeqCst);
+        send(
+            &mut stream,
+            0,
+            AMQPClass::Connection(connection::AMQPMethod::Close(connection::Close {
+                reply_code: 530,
+                reply_text: "peer closed during auth".into(),
+                class_id: 10,
+                method_id: 10,
+            })),
+        )
+        .await;
+        assert!(matches!(
+            read(&mut stream).await,
+            AMQPFrame::Method(0, AMQPClass::Connection(connection::AMQPMethod::CloseOk(_)))
+        ));
+    });
+    let stream = ends(smol::net::TcpStream::connect(address)).await.unwrap();
+    let (owner, handshake) = Connection::from_stream(
+        format!("amqp://{address}/%2f").parse().unwrap(),
+        Runtime::tokio_current(),
+        GatedStream {
+            stream,
+            gate: gate.clone(),
+        },
+        ConnectionProperties::default().with_auth_provider(HeldProvider(auth.clone())),
+    )
+    .unwrap();
+    tokio::pin!(handshake);
+    let mut result = None;
+    ends(std::future::poll_fn(|cx| {
+        if result.is_none()
+            && let Poll::Ready(value) = handshake.as_mut().poll(cx)
+        {
+            result = Some(value);
+        }
+        if gate.entered.load(Ordering::SeqCst) {
+            Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }))
+    .await;
+    auth.release.notify_one();
+    ends(auth.completed.notified()).await;
+    // This test uses one Tokio thread. After the provider returns, poison makes
+    // the remaining auth-task awaits ready; its guard finishes before we resume.
+    if result.is_none() {
+        result = std::future::poll_fn(|cx| {
+            Poll::Ready(match handshake.as_mut().poll(cx) {
+                Poll::Ready(value) => Some(value),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+    }
+    let early = result.is_some();
+    gate.hold.store(false, Ordering::SeqCst);
+    if let Some(waker) = gate.waker.lock().unwrap().take() {
+        waker.wake();
+    }
+    let error = match result {
+        Some(result) => result,
+        None => ends(handshake).await,
+    }
+    .unwrap_err();
+    owner.stop();
+    let _ = ends(tokio::task::spawn_blocking(move || owner.join()))
+        .await
+        .unwrap();
+    ends(peer).await.unwrap();
+    assert!(
+        !early,
+        "authentication released the handshake owner before CloseOk"
+    );
+    assert!(
+        matches!(error.kind(), ErrorKind::ProtocolError(error) if error.get_id() == 530 && error.get_message().as_str() == "peer closed during auth")
+    );
+}
+#[tokio::test]
+async fn starter_auth_close_waits_for_close_ok() {
+    for fail in [false, true] {
+        ends(close_during_auth(AuthArm::Start, fail)).await;
+    }
+}
+#[tokio::test]
+async fn continue_auth_close_waits_for_close_ok() {
+    for fail in [false, true] {
+        ends(close_during_auth(AuthArm::Continue, fail)).await;
+    }
+}
+#[tokio::test]
+async fn finish_auth_close_waits_for_close_ok() {
+    for fail in [false, true] {
+        ends(close_during_auth(AuthArm::Finish, fail)).await;
+    }
+}
