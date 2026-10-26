@@ -20,7 +20,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Error {
     kind: ErrorKind,
     notifier: Option<Notifier>,
-    remote_close: Option<Arc<RemoteClose>>,
+    remote_close: Option<Arc<ReceivedClose>>,
 }
 
 /// The complete Close method received from the peer.
@@ -33,6 +33,46 @@ pub enum RemoteClose {
     Connection(crate::protocol::connection::Close),
     /// A received `Channel.Close`.
     Channel(crate::protocol::channel::Close),
+}
+
+/// Immutable method and observer context captured before native completion.
+pub(crate) struct ReceivedClose {
+    method: RemoteClose,
+    context: Option<Box<dyn error::Error + Send + Sync>>,
+}
+impl ReceivedClose {
+    pub(crate) fn new(
+        method: RemoteClose,
+        context: Option<Box<dyn error::Error + Send + Sync>>,
+    ) -> Self {
+        Self { method, context }
+    }
+    pub(crate) fn method(&self) -> &RemoteClose {
+        &self.method
+    }
+}
+impl fmt::Debug for ReceivedClose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReceivedClose")
+            .field("method", &self.method)
+            .field("context", &self.context.is_some())
+            .finish()
+    }
+}
+/// Observe an actual received Close before shutdown or promise completion.
+pub trait RemoteCloseObserver: Send + Sync + 'static {
+    /// Called with the original method after pure validation and before any shutdown effects.
+    fn received(
+        &self,
+        close: &RemoteClose,
+        accepted: bool,
+    ) -> Option<Box<dyn error::Error + Send + Sync>>;
+}
+
+impl fmt::Debug for dyn RemoteCloseObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RemoteCloseObserver")
+    }
 }
 
 /// The type of error that can be returned in this crate.
@@ -121,15 +161,21 @@ impl Error {
     /// codes retain their Close too. Without a received peer Close this is `None`.
     #[must_use]
     pub fn remote_close(&self) -> Option<&RemoteClose> {
-        self.remote_close.as_deref()
+        self.remote_close.as_deref().map(ReceivedClose::method)
     }
 
-    pub(crate) fn remote_close_shared(&self) -> Option<Arc<RemoteClose>> {
+    /// The context captured with this exact received method, shared by clones.
+    pub fn remote_close_context(&self) -> Option<&(dyn error::Error + Send + Sync + 'static)> {
+        self.remote_close
+            .as_ref()
+            .and_then(|close| close.context.as_deref())
+    }
+    pub(crate) fn remote_close_shared(&self) -> Option<Arc<ReceivedClose>> {
         self.remote_close.clone()
     }
 
     // Keep an already captured Close when an error crosses another boundary.
-    pub(crate) fn with_remote_close(mut self, close: Option<Arc<RemoteClose>>) -> Self {
+    pub(crate) fn with_remote_close(mut self, close: Option<Arc<ReceivedClose>>) -> Self {
         if self.remote_close.is_none() {
             self.remote_close = close;
         }

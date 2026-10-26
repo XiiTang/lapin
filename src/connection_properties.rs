@@ -26,6 +26,7 @@ use std::sync::Arc;
 /// [`Connection`]: crate::Connection
 #[derive(Clone)]
 pub struct ConnectionProperties {
+    pub(crate) remote_close_observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
     pub(crate) locale: ShortString,
     pub(crate) client_properties: FieldTable,
     pub(crate) auth_provider: Option<Arc<dyn AuthProvider>>,
@@ -39,6 +40,7 @@ pub struct ConnectionProperties {
 impl Default for ConnectionProperties {
     fn default() -> Self {
         Self {
+            remote_close_observer: None,
             locale: "en_US".into(),
             client_properties: FieldTable::default(),
             auth_provider: None,
@@ -52,6 +54,21 @@ impl Default for ConnectionProperties {
 }
 
 impl ConnectionProperties {
+    /// Observe actual connection Close methods before native teardown.
+    /// Panics if configured twice; the observer is immutable after construction.
+    #[must_use]
+    pub fn with_remote_close_observer(
+        mut self,
+        observer: Arc<dyn crate::RemoteCloseObserver>,
+    ) -> Self {
+        assert!(
+            self.remote_close_observer.is_none(),
+            "configure Close observer once"
+        );
+        self.remote_close_observer = Some(observer);
+        self
+    }
+
     /// Collect exchange and queue declarations and bindings for recovery (default: `true`).
     ///
     /// When `false`, the registry retains no exchange or queue topology, even if
@@ -157,6 +174,10 @@ impl ConnectionProperties {
 impl fmt::Debug for ConnectionProperties {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionProperties")
+            .field(
+                "remote_close_observer",
+                &self.remote_close_observer.is_some(),
+            )
             .field("locale", &self.locale)
             .field("client_properties", &self.client_properties)
             .field("backoff", &self.backoff)

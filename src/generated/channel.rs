@@ -1133,15 +1133,38 @@ impl Channel {
         promise.await
     }
     fn receive_connection_close(&self, method: protocol::connection::Close) -> Result<()> {
-        let close = Arc::new(RemoteClose::Connection(method.clone()));
-        self.connection_status.set_remote_close(close.clone());
-        self.assert_channel0(method.get_amqp_class_id(), method.get_amqp_method_id())
-            .map_err(|error| error.with_remote_close(Some(close.clone())))?;
-        if !self.status.can_receive_messages() {
-            return Err(self
-                .status
-                .state_error("connection.close")
-                .with_remote_close(Some(close.clone())));
+        let validation = self.validate_channel0();
+        let rejected_channel = validation.is_err();
+        let validation = validation.and_then(|()| {
+            if self.status.can_receive_messages() {
+                Ok(())
+            } else {
+                Err(self.status.state_error("connection.close"))
+            }
+        });
+        let existing = self.connection_status.remote_close();
+        let close = match existing {
+            Some(close) => close,
+            None => {
+                let received = RemoteClose::Connection(method.clone());
+                let context = self
+                    .connection_close_observer
+                    .as_ref()
+                    .and_then(|observer| observer.received(&received, validation.is_ok()));
+                Arc::new(ReceivedClose::new(received, context))
+            }
+        };
+        let close = self.connection_status.set_remote_close(close);
+        if let Err(error) = validation {
+            let error = error.with_remote_close(Some(close));
+            if rejected_channel {
+                self.reject_connection_frame(
+                    &error,
+                    method.get_amqp_class_id(),
+                    method.get_amqp_method_id(),
+                );
+            }
+            return Err(error);
         }
         self.on_connection_close_received(method, close)
     }
@@ -1391,13 +1414,27 @@ impl Channel {
         promise.await
     }
     fn receive_channel_close(&self, method: protocol::channel::Close) -> Result<()> {
-        let close = Arc::new(RemoteClose::Channel(method.clone()));
-        self.status.set_remote_close(close.clone());
-        if !self.status.can_receive_messages() {
-            return Err(self
-                .status
-                .state_error("channel.close")
-                .with_remote_close(Some(close.clone())));
+        let validation = if self.status.can_receive_messages() {
+            Ok(())
+        } else {
+            Err(self.status.state_error("channel.close"))
+        };
+        let existing = self.status.remote_close();
+        let close = match existing {
+            Some(close) => close,
+            None => {
+                let received = RemoteClose::Channel(method.clone());
+                let context = self
+                    .remote_close_observer
+                    .as_ref()
+                    .and_then(|observer| observer.received(&received, validation.is_ok()));
+                Arc::new(ReceivedClose::new(received, context))
+            }
+        };
+        let close = self.status.set_remote_close(close);
+        if let Err(error) = validation {
+            let error = error.with_remote_close(Some(close));
+            return Err(error);
         }
         self.on_channel_close_received(method, close)
     }

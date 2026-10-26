@@ -42,7 +42,7 @@ struct Poison {
     channels: HashMap<ChannelId, Error>,
 }
 impl FrameErrorContext {
-    pub(crate) fn remote_close(&self, id: ChannelId) -> Option<Arc<crate::RemoteClose>> {
+    pub(crate) fn remote_close(&self, id: ChannelId) -> Option<Arc<crate::error::ReceivedClose>> {
         self.channel_poison(id)
             .and_then(|error| error.remote_close_shared())
     }

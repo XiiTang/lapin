@@ -207,9 +207,14 @@ impl InternalRPCHandle {
     pub(crate) fn create_channel_completion(
         &self,
         connection_closer: Arc<ConnectionCloser>,
+        observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
     ) -> Promise<Channel> {
         let (promise, resolver) = self.reply("channel.create");
-        self.send(InternalCommand::CreateChannel(connection_closer, resolver));
+        self.send(InternalCommand::CreateChannel(
+            connection_closer,
+            observer,
+            resolver,
+        ));
         promise
     }
 
@@ -367,7 +372,11 @@ enum InternalCommand {
         Identifier,
         Option<PromiseResolver<()>>,
     ),
-    CreateChannel(Arc<ConnectionCloser>, PromiseResolver<Channel>),
+    CreateChannel(
+        Arc<ConnectionCloser>,
+        Option<Arc<dyn crate::RemoteCloseObserver>>,
+        PromiseResolver<Channel>,
+    ),
     DeregisterConsumer(ChannelId, ShortString),
     FinishConnectionShutdown,
     FinishFrameRejection(Error),
@@ -412,7 +421,7 @@ impl Drop for QueuedCommand {
             | Some(InternalCommand::UpdateSecret(_, _, resolver)) => {
                 resolver.retain_remote_close(self.error_context.remote_close(0));
             }
-            Some(InternalCommand::CreateChannel(_, resolver)) => {
+            Some(InternalCommand::CreateChannel(_, _, resolver)) => {
                 resolver.retain_remote_close(self.error_context.remote_close(0));
             }
             Some(InternalCommand::InitConnectionShutdown(error, Some(resolver))) => {
@@ -664,13 +673,15 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                 FinishFrameRejection(error) => {
                     channels.set_connection_error(error);
                 }
-                CreateChannel(closer, resolver) => match channels.create(closer) {
-                    Ok(channel) => Self::forward_completion(
-                        channel.channel_open_completion(channel.clone()),
-                        resolver,
-                    ),
-                    Err(err) => resolver.reject(err),
-                },
+                CreateChannel(closer, observer, resolver) => {
+                    match channels.create(closer, observer) {
+                        Ok(channel) => Self::forward_completion(
+                            channel.channel_open_completion(channel.clone()),
+                            resolver,
+                        ),
+                        Err(err) => resolver.reject(err),
+                    }
+                }
                 DeregisterConsumer(channel_id, consumer_tag) => {
                     if let Ok(channel) = get_channel(channel_id) {
                         channel.deregister_consumer(consumer_tag.as_str());

@@ -36,6 +36,8 @@ pub(super) fn channel(
         None,
         recovery,
         Events::new().sender(),
+        None,
+        None,
     );
     channel.set_state(ChannelState::Connected);
     (channel, rpc)

@@ -210,19 +210,41 @@ impl Channel {
     }
   {{else}}
     {{#if method.metadata.remote_close ~}}
-    let close = Arc::new(RemoteClose::{{method.metadata.remote_close}}(method.clone()));
-    self.{{#if class.metadata.channel0_only ~}}connection_status{{else}}status{{/if ~}}.set_remote_close(close.clone());
-    {{/if ~}}
     {{#if class.metadata.channel0_only ~}}
-    self.assert_channel0(
-      method.get_amqp_class_id(),
-      method.get_amqp_method_id(),
-    ){{#if method.metadata.remote_close ~}}.map_err(|error| error.with_remote_close(Some(close.clone()))){{/if ~}}?;
+    let validation = self.validate_channel0();
+    let rejected_channel = validation.is_err();
+    let validation = validation.and_then(|()| if self.status.can_receive_messages() { Ok(()) } else { Err(self.status.state_error("{{class.name}}.{{method.name}}")) });
+    let existing = self.connection_status.remote_close();
+    {{else}}
+    let validation = if self.status.can_receive_messages() { Ok(()) } else { Err(self.status.state_error("{{class.name}}.{{method.name}}")) };
+    let existing = self.status.remote_close();
+    {{/if ~}}
+    let close = match existing {
+      Some(close) => close,
+      None => {
+        let received = RemoteClose::{{method.metadata.remote_close}}(method.clone());
+        let context = self.{{#if class.metadata.channel0_only ~}}connection_close_observer{{else}}remote_close_observer{{/if ~}}.as_ref().and_then(|observer| observer.received(&received, validation.is_ok()));
+        Arc::new(ReceivedClose::new(received, context))
+      }
+    };
+    let close = self.{{#if class.metadata.channel0_only ~}}connection_status{{else}}status{{/if ~}}.set_remote_close(close);
+    if let Err(error) = validation {
+      let error = error.with_remote_close(Some(close));
+      {{#if class.metadata.channel0_only ~}}
+      if rejected_channel { self.reject_connection_frame(&error, method.get_amqp_class_id(), method.get_amqp_method_id()); }
+      {{/if ~}}
+      return Err(error);
+    }
+    self.on_{{snake class.name false}}_{{snake method.name false}}_received(method, close)
+    {{else}}
+    {{#if class.metadata.channel0_only ~}}
+    self.assert_channel0(method.get_amqp_class_id(), method.get_amqp_method_id())?;
     {{/if ~}}
     if !self.status.can_receive_messages() {
-      return Err(self.status.state_error("{{class.name}}.{{method.name}}"){{#if method.metadata.remote_close ~}}.with_remote_close(Some(close.clone())){{/if ~}});
+      return Err(self.status.state_error("{{class.name}}.{{method.name}}"));
     }
-    self.on_{{snake class.name false}}_{{snake method.name false}}_received(method{{#if method.metadata.remote_close ~}}, close{{/if ~}})
+    self.on_{{snake class.name false}}_{{snake method.name false}}_received(method)
+    {{/if ~}}
   {{/if ~}}
   }
   {{/if ~}}

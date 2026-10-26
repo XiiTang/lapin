@@ -258,10 +258,23 @@ impl Connection {
 
     /// Admit this operation and expose its native completion receiver.
     pub fn create_channel_completion(&self) -> Result<crate::Completion<Channel>> {
+        self.create_channel_completion_observed(None)
+    }
+    /// Install this channel's immutable receive observer before open dispatch.
+    pub fn create_channel_completion_with_close_observer(
+        &self,
+        observer: Arc<dyn crate::RemoteCloseObserver>,
+    ) -> Result<crate::Completion<Channel>> {
+        self.create_channel_completion_observed(Some(observer))
+    }
+    fn create_channel_completion_observed(
+        &self,
+        observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
+    ) -> Result<crate::Completion<Channel>> {
         self.status.ensure_connected()?;
         Ok(self
             .internal_rpc
-            .create_channel_completion(self.closer.clone()))
+            .create_channel_completion(self.closer.clone(), observer))
     }
 
     /// Return a [`Stream`] of connection-level [`Event`]s.
@@ -854,11 +867,11 @@ mod tests {
             .negotiated_config
             .set_channel_max(ChannelId::MAX);
         for _ in 1..=ChannelId::MAX {
-            channels.create(conn.closer.clone()).unwrap();
+            channels.create(conn.closer.clone(), None).unwrap();
         }
 
         assert_eq!(
-            channels.create(conn.closer.clone()),
+            channels.create(conn.closer.clone(), None,),
             Err(ErrorKind::ChannelsLimitReached.into())
         );
     }
@@ -872,7 +885,7 @@ mod tests {
         // Bootstrap connection state to a consuming state
         let (conn, channels, internal_rpc) = create_connection();
         conn.configuration.negotiated_config.set_channel_max(2047);
-        let channel = channels.create(conn.closer.clone()).unwrap();
+        let channel = channels.create(conn.closer.clone(), None).unwrap();
         channel.set_state(ChannelState::Connected);
         let queue_name = ShortString::from("consumed");
         let consumer_tag = ShortString::from("consumer-tag");
@@ -938,7 +951,7 @@ mod tests {
         // Bootstrap connection state to a consuming state
         let (conn, channels, internal_rpc) = create_connection();
         conn.configuration.negotiated_config.set_channel_max(2047);
-        let channel = channels.create(conn.closer.clone()).unwrap();
+        let channel = channels.create(conn.closer.clone(), None).unwrap();
         channel.set_state(ChannelState::Connected);
         let queue_name = ShortString::from("consumed");
         let consumer_tag = ShortString::from("consumer-tag");
@@ -992,7 +1005,7 @@ mod tests {
         let (conn, channels, _) = create_connection();
         conn.closer.noop();
         conn.configuration.negotiated_config.set_channel_max(4);
-        let violated = channels.create(conn.closer.clone()).unwrap();
+        let violated = channels.create(conn.closer.clone(), None).unwrap();
         violated.set_state(ChannelState::Connected);
         let _pending = violated.register_publisher_confirm();
         // The broker acknowledges a delivery tag nothing was published with.
@@ -1014,7 +1027,7 @@ mod tests {
         let (conn, channels, _) = create_connection();
         conn.closer.noop();
         conn.configuration.negotiated_config.set_channel_max(4);
-        let closed = channels.create(conn.closer.clone()).unwrap();
+        let closed = channels.create(conn.closer.clone(), None).unwrap();
         closed.set_state(ChannelState::Connected);
         let pending = closed.register_publisher_confirm();
         let close = AMQPClass::Channel(channel::AMQPMethod::Close(channel::Close {
@@ -1042,7 +1055,7 @@ mod tests {
             .configuration
             .negotiated_config
             .set_channel_max(4);
-        let channel = channels.create(connection.closer.clone()).unwrap();
+        let channel = channels.create(connection.closer.clone(), None).unwrap();
         channel.set_state(ChannelState::Connected);
         let result = futures_lite::future::block_on(
             channel

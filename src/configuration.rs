@@ -17,6 +17,7 @@ use std::{
 ///
 /// [`Connection::configuration`]: crate::Connection::configuration
 pub struct Configuration {
+    connection_close_observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
     pub(crate) amqp_client_properties: FieldTable,
     pub(crate) amqp_locale: ShortString,
     pub(crate) auth_provider: Arc<dyn AuthProvider>,
@@ -26,6 +27,10 @@ pub struct Configuration {
 }
 
 impl Configuration {
+    pub(crate) fn connection_close_observer(&self) -> Option<Arc<dyn crate::RemoteCloseObserver>> {
+        self.connection_close_observer.clone()
+    }
+
     pub(crate) fn new(uri: &AMQPUri, options: ConnectionProperties) -> Self {
         let ConnectionProperties {
             locale,
@@ -36,6 +41,7 @@ impl Configuration {
             ..
         } = options;
         Self {
+            connection_close_observer: options.remote_close_observer,
             amqp_client_properties: client_properties,
             amqp_locale: locale,
             auth_provider: auth_provider.unwrap_or_else(|| Arc::new(DefaultAuthProvider::new(uri))),
@@ -75,6 +81,7 @@ impl Configuration {
 impl Clone for Configuration {
     fn clone(&self) -> Self {
         Self {
+            connection_close_observer: self.connection_close_observer.clone(),
             amqp_client_properties: self.amqp_client_properties.clone(),
             amqp_locale: self.amqp_locale.clone(),
             auth_provider: self.auth_provider.clone(),
@@ -87,7 +94,13 @@ impl Clone for Configuration {
 
 impl fmt::Debug for Configuration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.negotiated_config, f)
+        f.debug_struct("Configuration")
+            .field("negotiated_config", &self.negotiated_config)
+            .field(
+                "connection_close_observer",
+                &self.connection_close_observer.is_some(),
+            )
+            .finish()
     }
 }
 

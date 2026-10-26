@@ -46,10 +46,13 @@ fn fixture() -> (
 
 fn channel(channels: &Channels, rpc: &InternalRPC<crate::runtime::DefaultRuntimeKit>) -> Channel {
     let channel = channels
-        .create(Arc::new(ConnectionCloser::new(
-            channels.connection_status.clone(),
-            rpc.handle(),
-        )))
+        .create(
+            Arc::new(ConnectionCloser::new(
+                channels.connection_status.clone(),
+                rpc.handle(),
+            )),
+            None,
+        )
         .unwrap();
     channel.set_state(ChannelState::Connected);
     channel

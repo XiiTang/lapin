@@ -890,3 +890,24 @@ unchanged BrokenPipe kind. Final macOS arm64 validation through build-slot:
 60 unit + 19 integration + 7 doctests (86), strict all-target Clippy, fmt and
 repeatable template generation all pass (exit 0). Queue admission, capacity,
 stop behavior, retry decisions and error classification are unchanged.
+
+## W5d receive observer (work in progress)
+
+Received connection/channel Close is captured once before rejection, poison or
+shutdown effects. The immutable ReceivedClose envelope carries the observer's
+opaque context through status, errors and completion paths. Observer selection
+is fixed by method scope; per-channel observers are installed before Channel.Open.
+Configuration is immutable after installation. Callbacks run outside native locks.
+These checkpoints use private envelope fields, first-write status setters and the
+single generated receive entry, rather than changing close classification.
+
+macOS arm64 regression evidence on observer work based on 51805ee0:
+`cargo test --test remote_close_observer -- --nocapture` exited 101: four
+observer regressions passed; `idle_connection_close_notifies_before_shutdown`
+and `connection_close_context_precedes_rejection_effects` failed reading required
+Connection.CloseOk with UnexpectedEof. The existing shutdown/frame poison defect
+is tracked as Boundless #369; this patch does not repair it or weaken either test.
+`cargo test --lib connection::remote_close_tests::first_received_close_envelope_is_retained_by_status_and_error`
+exited 0 (one passed). `cargo build --features codegen-internal` and generated-file
+formatting exited 0. All compile/test commands ran through build-slot.
+This is WIP evidence; remaining native checks and Boundless integration follow.

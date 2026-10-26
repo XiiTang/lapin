@@ -65,7 +65,7 @@ impl Fixture {
     fn channel(&self) -> Channel {
         let channel = self
             .channels
-            .create(self.connection.closer.clone())
+            .create(self.connection.closer.clone(), None)
             .unwrap();
         channel.set_state(ChannelState::Connected);
         channel
@@ -603,4 +603,24 @@ async fn get_settlement_after_rpc_exit_keeps_peer_close_on_resolver_loss() {
         "IO error: promise lost its last resolver before completion"
     );
     check(&error, &expected);
+}
+
+#[tokio::test]
+async fn first_received_close_envelope_is_retained_by_status_and_error() {
+    use crate::error::ReceivedClose;
+    let method = || RemoteClose::Connection(connection::Close { reply_code: 200, reply_text: "first".into(), class_id: 0, method_id: 0 });
+    let first = Arc::new(ReceivedClose::new(method(), Some(Box::new(std::io::Error::other("first context")))));
+    let second = Arc::new(ReceivedClose::new(method(), Some(Box::new(std::io::Error::other("second context")))));
+    let fixture = Fixture::new();
+    let channel = fixture.channel().status().clone();
+    let connection = fixture.connection.status().clone();
+    assert!(Arc::ptr_eq(&connection.set_remote_close(first.clone()), &first));
+    assert!(Arc::ptr_eq(&connection.set_remote_close(second.clone()), &first));
+    assert!(Arc::ptr_eq(&connection.remote_close().unwrap(), &first));
+    assert!(Arc::ptr_eq(&channel.set_remote_close(first.clone()), &first));
+    assert!(Arc::ptr_eq(&channel.set_remote_close(second.clone()), &first));
+    let error = Error::from(ErrorKind::InvalidChannel(1)).with_remote_close(Some(first.clone())).with_remote_close(Some(second));
+    assert!(Arc::ptr_eq(&error.remote_close_shared().unwrap(), &first));
+    assert!(std::ptr::eq(error.remote_close_context().unwrap(), error.clone().remote_close_context().unwrap()));
+    fixture.stop().await;
 }

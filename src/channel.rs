@@ -1,3 +1,4 @@
+use crate::error::ReceivedClose;
 use crate::{
     BasicProperties, ChannelState, ChannelStatus, Connection, ConnectionState, ConnectionStatus,
     Error, ErrorKind, ExchangeKind, Promise, PromiseResolver, RemoteClose, Result,
@@ -55,6 +56,8 @@ use tracing::{error, info, trace};
 /// tasks — or from different OS threads — concurrently.
 #[derive(Clone)]
 pub struct Channel {
+    connection_close_observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
+    remote_close_observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
     id: ChannelId,
     expected_generation: Option<u64>,
     configuration: NegotiatedConfig,
@@ -108,6 +111,8 @@ impl Channel {
         connection_closer: Option<Arc<ConnectionCloser>>,
         recovery_config: RecoveryConfig,
         events_sender: EventsSender,
+        connection_close_observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
+        remote_close_observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
     ) -> Channel {
         let returned_messages = ReturnedMessages::default();
         let status =
@@ -122,6 +127,8 @@ impl Channel {
             )))
         };
         Self {
+            connection_close_observer,
+            remote_close_observer,
             id: channel_id,
             expected_generation: None,
             local_registry: Registry::new(configuration.collect_topology),
@@ -244,20 +251,28 @@ impl Channel {
         self.waker.wake()
     }
 
-    fn assert_channel0(&self, class_id: Identifier, method_id: Identifier) -> Result<()> {
+    fn validate_channel0(&self) -> Result<()> {
         if self.id == 0 {
             Ok(())
         } else {
-            error!(
-                channel=%self.id,
-                "Got a connection frame on, closing connection"
-            );
-            let error = AMQPError::new(
+            Err(ErrorKind::ProtocolViolation(AMQPError::new(
                 AMQPHardError::COMMANDINVALID.into(),
                 format!("connection frame received on channel {}", self.id).into(),
-            );
-            self.reject_frame(0, error, class_id, method_id)
+            ))
+            .into())
         }
+    }
+    fn reject_connection_frame(&self, error: &Error, class_id: Identifier, method_id: Identifier) {
+        error!(channel=%self.id, "Got a connection frame on, closing connection");
+        let _ = self.reject_frame_error(0, error.clone(), class_id, method_id);
+    }
+
+    fn assert_channel0(&self, class_id: Identifier, method_id: Identifier) -> Result<()> {
+        let result = self.validate_channel0();
+        if let Err(error) = &result {
+            self.reject_connection_frame(error, class_id, method_id);
+        }
+        result
     }
 
     /// Perform a graceful AMQP channel close.
@@ -651,7 +666,10 @@ impl Channel {
         class_id: Identifier,
         method_id: Identifier,
     ) -> Result<()> {
-        let error = Error::from(ErrorKind::ProtocolViolation(error));
+        self.reject_frame_error(close_channel, Error::from(ErrorKind::ProtocolViolation(error)), class_id, method_id)
+    }
+
+    fn reject_frame_error(&self, close_channel: ChannelId, error: Error, class_id: Identifier, method_id: Identifier) -> Result<()> {
         if !self.connection_status.admit_rejection(error.clone()) {
             return Err(self.connection_status.rejection().unwrap_or(error));
         }
@@ -1153,7 +1171,7 @@ impl Channel {
     fn on_connection_close_received(
         &self,
         method: protocol::connection::Close,
-        close: Arc<RemoteClose>,
+        close: Arc<ReceivedClose>,
     ) -> Result<()> {
         let error: Error = AMQPError::try_from(method.clone())
             .map(|error| {
@@ -1244,7 +1262,7 @@ impl Channel {
     fn on_channel_close_received(
         &self,
         method: protocol::channel::Close,
-        close: Arc<RemoteClose>,
+        close: Arc<ReceivedClose>,
     ) -> Result<()> {
         let error = AMQPError::try_from(method.clone()).map(|error| {
                 error!(
@@ -1661,6 +1679,8 @@ mod partial_get_tests {
             None,
             recovery,
             Events::new().sender(),
+            None,
+            None,
         );
         channel.set_state(ChannelState::Connected);
         (channel, rpc)
@@ -1818,6 +1838,8 @@ mod authentication_step_tests {
             None,
             recovery,
             Events::new().sender(),
+            None,
+            None,
         );
         channel.set_state(ChannelState::Connected);
         (channel, rpc)

@@ -1,5 +1,6 @@
+use crate::error::ReceivedClose;
 use crate::{
-    ConnectionStatus, Error, ErrorKind, RemoteClose, Result,
+    ConnectionStatus, Error, ErrorKind, Result,
     channel_receiver_state::{ChannelReceiverStates, DeliveryCause},
     channel_recovery_context::ChannelRecoveryContext,
     internal_rpc::InternalRPCHandle,
@@ -133,11 +134,11 @@ impl ChannelStatus {
         error
     }
 
-    pub(crate) fn set_remote_close(&self, close: Arc<RemoteClose>) {
-        self.write().remote_close = Some(close);
+    pub(crate) fn set_remote_close(&self, close: Arc<ReceivedClose>) -> Arc<ReceivedClose> {
+        self.write().remote_close.get_or_insert(close).clone()
     }
 
-    pub(crate) fn remote_close(&self) -> Option<Arc<RemoteClose>> {
+    pub(crate) fn remote_close(&self) -> Option<Arc<ReceivedClose>> {
         self.read().remote_close()
     }
 
@@ -269,7 +270,7 @@ struct Inner {
     killswitch: KillSwitch,
     internal_rpc: InternalRPCHandle,
     connection_status: ConnectionStatus,
-    remote_close: Option<Arc<RemoteClose>>,
+    remote_close: Option<Arc<ReceivedClose>>,
 }
 
 impl Inner {
@@ -295,7 +296,7 @@ impl Inner {
         this
     }
 
-    fn remote_close(&self) -> Option<Arc<RemoteClose>> {
+    fn remote_close(&self) -> Option<Arc<ReceivedClose>> {
         self.remote_close
             .clone()
             .or_else(|| self.connection_status.remote_close())

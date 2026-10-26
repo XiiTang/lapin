@@ -1,5 +1,6 @@
+use crate::error::ReceivedClose;
 use crate::{
-    Error, ErrorKind, RemoteClose, Result,
+    Error, ErrorKind, Result,
     connection_step::{HandshakeResolver, WeakHandshakeResolver},
     types::ShortString,
     uri::AMQPUri,
@@ -123,8 +124,8 @@ impl ConnectionStatus {
             .with_remote_close(inner.remote_close.clone())
     }
 
-    pub(crate) fn set_remote_close(&self, close: Arc<RemoteClose>) {
-        self.write().remote_close = Some(close);
+    pub(crate) fn set_remote_close(&self, close: Arc<ReceivedClose>) -> Arc<ReceivedClose> {
+        self.write().remote_close.get_or_insert(close).clone()
     }
 
     // An invalid channel Close can end the connection too. Retain its facts
@@ -137,7 +138,7 @@ impl ConnectionStatus {
         error.with_remote_close(inner.remote_close.clone())
     }
 
-    pub(crate) fn remote_close(&self) -> Option<Arc<RemoteClose>> {
+    pub(crate) fn remote_close(&self) -> Option<Arc<ReceivedClose>> {
         self.read().remote_close.clone()
     }
 
@@ -248,7 +249,7 @@ struct StateInner {
     blocked: bool,
     poison: Option<Error>,
     rejection: Option<Error>,
-    remote_close: Option<Arc<RemoteClose>>,
+    remote_close: Option<Arc<ReceivedClose>>,
 }
 
 impl StateInner {

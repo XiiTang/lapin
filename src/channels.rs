@@ -1,3 +1,4 @@
+use crate::error::ReceivedClose;
 use crate::{
     BasicProperties, Channel, ChannelState, Configuration, Connection, ConnectionState,
     ConnectionStatus, Error, ErrorKind, RemoteClose, Result,
@@ -52,6 +53,7 @@ impl Channels {
             configuration.negotiated_config.clone(),
             configuration.recovery_config(),
             waker,
+            configuration.connection_close_observer(),
         );
         let channel0 = inner.create_channel(
             0,
@@ -59,6 +61,7 @@ impl Channels {
             internal_rpc.clone(),
             frames.clone(),
             events.sender(),
+            None,
             None,
         );
         channel0.set_state(ChannelState::Connected);
@@ -76,7 +79,11 @@ impl Channels {
         }
     }
 
-    pub(crate) fn create(&self, connection_closer: Arc<ConnectionCloser>) -> Result<Channel> {
+    pub(crate) fn create(
+        &self,
+        connection_closer: Arc<ConnectionCloser>,
+        observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
+    ) -> Result<Channel> {
         let mut ingress = self.ingress.lock().unwrap_or_else(|e| e.into_inner());
         let channel = self.write().create(
             self.connection_status.clone(),
@@ -84,6 +91,7 @@ impl Channels {
             self.frames.clone(),
             self.events.sender(),
             connection_closer,
+            observer,
         )?;
         // A reopened native id is a new channel lifetime with a new tag
         // sequence. Creation and ingress share the fence, so no first delivery
@@ -159,8 +167,20 @@ impl Channels {
             };
             Err(match close {
                 Some(close) => {
-                    let close = Arc::new(close);
-                    self.connection_status.set_remote_close(close.clone());
+                    let close = match self.connection_status.remote_close() {
+                        Some(existing) => existing,
+                        None => {
+                            let context = if matches!(&close, RemoteClose::Connection(_)) {
+                                self.configuration
+                                    .connection_close_observer()
+                                    .and_then(|observer| observer.received(&close, false))
+                            } else {
+                                None
+                            };
+                            Arc::new(ReceivedClose::new(close, context))
+                        }
+                    };
+                    let close = self.connection_status.set_remote_close(close);
                     Error::from(ErrorKind::InvalidChannel(id)).with_remote_close(Some(close))
                 }
                 None => self.invalid_channel_error(id),
@@ -460,6 +480,7 @@ impl fmt::Debug for Channels {
 }
 
 struct Inner {
+    connection_close_observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
     channels: HashMap<ChannelId, Channel>,
     channel_id: IdSequence<ChannelId>,
     configuration: NegotiatedConfig,
@@ -472,8 +493,10 @@ impl Inner {
         configuration: NegotiatedConfig,
         recovery_config: RecoveryConfig,
         waker: SocketStateHandle,
+        connection_close_observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
     ) -> Self {
         Self {
+            connection_close_observer,
             channels: HashMap::default(),
             channel_id: IdSequence::new(false),
             configuration,
@@ -490,6 +513,7 @@ impl Inner {
         frames: Frames,
         events_sender: EventsSender,
         connection_closer: Option<Arc<ConnectionCloser>>,
+        observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
     ) -> Channel {
         debug!(%id, "create channel");
         Channel::new(
@@ -502,6 +526,8 @@ impl Inner {
             connection_closer,
             self.recovery_config,
             events_sender,
+            self.connection_close_observer.clone(),
+            observer,
         )
     }
 
@@ -512,6 +538,7 @@ impl Inner {
         frames: Frames,
         events_sender: EventsSender,
         connection_closer: Arc<ConnectionCloser>,
+        observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
     ) -> Result<Channel> {
         debug!("create channel");
         self.channel_id.set_max(self.configuration.channel_max());
@@ -536,6 +563,7 @@ impl Inner {
                     frames,
                     events_sender,
                     Some(connection_closer),
+                    observer,
                 );
                 self.channels.insert(id, channel.clone_internal());
                 return Ok(channel);
