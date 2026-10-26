@@ -926,3 +926,12 @@ for the new accessor's missing must_use; after adding it, exit 0. Final
 `cargo fmt --all --check` exited 0 after formatting the new fixtures. Commands
 ran through build-slot on macOS arm64. Code was first committed as 52245298;
 this follow-up changes only formatting, must_use and this evidence.
+
+Current verification disposition (macOS arm64, observer tip
+8a82380866770af95512327432122f4e52642e24): the RabbitMQ workspace integration
+run is NOT RUN without a configured broker, per the landing owner. The earlier
+attempt and its connection-refused result above are historical evidence, not a
+passed gate. The observer's two Connection.CloseOk tests remain unchanged and
+blocked by #369; the four other observer tests, 61 library tests, 11 supplied
+driver tests, seven doctests, strict Clippy and formatting retain their recorded
+results. No shutdown/frame-poison repair is included.
