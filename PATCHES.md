@@ -893,26 +893,50 @@ stop behavior, retry decisions and error classification are unchanged.
 
 ## W5d receive observer (work in progress)
 
+The current combined line descends from landed #369 prerequisite
+966311590693c4b44bb0db0b9d7b105c650f3020. Its rebased required lineage is
+201b4b1 (W4d), 0e8a81c (W7d), 252e6da, c686e1b, fadaddc (topology removal),
+3542674 (Close facts), 1ba7ca3 (observer/context), 099a9b3, a597a4e and
+f930bdcbfeefdf2941acef1440eb9222b9769138. No old-line merge or restoration
+path is added. Integration removes the obsolete raw-resolver shutdown Drop arm
+and restores the Promise import required by the retained completion entry.
+The merged generator templates produce the channel receive code.
+
+One ReceivedClose envelope is attached to the original Error before
+`defer_handshake_close`, retained across shutdown/recovery selection, and carried
+by the existing HandshakeResolver until actual CloseOk frame-write completion.
+The sole successful-write retirement hook and #369 poison admission remain in
+place. The shared-owner unit test now checks the same envelope Arc and borrowed
+context address, beside its original cause-Arc and once-only completion checks.
+The first combined generator build exited 101 for the missing Promise import;
+its corrected rerun builds successfully. Combined results are recorded below.
+RabbitMQ-dependent workspace tests are not run without a configured broker.
+
+
 Received connection/channel Close is captured once before rejection, poison or
 shutdown effects. The immutable ReceivedClose envelope carries the observer's
 opaque context through status, errors and completion paths. Observer selection
 is fixed by method scope; per-channel observers are installed before Channel.Open.
-Configuration is immutable after installation. Callbacks run outside native locks.
+Configuration is immutable after installation. Callbacks run synchronously on the
+I/O thread under ingress, before teardown. They must not wait in production or
+reenter native code; the Boundless lock order is ingress then lifecycle/book.
+No caller may enter native ingress while holding a lock acquired by the callback.
 These checkpoints use private envelope fields, first-write status setters and the
 single generated receive entry, rather than changing close classification.
 
-macOS arm64 regression evidence on observer work based on 51805ee0:
+Historical pre-#369 macOS arm64 regression evidence on observer work based on 51805ee0:
 `cargo test --test remote_close_observer -- --nocapture` exited 101: four
 observer regressions passed; `idle_connection_close_notifies_before_shutdown`
 and `connection_close_context_precedes_rejection_effects` failed reading required
 Connection.CloseOk with UnexpectedEof. The existing shutdown/frame poison defect
-is tracked as Boundless #369; this patch does not repair it or weaken either test.
+was tracked as Boundless #369 and is now repaired by the landed prerequisite
+966311590693c4b44bb0db0b9d7b105c650f3020. Neither test was weakened.
 `cargo test --lib connection::remote_close_tests::first_received_close_envelope_is_retained_by_status_and_error`
 exited 0 (one passed). `cargo build --features codegen-internal` and generated-file
 formatting exited 0. All compile/test commands ran through build-slot.
 This is WIP evidence; remaining native checks and Boundless integration follow.
 
-Follow-up evidence on the same observer implementation: `cargo test --lib`
+Historical follow-up evidence on the same pre-rebase observer implementation: `cargo test --lib`
 exited 0 (61 passed); `cargo test --features tokio --test supplied_driver`
 exited 0 (11 passed). `cargo test --workspace` exited 101 after the 61 unit
 and conn_refused tests passed: the existing connection integration requires
@@ -927,7 +951,7 @@ for the new accessor's missing must_use; after adding it, exit 0. Final
 ran through build-slot on macOS arm64. Code was first committed as 52245298;
 this follow-up changes only formatting, must_use and this evidence.
 
-Current verification disposition (macOS arm64, observer tip
+Historical pre-rebase verification disposition (macOS arm64, observer tip
 8a82380866770af95512327432122f4e52642e24): the RabbitMQ workspace integration
 run is NOT RUN without a configured broker, per the landing owner. The earlier
 attempt and its connection-refused result above are historical evidence, not a
@@ -936,7 +960,7 @@ blocked by #369; the four other observer tests, 61 library tests, 11 supplied
 driver tests, seven doctests, strict Clippy and formatting retain their recorded
 results. No shutdown/frame-poison repair is included.
 
-Additional W5d rejection controls (macOS arm64, based on f0d2cde5): a test-only,
+Historical additional W5d rejection controls (macOS arm64, based on f0d2cde5): a test-only,
 nonblocking close-dispatch probe sits immediately before close_connection in
 reject_connection_frame. The private probe records class/method ids; no native
 shutdown order or production observer API changes. The wrapper control checks
@@ -955,5 +979,59 @@ tests passed and the same two Connection.CloseOk tests failed at the required
 frame header read with UnexpectedEof (early eof), then JoinError::Panic. Their
 assertions remain unchanged. The accepted control still prevents that existing
 integration test reaching its nonzero rejected subcase; the new independent
-native unit control covers rejection before effects. #369 remains unmodified.
+native unit control covers rejection before effects. These failures predate the
+landed #369 prerequisite and do not describe the combined rebased tip.
 RabbitMQ workspace integration remains NOT RUN without a broker.
+
+
+### Combined #369/observer WIP evidence (macOS arm64)
+
+Commands use the machine's `build-slot` wrapper, local fork resolution and
+`CARGO_INCREMENTAL=0`. The current rebased source is based on full tip
+f930bdcbfeefdf2941acef1440eb9222b9769138; the integration commit and final pin
+are identified by the implementation report. These are failing WIP results,
+not a combined regression pass.
+
+- `build-slot cargo build --no-default-features --features tokio,codegen-internal --locked`
+  with `LAPIN_CODEGEN_DIR=src/generated` (absolute checkout directory at execution):
+  exit 0 after the missing Promise import correction. The generator produced
+  the committed channel source; no generated code was edited by hand.
+- `build-slot cargo fmt --all`: exit 0.
+- `build-slot cargo test --lib --test connection_close --test remote_close_observer --test supplied_driver --features tokio --locked --no-fail-fast`:
+  exit 101, 86 passed and four failed (zero ignored). Library: 63 passed/two
+  failed; connection_close: eight passed; observer: five passed/one failed;
+  supplied_driver: ten passed/one failed. The shared HandshakeResolver envelope
+  pointer/cause pointer control and
+  `frames::close_ok_tests::poisoned_admission_keeps_only_the_connection_close_acknowledgement`
+  both ran and passed. All eight #369 actual-wire/held-auth regressions passed.
+- The transportless unit fixtures
+  `remote_connection_close_reaches_channels_and_pending_completions` and
+  `remote_close_completes_an_abandoned_handshake_with_its_peer_facts` failed with
+  `Elapsed(())` after ten seconds. They have no writer completing the now-admitted
+  CloseOk; the former still explicitly asserts the old poison-rejects-CloseOk
+  behavior. Their assertions await the reviewed fixture cutover.
+- `connection_close_context_precedes_rejection_effects`: accepted route decoded
+  actual CloseOk; rejected=true failed its local Connection.Close503 read with
+  `UnexpectedEof (early eof)`, then JoinError::Panic. Its assertions and the
+  production rejection path are unchanged, pending the design answer.
+- `close_during_async_authentication_retains_peer_facts`: accepted route0,
+  eof=false returns the reserved original peer error403; the old fixture asserts
+  ConnectionAborted. Its assertion awaits the reviewed cutover.
+- `build-slot cargo clippy --lib --tests --locked -- -D warnings`: exit 0.
+- `build-slot cargo fmt --all --check`: exit 0. Include-generated output is
+  separately formatted by `build-slot rustfmt --edition 2024 src/generated/channel.rs`,
+  exit 0.
+- Diagnostic isolation:
+  `build-slot cargo test --features tokio --locked --test remote_close_observer --test supplied_driver --no-fail-fast -- connection_close_context_precedes_rejection_effects close_during_async_authentication_retains_peer_facts --nocapture`:
+  exit 101, both selected tests failed as described above. Temporary diagnostic
+  messages identified the routes and were removed; no assertion was weakened.
+
+The earlier combined attempt exited 101 before running tests: stale Promise
+import and private poison-field access in the retained #369 unit fixture, the
+new cancellation control's missing Error argument, plus an unused ErrorKind
+import. These integration errors were corrected against the existing public
+Promise and private shared FrameErrorContext; no production mechanism or
+visibility was added. That attempt's strict Clippy exited 101 and fmt exited 0;
+the later strict result above supersedes only those compile errors.
+RabbitMQ workspace integration remains not run without a broker. Boundless's
+actual-wire T10 schedules and the final combined-tip rerun remain outstanding.

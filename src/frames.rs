@@ -567,7 +567,7 @@ impl Inner {
 #[cfg(test)]
 mod close_ok_tests {
     use super::*;
-    use crate::{ErrorKind, promise::Promise, protocol::connection};
+    use crate::{ErrorKind, Promise, protocol::connection};
 
     #[test]
     fn poisoned_admission_keeps_only_the_connection_close_acknowledgement() {
@@ -577,7 +577,7 @@ mod close_ok_tests {
             if recovery {
                 frames.poison_channel(0, cause.clone());
             } else {
-                frames.lock_inner().poison = Some(cause.clone());
+                frames.error_context().0.lock().unwrap().connection = Some(cause.clone());
             }
             let (ordinary, rejected) = Promise::new("ordinary work");
             frames.push(

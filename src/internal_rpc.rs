@@ -1,5 +1,5 @@
 use crate::{
-    Channel, Error, ErrorKind, Promise, PromiseResolver, Result,
+    Channel, Error, Promise, PromiseResolver, Result,
     channels::Channels,
     connection_closer::ConnectionCloser,
     connection_step::HandshakeResolver,
@@ -423,13 +423,6 @@ impl Drop for QueuedCommand {
             }
             Some(InternalCommand::CreateChannel(_, _, resolver)) => {
                 resolver.retain_remote_close(self.error_context.remote_close(0));
-            }
-            Some(InternalCommand::InitConnectionShutdown(error, Some(resolver))) => {
-                resolver.retain_remote_close(
-                    error
-                        .remote_close_shared()
-                        .or_else(|| self.error_context.remote_close(0)),
-                );
             }
             _ => {}
         }

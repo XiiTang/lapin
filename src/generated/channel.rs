@@ -414,6 +414,16 @@ impl Channel {
         prefetch_count: ShortUInt,
         options: BasicQosOptions,
     ) -> Result<()> {
+        self.basic_qos_completion(prefetch_count, options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn basic_qos_completion(
+        &self,
+        prefetch_count: ShortUInt,
+        options: BasicQosOptions,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.qos"));
         }
@@ -432,7 +442,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_basic_qos_ok(&self, method: protocol::basic::QosOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -472,6 +482,20 @@ impl Channel {
         arguments: FieldTable,
         original: Option<Consumer>,
     ) -> Result<Consumer> {
+        self.do_basic_consume_completion(queue, consumer_tag, options, arguments, original)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    fn do_basic_consume_completion(
+        &self,
+        queue: ShortString,
+        consumer_tag: ShortString,
+        options: BasicConsumeOptions,
+        arguments: FieldTable,
+        original: Option<Consumer>,
+    ) -> Result<crate::Completion<Consumer>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.consume"));
         }
@@ -516,7 +540,7 @@ impl Channel {
         if let Some(nowait_reply) = nowait_reply {
             self.receive_basic_consume_ok(nowait_reply)?;
         }
-        promise.await
+        Ok(promise)
     }
     fn receive_basic_consume_ok(&self, method: protocol::basic::ConsumeOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -566,6 +590,16 @@ impl Channel {
         consumer_tag: ShortString,
         options: BasicCancelOptions,
     ) -> Result<()> {
+        self.basic_cancel_completion(consumer_tag, options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn basic_cancel_completion(
+        &self,
+        consumer_tag: ShortString,
+        options: BasicCancelOptions,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.cancel"));
         }
@@ -593,7 +627,7 @@ impl Channel {
         if let Some(nowait_reply) = nowait_reply {
             self.receive_basic_cancel_ok(nowait_reply)?;
         }
-        promise.await
+        Ok(promise)
     }
     fn receive_basic_cancel(&self, method: protocol::basic::Cancel) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -603,6 +637,15 @@ impl Channel {
     }
     /// Server confirmation that the consumer identified by the consumer tag has been cancelled.
     async fn basic_cancel_ok(&self, consumer_tag: ShortString) -> Result<()> {
+        self.basic_cancel_ok_completion(consumer_tag)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    fn basic_cancel_ok_completion(
+        &self,
+        consumer_tag: ShortString,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.cancel-ok"));
         }
@@ -613,7 +656,7 @@ impl Channel {
         ));
 
         self.send_method_frame(method, Box::new(resolver.clone()), None, Some(resolver));
-        promise.await
+        Ok(promise)
     }
     fn receive_basic_cancel_ok(&self, method: protocol::basic::CancelOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -663,6 +706,20 @@ impl Channel {
         payload: &[u8],
         properties: BasicProperties,
     ) -> Result<PublisherConfirm> {
+        self.basic_publish_completion(exchange, routing_key, options, payload, properties)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn basic_publish_completion(
+        &self,
+        exchange: ShortString,
+        routing_key: ShortString,
+        options: BasicPublishOptions,
+        payload: &[u8],
+        properties: BasicProperties,
+    ) -> Result<crate::Completion<PublisherConfirm>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.publish"));
         }
@@ -688,7 +745,6 @@ impl Channel {
             properties,
             start_hook_res,
         )
-        .await
     }
     fn receive_basic_return(&self, method: protocol::basic::Return) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -714,6 +770,18 @@ impl Channel {
         options: BasicGetOptions,
         original: Option<PromiseResolver<Option<BasicGetMessage>>>,
     ) -> Result<Option<BasicGetMessage>> {
+        self.do_basic_get_completion(queue, options, original)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    fn do_basic_get_completion(
+        &self,
+        queue: ShortString,
+        options: BasicGetOptions,
+        original: Option<PromiseResolver<Option<BasicGetMessage>>>,
+    ) -> Result<crate::Completion<Option<BasicGetMessage>>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.get"));
         }
@@ -733,7 +801,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_basic_get_ok(&self, method: protocol::basic::GetOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -775,6 +843,16 @@ impl Channel {
         delivery_tag: LongLongUInt,
         options: BasicAckOptions,
     ) -> Result<()> {
+        self.basic_ack_completion(delivery_tag, options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn basic_ack_completion(
+        &self,
+        delivery_tag: LongLongUInt,
+        options: BasicAckOptions,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.ack"));
         }
@@ -788,7 +866,7 @@ impl Channel {
 
         self.send_method_frame(method, Box::new(resolver.clone()), None, Some(resolver));
         self.on_basic_ack_sent(multiple, delivery_tag);
-        promise.await
+        Ok(promise)
     }
     fn receive_basic_ack(&self, method: protocol::basic::Ack) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -813,6 +891,16 @@ impl Channel {
         delivery_tag: LongLongUInt,
         options: BasicRejectOptions,
     ) -> Result<()> {
+        self.basic_reject_completion(delivery_tag, options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn basic_reject_completion(
+        &self,
+        delivery_tag: LongLongUInt,
+        options: BasicRejectOptions,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.reject"));
         }
@@ -827,7 +915,7 @@ impl Channel {
         ));
 
         self.send_method_frame(method, Box::new(resolver.clone()), None, Some(resolver));
-        promise.await
+        Ok(promise)
     }
     /// Ask the server to redeliver all unacknowledged messages (fire-and-forget).
     ///
@@ -840,6 +928,15 @@ impl Channel {
     /// Prefer [`Channel::basic_recover`] unless you specifically need
     /// fire-and-forget semantics.
     pub async fn basic_recover_async(&self, options: BasicRecoverAsyncOptions) -> Result<()> {
+        self.basic_recover_async_completion(options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn basic_recover_async_completion(
+        &self,
+        options: BasicRecoverAsyncOptions,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.recover-async"));
         }
@@ -852,7 +949,7 @@ impl Channel {
 
         self.send_method_frame(method, Box::new(resolver.clone()), None, Some(resolver));
         self.on_basic_recover_async_sent();
-        promise.await
+        Ok(promise)
     }
     /// Ask the server to redeliver all unacknowledged messages.
     ///
@@ -862,6 +959,15 @@ impl Channel {
     /// to a different consumer; if `false` they are redelivered to the original
     /// consumer.
     pub async fn basic_recover(&self, options: BasicRecoverOptions) -> Result<()> {
+        self.basic_recover_completion(options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn basic_recover_completion(
+        &self,
+        options: BasicRecoverOptions,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.recover"));
         }
@@ -879,7 +985,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_basic_recover_ok(&self, method: protocol::basic::RecoverOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -919,6 +1025,16 @@ impl Channel {
         delivery_tag: LongLongUInt,
         options: BasicNackOptions,
     ) -> Result<()> {
+        self.basic_nack_completion(delivery_tag, options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn basic_nack_completion(
+        &self,
+        delivery_tag: LongLongUInt,
+        options: BasicNackOptions,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.nack"));
         }
@@ -933,7 +1049,7 @@ impl Channel {
 
         self.send_method_frame(method, Box::new(resolver.clone()), None, Some(resolver));
         self.on_basic_nack_sent(multiple, delivery_tag);
-        promise.await
+        Ok(promise)
     }
     fn receive_basic_nack(&self, method: protocol::basic::Nack) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -963,6 +1079,30 @@ impl Channel {
         connection: Connection,
         auth_provider: Arc<dyn AuthProvider>,
     ) -> Result<()> {
+        self.connection_start_ok_completion(
+            client_properties,
+            mechanism,
+            response,
+            locale,
+            conn_resolver,
+            connection,
+            auth_provider,
+        )?
+        .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    fn connection_start_ok_completion(
+        &self,
+        client_properties: FieldTable,
+        mechanism: ShortString,
+        response: LongString,
+        locale: ShortString,
+        conn_resolver: HandshakeResolver,
+        connection: Connection,
+        auth_provider: Arc<dyn AuthProvider>,
+    ) -> Result<crate::Completion<()>> {
         let (promise, resolver) = Promise::new("connection.start-ok");
         let method = AMQPClass::Connection(protocol::connection::AMQPMethod::StartOk(
             protocol::connection::StartOk {
@@ -986,7 +1126,7 @@ impl Channel {
             )),
             Some(resolver),
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_connection_secure(&self, method: protocol::connection::Secure) -> Result<()> {
         self.assert_channel0(method.get_amqp_class_id(), method.get_amqp_method_id())?;
@@ -1007,6 +1147,19 @@ impl Channel {
         connection: Connection,
         auth_provider: Arc<dyn AuthProvider>,
     ) -> Result<()> {
+        self.connection_secure_ok_completion(response, conn_resolver, connection, auth_provider)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    fn connection_secure_ok_completion(
+        &self,
+        response: LongString,
+        conn_resolver: HandshakeResolver,
+        connection: Connection,
+        auth_provider: Arc<dyn AuthProvider>,
+    ) -> Result<crate::Completion<()>> {
         let (promise, resolver) = Promise::new("connection.secure-ok");
         let method = AMQPClass::Connection(protocol::connection::AMQPMethod::SecureOk(
             protocol::connection::SecureOk { response },
@@ -1025,7 +1178,7 @@ impl Channel {
             )),
             Some(resolver),
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_connection_tune(&self, method: protocol::connection::Tune) -> Result<()> {
         self.assert_channel0(method.get_amqp_class_id(), method.get_amqp_method_id())?;
@@ -1045,6 +1198,18 @@ impl Channel {
         frame_max: LongUInt,
         heartbeat: ShortUInt,
     ) -> Result<()> {
+        self.connection_tune_ok_completion(channel_max, frame_max, heartbeat)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    fn connection_tune_ok_completion(
+        &self,
+        channel_max: ShortUInt,
+        frame_max: LongUInt,
+        heartbeat: ShortUInt,
+    ) -> Result<crate::Completion<()>> {
         let (promise, resolver) = Promise::new("connection.tune-ok");
         let method = AMQPClass::Connection(protocol::connection::AMQPMethod::TuneOk(
             protocol::connection::TuneOk {
@@ -1055,7 +1220,7 @@ impl Channel {
         ));
 
         self.send_method_frame(method, Box::new(resolver.clone()), None, Some(resolver));
-        promise.await
+        Ok(promise)
     }
     /// Client request to open a virtual host, completing the connection handshake.
     pub(crate) async fn connection_open(
@@ -1064,6 +1229,18 @@ impl Channel {
         connection: Box<Connection>,
         conn_resolver: HandshakeResolver,
     ) -> Result<()> {
+        self.connection_open_completion(virtual_host, connection, conn_resolver)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub(crate) fn connection_open_completion(
+        &self,
+        virtual_host: ShortString,
+        connection: Box<Connection>,
+        conn_resolver: HandshakeResolver,
+    ) -> Result<crate::Completion<()>> {
         let (promise, resolver) = Promise::new("connection.open");
         let reply = Reply::ConnectionOpenOk(resolver.clone(), connection, conn_resolver);
         let method = AMQPClass::Connection(protocol::connection::AMQPMethod::Open(
@@ -1076,7 +1253,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_connection_open_ok(&self, method: protocol::connection::OpenOk) -> Result<()> {
         self.assert_channel0(method.get_amqp_class_id(), method.get_amqp_method_id())?;
@@ -1113,6 +1290,19 @@ impl Channel {
         class_id: ShortUInt,
         method_id: ShortUInt,
     ) -> Result<()> {
+        self.connection_close_completion(reply_code, reply_text, class_id, method_id)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub(crate) fn connection_close_completion(
+        &self,
+        reply_code: ShortUInt,
+        reply_text: ShortString,
+        class_id: ShortUInt,
+        method_id: ShortUInt,
+    ) -> Result<crate::Completion<()>> {
         let (promise, resolver) = Promise::new("connection.close");
         let reply = Reply::ConnectionCloseOk(resolver.clone());
         let method = AMQPClass::Connection(protocol::connection::AMQPMethod::Close(
@@ -1130,7 +1320,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_connection_close(&self, method: protocol::connection::Close) -> Result<()> {
         let validation = self.validate_channel0();
@@ -1170,6 +1360,12 @@ impl Channel {
     }
     /// Acknowledgement of a `connection.close` request; the TCP connection may now be closed.
     pub(crate) async fn connection_close_ok(&self) -> Result<()> {
+        self.connection_close_ok_completion()?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub(crate) fn connection_close_ok_completion(&self) -> Result<crate::Completion<()>> {
         self.before_connection_close_ok();
         let (promise, resolver) = Promise::new("connection.close-ok");
         let method = AMQPClass::Connection(protocol::connection::AMQPMethod::CloseOk(
@@ -1177,7 +1373,7 @@ impl Channel {
         ));
 
         self.send_method_frame(method, Box::new(resolver.clone()), None, Some(resolver));
-        promise.await
+        Ok(promise)
     }
     fn receive_connection_close_ok(&self, method: protocol::connection::CloseOk) -> Result<()> {
         self.assert_channel0(method.get_amqp_class_id(), method.get_amqp_method_id())?;
@@ -1223,11 +1419,13 @@ impl Channel {
     ///
     /// [`Connection::update_secret`]: crate::Connection::update_secret
     /// [`auth::TokenAuthProvider`]: crate::auth::TokenAuthProvider
-    pub(crate) async fn connection_update_secret(
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub(crate) fn connection_update_secret_completion(
         &self,
         new_secret: LongString,
         reason: ShortString,
-    ) -> Result<()> {
+    ) -> Result<crate::Completion<()>> {
         let (promise, resolver) = Promise::new("connection.update-secret");
         let reply = Reply::ConnectionUpdateSecretOk(resolver.clone());
         let method = AMQPClass::Connection(protocol::connection::AMQPMethod::UpdateSecret(
@@ -1240,7 +1438,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_connection_update_secret_ok(
         &self,
@@ -1265,6 +1463,15 @@ impl Channel {
     }
     /// Open a new channel on the connection, identified by its channel number.
     pub(crate) async fn channel_open(&self, channel: Channel) -> Result<Channel> {
+        self.channel_open_completion(channel)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub(crate) fn channel_open_completion(
+        &self,
+        channel: Channel,
+    ) -> Result<crate::Completion<Channel>> {
         if !self.status.initializing() {
             return Err(self.status.state_error("channel.open"));
         }
@@ -1281,7 +1488,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_channel_open_ok(&self, method: protocol::channel::OpenOk) -> Result<()> {
         if !self.status.initializing() {
@@ -1315,6 +1522,15 @@ impl Channel {
     /// the publisher side; prefer [`Channel::basic_qos`] for consumer-side
     /// throttling.
     pub async fn channel_flow(&self, options: ChannelFlowOptions) -> Result<Boolean> {
+        self.channel_flow_completion(options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn channel_flow_completion(
+        &self,
+        options: ChannelFlowOptions,
+    ) -> Result<crate::Completion<Boolean>> {
         if !self.status.connected() {
             return Err(self.status.state_error("channel.flow"));
         }
@@ -1332,7 +1548,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_channel_flow(&self, method: protocol::channel::Flow) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -1342,6 +1558,15 @@ impl Channel {
     }
     /// Server confirmation of the current message flow state on the channel.
     async fn channel_flow_ok(&self, options: ChannelFlowOkOptions) -> Result<()> {
+        self.channel_flow_ok_completion(options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    fn channel_flow_ok_completion(
+        &self,
+        options: ChannelFlowOkOptions,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("channel.flow-ok"));
         }
@@ -1353,7 +1578,7 @@ impl Channel {
         ));
 
         self.send_method_frame(method, Box::new(resolver.clone()), None, Some(resolver));
-        promise.await
+        Ok(promise)
     }
     fn receive_channel_flow_ok(&self, method: protocol::channel::FlowOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -1389,6 +1614,19 @@ impl Channel {
         class_id: ShortUInt,
         method_id: ShortUInt,
     ) -> Result<()> {
+        self.do_channel_close_completion(reply_code, reply_text, class_id, method_id)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    fn do_channel_close_completion(
+        &self,
+        reply_code: ShortUInt,
+        reply_text: ShortString,
+        class_id: ShortUInt,
+        method_id: ShortUInt,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("channel.close"));
         }
@@ -1411,7 +1649,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_channel_close(&self, method: protocol::channel::Close) -> Result<()> {
         let validation = if self.status.can_receive_messages() {
@@ -1440,6 +1678,12 @@ impl Channel {
     }
     /// Acknowledgement of a `channel.close` request; the channel is now closed.
     async fn channel_close_ok(&self, error: Option<Error>) -> Result<()> {
+        self.channel_close_ok_completion(error)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    fn channel_close_ok_completion(&self, error: Option<Error>) -> Result<crate::Completion<()>> {
         if !self.status.closing() {
             return Err(self.status.state_error("channel.close-ok"));
         }
@@ -1451,7 +1695,7 @@ impl Channel {
 
         self.send_method_frame(method, Box::new(resolver.clone()), None, Some(resolver));
         self.on_channel_close_ok_sent(error);
-        promise.await
+        Ok(promise)
     }
     fn receive_channel_close_ok(&self, method: protocol::channel::CloseOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -1484,6 +1728,16 @@ impl Channel {
         realm: ShortString,
         options: AccessRequestOptions,
     ) -> Result<()> {
+        self.access_request_completion(realm, options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn access_request_completion(
+        &self,
+        realm: ShortString,
+        options: AccessRequestOptions,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("access.request"));
         }
@@ -1514,7 +1768,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_access_request_ok(&self, method: protocol::access::RequestOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -1553,6 +1807,20 @@ impl Channel {
         arguments: FieldTable,
         exchange_kind: ExchangeKind,
     ) -> Result<()> {
+        self.do_exchange_declare_completion(exchange, kind, options, arguments, exchange_kind)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    fn do_exchange_declare_completion(
+        &self,
+        exchange: ShortString,
+        kind: ShortString,
+        options: ExchangeDeclareOptions,
+        arguments: FieldTable,
+        exchange_kind: ExchangeKind,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("exchange.declare"));
         }
@@ -1596,7 +1864,7 @@ impl Channel {
         if let Some(nowait_reply) = nowait_reply {
             self.receive_exchange_declare_ok(nowait_reply)?;
         }
-        promise.await
+        Ok(promise)
     }
     fn receive_exchange_declare_ok(&self, method: protocol::exchange::DeclareOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -1635,6 +1903,16 @@ impl Channel {
         exchange: ShortString,
         options: ExchangeDeleteOptions,
     ) -> Result<()> {
+        self.exchange_delete_completion(exchange, options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn exchange_delete_completion(
+        &self,
+        exchange: ShortString,
+        options: ExchangeDeleteOptions,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("exchange.delete"));
         }
@@ -1660,7 +1938,7 @@ impl Channel {
         if let Some(nowait_reply) = nowait_reply {
             self.receive_exchange_delete_ok(nowait_reply)?;
         }
-        promise.await
+        Ok(promise)
     }
     fn receive_exchange_delete_ok(&self, method: protocol::exchange::DeleteOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -1700,6 +1978,20 @@ impl Channel {
         options: ExchangeBindOptions,
         arguments: FieldTable,
     ) -> Result<()> {
+        self.exchange_bind_completion(destination, source, routing_key, options, arguments)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn exchange_bind_completion(
+        &self,
+        destination: ShortString,
+        source: ShortString,
+        routing_key: ShortString,
+        options: ExchangeBindOptions,
+        arguments: FieldTable,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("exchange.bind"));
         }
@@ -1734,7 +2026,7 @@ impl Channel {
         if let Some(nowait_reply) = nowait_reply {
             self.receive_exchange_bind_ok(nowait_reply)?;
         }
-        promise.await
+        Ok(promise)
     }
     fn receive_exchange_bind_ok(&self, method: protocol::exchange::BindOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -1783,6 +2075,20 @@ impl Channel {
         options: ExchangeUnbindOptions,
         arguments: FieldTable,
     ) -> Result<()> {
+        self.exchange_unbind_completion(destination, source, routing_key, options, arguments)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn exchange_unbind_completion(
+        &self,
+        destination: ShortString,
+        source: ShortString,
+        routing_key: ShortString,
+        options: ExchangeUnbindOptions,
+        arguments: FieldTable,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("exchange.unbind"));
         }
@@ -1817,7 +2123,7 @@ impl Channel {
         if let Some(nowait_reply) = nowait_reply {
             self.receive_exchange_unbind_ok(nowait_reply)?;
         }
-        promise.await
+        Ok(promise)
     }
     fn receive_exchange_unbind_ok(&self, method: protocol::exchange::UnbindOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -1871,6 +2177,18 @@ impl Channel {
         options: QueueDeclareOptions,
         arguments: FieldTable,
     ) -> Result<Queue> {
+        self.queue_declare_completion(queue, options, arguments)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn queue_declare_completion(
+        &self,
+        queue: ShortString,
+        options: QueueDeclareOptions,
+        arguments: FieldTable,
+    ) -> Result<crate::Completion<Queue>> {
         if !self.status.connected() {
             return Err(self.status.state_error("queue.declare"));
         }
@@ -1910,7 +2228,7 @@ impl Channel {
         if let Some(nowait_reply) = nowait_reply {
             self.receive_queue_declare_ok(nowait_reply)?;
         }
-        promise.await
+        Ok(promise)
     }
     fn receive_queue_declare_ok(&self, method: protocol::queue::DeclareOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -1948,6 +2266,20 @@ impl Channel {
         options: QueueBindOptions,
         arguments: FieldTable,
     ) -> Result<()> {
+        self.queue_bind_completion(queue, exchange, routing_key, options, arguments)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn queue_bind_completion(
+        &self,
+        queue: ShortString,
+        exchange: ShortString,
+        routing_key: ShortString,
+        options: QueueBindOptions,
+        arguments: FieldTable,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("queue.bind"));
         }
@@ -1980,7 +2312,7 @@ impl Channel {
         if let Some(nowait_reply) = nowait_reply {
             self.receive_queue_bind_ok(nowait_reply)?;
         }
-        promise.await
+        Ok(promise)
     }
     fn receive_queue_bind_ok(&self, method: protocol::queue::BindOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -2026,6 +2358,16 @@ impl Channel {
         queue: ShortString,
         options: QueuePurgeOptions,
     ) -> Result<MessageCount> {
+        self.queue_purge_completion(queue, options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn queue_purge_completion(
+        &self,
+        queue: ShortString,
+        options: QueuePurgeOptions,
+    ) -> Result<crate::Completion<MessageCount>> {
         if !self.status.connected() {
             return Err(self.status.state_error("queue.purge"));
         }
@@ -2044,7 +2386,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_queue_purge_ok(&self, method: protocol::queue::PurgeOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -2080,6 +2422,16 @@ impl Channel {
         queue: ShortString,
         options: QueueDeleteOptions,
     ) -> Result<MessageCount> {
+        self.queue_delete_completion(queue, options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn queue_delete_completion(
+        &self,
+        queue: ShortString,
+        options: QueueDeleteOptions,
+    ) -> Result<crate::Completion<MessageCount>> {
         if !self.status.connected() {
             return Err(self.status.state_error("queue.delete"));
         }
@@ -2112,7 +2464,7 @@ impl Channel {
         if let Some(nowait_reply) = nowait_reply {
             self.receive_queue_delete_ok(nowait_reply)?;
         }
-        promise.await
+        Ok(promise)
     }
     fn receive_queue_delete_ok(&self, method: protocol::queue::DeleteOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -2147,6 +2499,19 @@ impl Channel {
         routing_key: ShortString,
         arguments: FieldTable,
     ) -> Result<()> {
+        self.queue_unbind_completion(queue, exchange, routing_key, arguments)?
+            .await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn queue_unbind_completion(
+        &self,
+        queue: ShortString,
+        exchange: ShortString,
+        routing_key: ShortString,
+        arguments: FieldTable,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("queue.unbind"));
         }
@@ -2175,7 +2540,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_queue_unbind_ok(&self, method: protocol::queue::UnbindOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -2218,6 +2583,12 @@ impl Channel {
     /// with [`Channel::tx_rollback`]. Transactions significantly reduce throughput;
     /// prefer publisher confirms ([`Channel::confirm_select`]) when possible.
     pub async fn tx_select(&self) -> Result<()> {
+        self.tx_select_completion()?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn tx_select_completion(&self) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("tx.select"));
         }
@@ -2232,7 +2603,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_tx_select_ok(&self, method: protocol::tx::SelectOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -2265,6 +2636,12 @@ impl Channel {
     /// [`Channel::tx_rollback`] are made permanent. Requires transaction mode to
     /// be enabled first via [`Channel::tx_select`].
     pub async fn tx_commit(&self) -> Result<()> {
+        self.tx_commit_completion()?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn tx_commit_completion(&self) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("tx.commit"));
         }
@@ -2279,7 +2656,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_tx_commit_ok(&self, method: protocol::tx::CommitOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -2312,6 +2689,12 @@ impl Channel {
     /// [`Channel::tx_rollback`]. Requires transaction mode to be enabled first
     /// via [`Channel::tx_select`].
     pub async fn tx_rollback(&self) -> Result<()> {
+        self.tx_rollback_completion()?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn tx_rollback_completion(&self) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("tx.rollback"));
         }
@@ -2328,7 +2711,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_tx_rollback_ok(&self, method: protocol::tx::RollbackOk) -> Result<()> {
         if !self.status.can_receive_messages() {
@@ -2365,6 +2748,15 @@ impl Channel {
     /// mutually exclusive. Use [`Channel::wait_for_confirms`] to drain all
     /// outstanding confirms at once.
     pub async fn confirm_select(&self, options: ConfirmSelectOptions) -> Result<()> {
+        self.confirm_select_completion(options)?.await
+    }
+
+    /// Admit this operation and return its native completion receiver.
+    /// Install a sink before handing the receiver to a bounded waiter.
+    pub fn confirm_select_completion(
+        &self,
+        options: ConfirmSelectOptions,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected_or_recovering() {
             return Err(self.status.state_error("confirm.select"));
         }
@@ -2382,7 +2774,7 @@ impl Channel {
             Some(ExpectedReply(reply, Box::new(resolver))),
             None,
         );
-        promise.await
+        Ok(promise)
     }
     fn receive_confirm_select_ok(&self, method: protocol::confirm::SelectOk) -> Result<()> {
         if !self.status.can_receive_messages() {

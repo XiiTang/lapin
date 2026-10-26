@@ -1,5 +1,5 @@
 use crate::{
-    ConnectionProperties, ConnectionStatus, Error, Event, Result,
+    ConnectionProperties, ConnectionStatus, Error, Event, Promise, Result,
     channel::{Channel, Reply},
     channels::Channels,
     configuration::Configuration,

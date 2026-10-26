@@ -62,6 +62,9 @@ impl fmt::Debug for ReceivedClose {
 /// Observe an actual received Close before shutdown or promise completion.
 pub trait RemoteCloseObserver: Send + Sync + 'static {
     /// Called with the original method after pure validation and before any shutdown effects.
+    /// Runs synchronously on the I/O thread with the ingress guard held. Do not
+    /// wait or reenter native code. Locks acquired here must never be held by a
+    /// caller entering native ingress, including `ConnectionDriver::freeze_ingress`.
     fn received(
         &self,
         close: &RemoteClose,

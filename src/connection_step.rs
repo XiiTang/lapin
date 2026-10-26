@@ -128,11 +128,24 @@ mod tests {
     fn peer_close_owns_handshake_completion_until_its_write_finishes() {
         let (promise, resolver) = HandshakeResolver::new();
         let cause = Arc::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-        let error: Error = ErrorKind::IOError(cause.clone()).into();
+        let context = Box::new(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        let context_address = context.as_ref() as *const std::io::Error;
+        let envelope = Arc::new(crate::error::ReceivedClose::new(
+            crate::RemoteClose::Connection(crate::protocol::connection::Close {
+                reply_code: 599,
+                reply_text: "peer close".into(),
+                class_id: 0,
+                method_id: 0,
+            }),
+            Some(context),
+        ));
+        let error = Error::from(ErrorKind::IOError(cause.clone()))
+            .with_remote_close(Some(envelope.clone()));
         let owner = resolver.downgrade().defer_close(error.clone()).unwrap();
         let late: Error = ErrorKind::AuthProviderError("late failure".into()).into();
         resolver.reject(late.clone());
         assert!(resolver.finish_auth(Err(late.clone())).is_ok());
+        resolver.cancel(late.clone());
         drop(resolver);
         assert!(promise.try_wait().is_none());
         owner.finish_close();
@@ -140,6 +153,18 @@ mod tests {
         assert!(
             matches!(received.kind(), ErrorKind::IOError(received) if Arc::ptr_eq(&cause, received))
         );
+        assert!(Arc::ptr_eq(
+            &received.remote_close_shared().unwrap(),
+            &envelope
+        ));
+        assert!(std::ptr::eq(
+            received
+                .remote_close_context()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap(),
+            context_address,
+        ));
         assert!(owner.finish_auth(Err(late)).is_ok());
         owner.finish_close();
         assert!(promise.try_wait().is_none());
