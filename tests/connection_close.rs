@@ -4,6 +4,7 @@ use amq_protocol::{
     protocol::{AMQPClass, channel, connection, queue},
 };
 use async_rs::Runtime;
+use futures_io::{AsyncRead, AsyncWrite};
 use lapin::{Connection, ConnectionProperties, ErrorKind};
 use std::{future::Future, time::Duration};
 use tokio::{
@@ -36,7 +37,7 @@ async fn read(stream: &mut TcpStream) -> AMQPFrame {
     assert!(rest.is_empty());
     frame
 }
-async fn handshake(listener: TcpListener) -> TcpStream {
+async fn handshake(listener: TcpListener, established: bool) -> TcpStream {
     let (mut stream, _) = listener.accept().await.unwrap();
     let mut header = [0; 8];
     stream.read_exact(&mut header).await.unwrap();
@@ -75,21 +76,23 @@ async fn handshake(listener: TcpListener) -> TcpStream {
         read(&mut stream).await,
         AMQPFrame::Method(0, AMQPClass::Connection(connection::AMQPMethod::Open(_)))
     ));
-    send(
-        &mut stream,
-        0,
-        AMQPClass::Connection(connection::AMQPMethod::OpenOk(connection::OpenOk {})),
-    )
-    .await;
+    if established {
+        send(
+            &mut stream,
+            0,
+            AMQPClass::Connection(connection::AMQPMethod::OpenOk(connection::OpenOk {})),
+        )
+        .await;
+    }
     stream
 }
 
-async fn peer_close(reply_code: u16, recover: bool, pending: bool) {
+async fn peer_close(reply_code: u16, recover: bool, pending: bool, blocked: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (go, gate) = oneshot::channel();
     let peer = tokio::spawn(async move {
-        let mut stream = handshake(listener).await;
+        let mut stream = handshake(listener, true).await;
         if pending {
             assert!(matches!(
                 read(&mut stream).await,
@@ -107,6 +110,16 @@ async fn peer_close(reply_code: u16, recover: bool, pending: bool) {
             ));
         }
         gate.await.unwrap();
+        if blocked {
+            send(
+                &mut stream,
+                0,
+                AMQPClass::Connection(connection::AMQPMethod::Blocked(connection::Blocked {
+                    reason: "resource alarm".into(),
+                })),
+            )
+            .await;
+        }
         send(
             &mut stream,
             0,
@@ -172,15 +185,167 @@ async fn peer_close(reply_code: u16, recover: bool, pending: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_connection_close_is_acknowledged_before_shutdown() {
-    ends(peer_close(200, false, false)).await;
+    ends(peer_close(200, false, false, false)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_connection_error_is_acknowledged_and_rejects_pending_work() {
-    ends(peer_close(320, false, true)).await;
+    ends(peer_close(320, false, true, false)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recoverable_peer_close_is_acknowledged_before_retiring_transport() {
-    ends(peer_close(320, true, false)).await;
+    ends(peer_close(320, true, false, false)).await;
+}
+
+// A failed handshake's caller immediately stops its owned driver. Hold the
+// CloseOk write to prove that rejection cannot race ahead of that write.
+#[derive(Default)]
+struct WriteGate {
+    hold: std::sync::atomic::AtomicBool,
+    entered: std::sync::atomic::AtomicBool,
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+struct GatedStream {
+    stream: smol::net::TcpStream,
+    gate: std::sync::Arc<WriteGate>,
+}
+impl AsyncRead for GatedStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, bytes)
+    }
+}
+impl AsyncWrite for GatedStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let mut waker = self.gate.waker.lock().unwrap();
+        if self.gate.hold.load(std::sync::atomic::Ordering::SeqCst) {
+            *waker = Some(cx.waker().clone());
+            self.gate
+                .entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return std::task::Poll::Pending;
+        }
+        drop(waker);
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, bytes)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_close(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_close(cx)
+    }
+}
+struct Plain;
+impl lapin::auth::AuthProvider for Plain {
+    fn mechanism(&self) -> lapin::types::ShortString {
+        "PLAIN".into()
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handshake_close_is_written_before_its_error_releases_the_owner() {
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        task::Poll,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let gate = Arc::new(WriteGate::default());
+    let peer_gate = gate.clone();
+    let peer = tokio::spawn(async move {
+        let mut stream = handshake(listener, false).await;
+        peer_gate.hold.store(true, Ordering::SeqCst);
+        send(
+            &mut stream,
+            0,
+            AMQPClass::Connection(connection::AMQPMethod::Close(connection::Close {
+                reply_code: 530,
+                reply_text: "vhost refused".into(),
+                class_id: 10,
+                method_id: 40,
+            })),
+        )
+        .await;
+        assert!(matches!(
+            read(&mut stream).await,
+            AMQPFrame::Method(0, AMQPClass::Connection(connection::AMQPMethod::CloseOk(_)))
+        ));
+    });
+    let stream = ends(smol::net::TcpStream::connect(address)).await.unwrap();
+    let (owner, handshake) = Connection::from_stream(
+        format!("amqp://{address}/%2f").parse().unwrap(),
+        Runtime::tokio_current(),
+        GatedStream {
+            stream,
+            gate: gate.clone(),
+        },
+        ConnectionProperties::default().with_auth_provider(Plain),
+    )
+    .unwrap();
+    tokio::pin!(handshake);
+    let mut result = None;
+    ends(std::future::poll_fn(|cx| {
+        if result.is_none()
+            && let Poll::Ready(value) = handshake.as_mut().poll(cx)
+        {
+            result = Some(value);
+        }
+        if gate.entered.load(Ordering::SeqCst) {
+            Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }))
+    .await;
+    // Observe the promise after the I/O thread reached the held write.
+    if result.is_none() {
+        result = std::future::poll_fn(|cx| {
+            Poll::Ready(match handshake.as_mut().poll(cx) {
+                Poll::Ready(value) => Some(value),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+    }
+    let rejected_before_write = result.is_some();
+    gate.hold.store(false, Ordering::SeqCst);
+    if let Some(waker) = gate.waker.lock().unwrap().take() {
+        waker.wake();
+    }
+    let error = match result {
+        Some(result) => result,
+        None => ends(handshake).await,
+    }
+    .unwrap_err();
+    owner.stop();
+    let _ = ends(tokio::task::spawn_blocking(move || owner.join()))
+        .await
+        .unwrap();
+    ends(peer).await.unwrap();
+    assert!(
+        !rejected_before_write,
+        "the handshake's owner could stop I/O before CloseOk"
+    );
+    assert!(
+        matches!(error.kind(), ErrorKind::ProtocolError(error) if error.get_id() == 530 && error.get_message().as_str() == "vhost refused")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_peer_connection_close_is_acknowledged() {
+    ends(peer_close(200, false, false, true)).await;
 }

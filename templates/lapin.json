@@ -89,7 +89,8 @@
     "close-ok": {
       "metadata": {
         "internal": true,
-        "received_hook": true
+        "received_hook": true,
+        "start_hook": true
       }
     },
     "blocked": {

@@ -58,7 +58,8 @@ impl ConnectionStatus {
         self.write().blocked = false;
     }
 
-    /// Returns `true` if the broker has issued a `Connection.Blocked` notice.
+    /// Returns `true` while writes are held by the broker's `Connection.Blocked`.
+    /// A peer's closing handshake releases this hold for its mandatory CloseOk.
     #[must_use]
     pub fn blocked(&self) -> bool {
         self.read().blocked

@@ -23,6 +23,12 @@ pub(crate) struct ExpectedReply(
     pub(crate) Box<dyn Cancelable + Send + Sync>,
 );
 
+impl ExpectedReply {
+    pub(crate) fn cancel(self, error: Error) {
+        Inner::cancel_expected_reply(self, error);
+    }
+}
+
 impl fmt::Debug for ExpectedReply {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("ExpectedReply").field(&self.0).finish()
@@ -80,6 +86,23 @@ impl Frames {
             .map(ConnectionStep::into_connection_resolver);
         // We carry the Connection here to drop the lock() above before dropping the Connection
         resolver.map(|(resolver, _connection)| resolver)
+    }
+
+    // Keep both the authentication-step and Open waiters owned until the
+    // peer's CloseOk is written; rejecting either can release the driver.
+    pub(crate) fn take_connection_shutdown_reply(
+        &self,
+        channel_id: ChannelId,
+    ) -> Option<ExpectedReply> {
+        let mut inner = self.lock_inner();
+        let replies = inner.expected_replies.get_mut(&channel_id)?;
+        let index = replies.iter().position(|reply| {
+            matches!(
+                reply.0,
+                Reply::ConnectionStep(..) | Reply::ConnectionOpenOk(..)
+            )
+        })?;
+        replies.remove(index)
     }
 
     pub(crate) fn clear_connection_steps(&self, error: &Error) {

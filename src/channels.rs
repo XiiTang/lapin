@@ -1,6 +1,6 @@
 use crate::{
     BasicProperties, Channel, ChannelState, Configuration, Connection, ConnectionState,
-    ConnectionStatus, Error, ErrorKind, PromiseResolver, Result,
+    ConnectionStatus, Error, ErrorKind, Result,
     configuration::{NegotiatedConfig, RecoveryConfig},
     connection_closer::ConnectionCloser,
     events::{Events, EventsSender},
@@ -289,15 +289,8 @@ impl Channels {
         Ok(())
     }
 
-    pub(crate) fn init_connection_shutdown(
-        &self,
-        error: Error,
-        connection_resolver: Option<PromiseResolver<Connection>>,
-    ) {
-        self.frames.drop_pending(error.clone(), &self.internal_rpc);
-        if let Some(resolver) = connection_resolver {
-            resolver.reject(error.clone());
-        }
+    pub(crate) fn init_connection_shutdown(&self, error: Error) {
+        self.frames.drop_pending(error, &self.internal_rpc);
     }
 
     pub(crate) fn finish_connection_shutdown(&self) {

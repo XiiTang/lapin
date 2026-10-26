@@ -761,6 +761,12 @@ impl Channel {
         Err(ErrorKind::ProtocolViolation(err).into())
     }
 
+    fn before_connection_close_ok(&self) {
+        // Connection.Blocked holds publications, not the peer's close reply.
+        // Shutdown/recovery has already poisoned ordinary frame admission.
+        self.connection_status.unblock();
+    }
+
     pub(crate) fn on_connection_close_ok_sent(&self, error: Error) {
         self.internal_rpc.finish_connection_shutdown();
         if !self.recovery_config.can_recover(&error) {
@@ -1091,14 +1097,16 @@ impl Channel {
                 info!(channel=%self.id, "Connection closed");
                 ErrorKind::InvalidConnectionState(ConnectionState::Closed).into()
             });
-        if self.recovery_config.can_recover(&error) {
+        let connection_reply = if self.recovery_config.can_recover(&error) {
             self.internal_rpc.init_connection_recovery(error.clone());
+            None
         } else {
-            let connection_resolver = self.frames.connection_resolver(self.id);
-            self.internal_rpc
-                .init_connection_shutdown(error.clone(), connection_resolver);
-        }
-        self.internal_rpc.send_connection_close_ok(error);
+            let reply = self.frames.take_connection_shutdown_reply(self.id);
+            self.internal_rpc.init_connection_shutdown(error.clone());
+            reply
+        };
+        self.internal_rpc
+            .send_connection_close_ok(error, connection_reply);
         Ok(())
     }
 

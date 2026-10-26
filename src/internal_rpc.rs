@@ -1,10 +1,10 @@
 use crate::{
-    Channel, Connection, Error, ErrorKind, Promise, PromiseResolver, Result,
+    Channel, Error, ErrorKind, Promise, PromiseResolver, Result,
     channels::Channels,
     connection_closer::ConnectionCloser,
     consumer_status::ConsumerStatus,
     error_holder::ErrorHolder,
-    frames::Frames,
+    frames::{ExpectedReply, Frames},
     future::InternalFuture,
     heartbeat::Heartbeat,
     killswitch::KillSwitch,
@@ -172,24 +172,24 @@ impl InternalRPCHandle {
         self.send(InternalCommand::InitConnectionRecovery(error));
     }
 
-    pub(crate) fn init_connection_shutdown(
-        &self,
-        error: Error,
-        connection_resolver: Option<PromiseResolver<Connection>>,
-    ) {
+    pub(crate) fn init_connection_shutdown(&self, error: Error) {
         self.set_connection_closing();
-        self.send(InternalCommand::InitConnectionShutdown(
-            error,
-            connection_resolver,
-        ));
+        self.send(InternalCommand::InitConnectionShutdown(error));
     }
 
     pub(crate) fn remove_channel(&self, channel_id: ChannelId, error: Error) {
         self.send(InternalCommand::RemoveChannel(channel_id, error));
     }
 
-    pub(crate) fn send_connection_close_ok(&self, error: Error) {
-        self.send(InternalCommand::SendConnectionCloseOk(error));
+    pub(crate) fn send_connection_close_ok(
+        &self,
+        error: Error,
+        connection_reply: Option<ExpectedReply>,
+    ) {
+        self.send(InternalCommand::SendConnectionCloseOk(
+            error,
+            connection_reply.map(Box::new),
+        ));
     }
 
     pub(crate) fn send_heartbeat(&self) {
@@ -306,9 +306,9 @@ enum InternalCommand {
     DeregisterConsumer(ChannelId, ShortString),
     FinishConnectionShutdown,
     InitConnectionRecovery(Error),
-    InitConnectionShutdown(Error, Option<PromiseResolver<Connection>>),
+    InitConnectionShutdown(Error),
     RemoveChannel(ChannelId, Error),
-    SendConnectionCloseOk(Error),
+    SendConnectionCloseOk(Error, Option<Box<ExpectedReply>>),
     SendHeartbeat,
     SetChannelStatus(ChannelId, KillSwitch),
     SetConnectionClosing,
@@ -514,9 +514,7 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                     self.secret_update.reset();
                     channels.init_connection_recovery(error);
                 }
-                InitConnectionShutdown(error, connection_resolver) => {
-                    channels.init_connection_shutdown(error, connection_resolver)
-                }
+                InitConnectionShutdown(error) => channels.init_connection_shutdown(error),
                 RemoveChannel(channel_id, error) => {
                     if !self.channel_ok(channel_id) {
                         continue;
@@ -524,12 +522,18 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                     let channels = channels.clone();
                     self.register_internal_future(async move { channels.remove(channel_id, error) })
                 }
-                SendConnectionCloseOk(error) => {
+                SendConnectionCloseOk(error, connection_reply) => {
                     let channel = channels.channel0();
                     self.register_internal_future(async move {
                         // Retire only after the frame-write completion. Merely
                         // queueing CloseOk must not stop I/O or discard the frame.
-                        channel.connection_close_ok().await?;
+                        let sent = channel.connection_close_ok().await;
+                        // A failed handshake releases its caller-owned driver.
+                        // Keep its original cause, but not ahead of CloseOk.
+                        if let Some(reply) = connection_reply {
+                            reply.cancel(error.clone());
+                        }
+                        sent?;
                         channel.on_connection_close_ok_sent(error);
                         Ok(())
                     })

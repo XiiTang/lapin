@@ -212,27 +212,48 @@ checkpoint: only Connection.CloseOk on channel zero passes either poison;
 ordinary work keeps the original rejection cause. Bulk content admission stays
 poisoned. No poison is cleared and no retry or recovery policy changes.
 
-The single SendConnectionCloseOk command now waits for the existing frame-write
-promise before calling the retirement hook with its original error. The generated
-method no longer retires at queue admission; templates/lapin.json and regenerated
-src/generated/channel.rs agree. This also prevents non-200 closes from marking
-I/O errored and discarding the acknowledgement before it is written. The command
-is the hook's sole caller. RabbitMQ Java client's AMQConnection.handleConnectionClose
-and AMQChannel.quiescingTransmit were inspected: shutdown rejects application
-work while its close acknowledgement still transmits before final shutdown.
+The single SendConnectionCloseOk command waits for the existing frame-write
+promise before calling the retirement hook with its original error. Its
+before_connection_close_ok hook releases Connection.Blocked's write hold only
+after shutdown/recovery has rejected ordinary queued work; otherwise an alarmed
+peer's close deadlocks behind that hold. The generated method no longer retires
+at queue admission; templates/lapin.json and regenerated src/generated/channel.rs
+agree. This prevents non-200 closes from marking I/O errored before CloseOk is
+written. The command is the retirement hook's sole caller.
+
+Frames::take_connection_shutdown_reply retains the whole authentication-step or
+Open expected reply, including its cancellation resolver, until that same write
+ends. Rejecting a handshake earlier lets its caller stop the owned driver before
+CloseOk. Cancellation then follows the existing ExpectedReply cancellation
+checkpoint with the original error; ordinary RPCs still reject at shutdown.
+The optional retained reply is boxed so the bounded internal command queue does
+not carry a 400-byte enum in every slot (strict Clippy catches that regression).
+No new completion or sending path is introduced. ConnectionStatus::blocked's
+comment documents the closing handshake's release of the hold.
+
+RabbitMQ Java client's AMQConnection.handleConnectionClose and
+AMQChannel.quiescingTransmit were inspected: shutdown rejects application work
+while its acknowledgement still transmits before final shutdown.
 
 Regressions on macOS arm64:
 - `cargo test --no-default-features --features tokio --locked --test connection_close`:
-  the f34c12f implementation reads EOF in all three owned-peer cases (exit 101).
-  The patch passes all three: completed handshake with heartbeat zero, code 200
-  with recovery off; code 320 rejecting a pending queue declaration with its
-  original cause; and code 320 through recovery initialization with zero retry
-  attempts. Each peer decodes Connection.CloseOk and checks it is the last frame.
-- `frames::close_ok_tests` tests the private admission checkpoint for connection
-  and channel-zero poison, original-cause rejection and write completion.
-- `cargo test --lib --features tokio --locked`: 31 passed (exit 0).
-- Tokio-only `connection_close`, `connection_retry`, `supplied_driver`: 14 passed
-  (exit 0), without a running broker.
-- Tokio-only library build and strict Clippy (`--lib --tests -- -D warnings`)
-  pass (exit 0); rustfmt checks the touched Rust files. Broker-dependent tests
-  are not claimed run. This repair adds no API contract or observer mechanism.
+  f34c12f reads EOF in all three initial owned-peer cases (exit 101).
+  The patch covers completed handshake with heartbeat zero, code 200 with
+  recovery off; code 320 rejecting a pending declaration with its original
+  cause; and code 320 through recovery initialization with zero retry attempts.
+- The same target adds a blocked peer and a gated CloseOk write during Open.
+  The gated test fails on the admission/retirement-only repair (exit 101, EOF)
+  when its failed-handshake caller stops the driver; with deferred rejection
+  it decodes CloseOk before returning the original 530 cause. The ordinary
+  cases also check that CloseOk is the last and only close response.
+- `frames::close_ok_tests` checks the private admission checkpoint for both
+  poisons, original Arc cause rejection, and admission versus write completion.
+
+Validation (all exit 0): `cargo test --lib --features tokio --locked` (31 tests);
+Tokio-only `connection_close`, `connection_retry` and `supplied_driver` (5, 3 and
+8 tests); Tokio-only library build and strict Clippy (`--lib --tests -- -D
+warnings`); and rustfmt checks of every touched Rust file. `cargo fmt --check`
+also passed before the final handshake/blocked cases; those added files are
+included in the final per-file check. Broker-dependent tests, including
+tests/connection.rs, are not claimed run.
+This repair changes no Boundless API contract or observer mechanism.
