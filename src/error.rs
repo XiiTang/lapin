@@ -165,6 +165,7 @@ impl Error {
     }
 
     /// The context captured with this exact received method, shared by clones.
+    #[must_use]
     pub fn remote_close_context(&self) -> Option<&(dyn error::Error + Send + Sync + 'static)> {
         self.remote_close
             .as_ref()

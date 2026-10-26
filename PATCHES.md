@@ -911,3 +911,18 @@ is tracked as Boundless #369; this patch does not repair it or weaken either tes
 exited 0 (one passed). `cargo build --features codegen-internal` and generated-file
 formatting exited 0. All compile/test commands ran through build-slot.
 This is WIP evidence; remaining native checks and Boundless integration follow.
+
+Follow-up evidence on the same observer implementation: `cargo test --lib`
+exited 0 (61 passed); `cargo test --features tokio --test supplied_driver`
+exited 0 (11 passed). `cargo test --workspace` exited 101 after the 61 unit
+and conn_refused tests passed: the existing connection integration requires
+RabbitMQ and failed with Connection refused (os error 61). No broker was
+configured for this run. `cargo test --test remote_close_observer` was repeated:
+exit 101, four passed and the same two #369 CloseOk reads failed with
+UnexpectedEof (early eof), at test helper frame-header read. The rejected-channel
+subcase remains unreached after its accepted control fails. No tests are ignored.
+Strict `cargo clippy --lib --tests --locked -- -D warnings` first exited 101
+for the new accessor's missing must_use; after adding it, exit 0. Final
+`cargo fmt --all --check` exited 0 after formatting the new fixtures. Commands
+ran through build-slot on macOS arm64. Code was first committed as 52245298;
+this follow-up changes only formatting, must_use and this evidence.
