@@ -201,3 +201,38 @@ fills both real queues and checks their exact count failures. Boundless's
 `oversized_content_is_rejected_before_body_allocation` checks the body's own limit;
 `an_oversized_peer_frame_is_an_invalid_response_before_its_body_arrives` sends only
 an over-limit frame header and checks the program-visible peer failure.
+
+## Acknowledge a peer's Connection.Close before retiring the transport (#369)
+
+Shutdown drops pending frames and poisons the queue; recovery poisons channel
+zero too. Both then submitted Connection.CloseOk through the poisoned queue,
+so the peer read EOF. Reordering submission alone would still let shutdown drop
+the queued acknowledgement. `Frames::Inner::push` is the private admission
+checkpoint: only Connection.CloseOk on channel zero passes either poison;
+ordinary work keeps the original rejection cause. Bulk content admission stays
+poisoned. No poison is cleared and no retry or recovery policy changes.
+
+The single SendConnectionCloseOk command now waits for the existing frame-write
+promise before calling the retirement hook with its original error. The generated
+method no longer retires at queue admission; templates/lapin.json and regenerated
+src/generated/channel.rs agree. This also prevents non-200 closes from marking
+I/O errored and discarding the acknowledgement before it is written. The command
+is the hook's sole caller. RabbitMQ Java client's AMQConnection.handleConnectionClose
+and AMQChannel.quiescingTransmit were inspected: shutdown rejects application
+work while its close acknowledgement still transmits before final shutdown.
+
+Regressions on macOS arm64:
+- `cargo test --no-default-features --features tokio --locked --test connection_close`:
+  the f34c12f implementation reads EOF in all three owned-peer cases (exit 101).
+  The patch passes all three: completed handshake with heartbeat zero, code 200
+  with recovery off; code 320 rejecting a pending queue declaration with its
+  original cause; and code 320 through recovery initialization with zero retry
+  attempts. Each peer decodes Connection.CloseOk and checks it is the last frame.
+- `frames::close_ok_tests` tests the private admission checkpoint for connection
+  and channel-zero poison, original-cause rejection and write completion.
+- `cargo test --lib --features tokio --locked`: 31 passed (exit 0).
+- Tokio-only `connection_close`, `connection_retry`, `supplied_driver`: 14 passed
+  (exit 0), without a running broker.
+- Tokio-only library build and strict Clippy (`--lib --tests -- -D warnings`)
+  pass (exit 0); rustfmt checks the touched Rust files. Broker-dependent tests
+  are not claimed run. This repair adds no API contract or observer mechanism.

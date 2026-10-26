@@ -313,7 +313,19 @@ impl Inner {
         resolver: Option<PromiseResolver<()>>,
     ) {
         let sending = FrameSending::new(Some(canceler), resolver);
-        if let Some(error) = self.check_poison(channel_id) {
+        // Shutdown/recovery rejects ordinary work, but the peer's mandatory
+        // close acknowledgement still has to reach the wire on channel zero.
+        let close_ok = matches!(
+            (channel_id, &frame),
+            (
+                0,
+                AMQPFrame::Method(
+                    0,
+                    AMQPClass::Connection(crate::protocol::connection::AMQPMethod::CloseOk(_))
+                )
+            )
+        );
+        if let Some(error) = self.check_poison(channel_id).filter(|_| !close_ok) {
             trace!(channel=%channel_id, "Discarding frame because of poisoning");
             if let Some(reply) = expected_reply {
                 Self::cancel_expected_reply(reply, error.clone());
@@ -494,6 +506,65 @@ impl Inner {
         match reply {
             Reply::BasicCancelOk(resolver) => resolver.resolve(()),
             _ => cancel.cancel(error.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod close_ok_tests {
+    use super::*;
+    use crate::{ErrorKind, promise::Promise, protocol::connection};
+
+    #[test]
+    fn poisoned_admission_keeps_only_the_connection_close_acknowledgement() {
+        for recovery in [false, true] {
+            let cause: Error = std::io::Error::other("first close cause").into();
+            let frames = Frames::default();
+            if recovery {
+                frames.poison_channel(0, cause.clone());
+            } else {
+                frames.lock_inner().poison = Some(cause.clone());
+            }
+            let (ordinary, rejected) = Promise::new("ordinary work");
+            frames.push(
+                0,
+                AMQPFrame::Heartbeat,
+                Box::new(rejected.clone()),
+                None,
+                Some(rejected),
+            );
+            let error = ordinary.try_wait().unwrap().unwrap_err();
+            let (ErrorKind::IOError(expected), ErrorKind::IOError(actual)) =
+                (cause.kind(), error.kind())
+            else {
+                panic!("ordinary work keeps its original cause")
+            };
+            assert!(Arc::ptr_eq(expected, actual));
+            assert!(frames.pop(true).is_none());
+
+            let (written, resolver) = Promise::new("connection.close-ok");
+            frames.push(
+                0,
+                AMQPFrame::Method(
+                    0,
+                    AMQPClass::Connection(connection::AMQPMethod::CloseOk(connection::CloseOk {})),
+                ),
+                Box::new(resolver.clone()),
+                None,
+                Some(resolver),
+            );
+            assert!(
+                written.try_wait().is_none(),
+                "admission is not write completion"
+            );
+            let frame = frames.pop(true).expect("CloseOk admitted after poison");
+            assert!(matches!(
+                frame.frame,
+                AMQPFrame::Method(0, AMQPClass::Connection(connection::AMQPMethod::CloseOk(_)))
+            ));
+            frame.sending.resolve();
+            written.try_wait().unwrap().unwrap();
+            assert!(frames.pop(true).is_none());
         }
     }
 }

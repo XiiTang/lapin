@@ -527,7 +527,11 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                 SendConnectionCloseOk(error) => {
                     let channel = channels.channel0();
                     self.register_internal_future(async move {
-                        channel.connection_close_ok(error).await
+                        // Retire only after the frame-write completion. Merely
+                        // queueing CloseOk must not stop I/O or discard the frame.
+                        channel.connection_close_ok().await?;
+                        channel.on_connection_close_ok_sent(error);
+                        Ok(())
                     })
                 }
                 SendHeartbeat => {

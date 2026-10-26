@@ -1149,14 +1149,13 @@ impl Channel {
         self.on_connection_close_received(method)
     }
     /// Acknowledgement of a `connection.close` request; the TCP connection may now be closed.
-    pub(crate) async fn connection_close_ok(&self, error: Error) -> Result<()> {
+    pub(crate) async fn connection_close_ok(&self) -> Result<()> {
         let (promise, resolver) = Promise::new("connection.close-ok");
         let method = AMQPClass::Connection(protocol::connection::AMQPMethod::CloseOk(
             protocol::connection::CloseOk {},
         ));
 
         self.send_method_frame(method, Box::new(resolver.clone()), None, Some(resolver));
-        self.on_connection_close_ok_sent(error);
         promise.await
     }
     fn receive_connection_close_ok(&self, method: protocol::connection::CloseOk) -> Result<()> {

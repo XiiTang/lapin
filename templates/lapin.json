@@ -89,16 +89,7 @@
     "close-ok": {
       "metadata": {
         "internal": true,
-        "received_hook": true,
-        "extra_args": [
-          {
-            "name": "error",
-            "type": "Error"
-          }
-        ],
-        "end_hook": {
-          "params": ["error"]
-        }
+        "received_hook": true
       }
     },
     "blocked": {

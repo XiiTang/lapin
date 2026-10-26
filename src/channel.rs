@@ -761,7 +761,7 @@ impl Channel {
         Err(ErrorKind::ProtocolViolation(err).into())
     }
 
-    fn on_connection_close_ok_sent(&self, error: Error) {
+    pub(crate) fn on_connection_close_ok_sent(&self, error: Error) {
         self.internal_rpc.finish_connection_shutdown();
         if !self.recovery_config.can_recover(&error) {
             if let ErrorKind::ProtocolError(_) = error.kind() {
