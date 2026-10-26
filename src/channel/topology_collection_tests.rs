@@ -504,3 +504,81 @@ fn upstream_recovery_restores_the_existing_consumer_and_tag() {
     }
     assert!(channel.frames.pop(true).is_none());
 }
+
+#[test]
+fn assert_channel0_dispatches_one_unchanged_protocol_rejection() {
+    let (channel, _rpc) = channel(ConnectionProperties::default());
+    let error = channel.assert_channel0(70, 20).unwrap_err();
+    let ErrorKind::ProtocolViolation(native) = error.kind() else {
+        panic!("protocol violation: {error:?}")
+    };
+    assert_eq!(native.get_id(), 503);
+    assert_eq!(
+        native.get_message().as_str(),
+        "connection frame received on channel 1"
+    );
+    assert_eq!(&*channel.close_dispatch.lock().unwrap(), &[(70, 20)]);
+}
+
+#[test]
+fn a_rejected_connection_close_is_observed_before_its_close_dispatch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Observer {
+        dispatch: Arc<std::sync::Mutex<Vec<(Identifier, Identifier)>>>,
+        calls: AtomicUsize,
+    }
+    impl crate::RemoteCloseObserver for Observer {
+        fn received(
+            &self,
+            close: &RemoteClose,
+            accepted: bool,
+        ) -> Option<Box<dyn std::error::Error + Send + Sync>> {
+            assert!(!accepted);
+            assert!(self.dispatch.lock().unwrap().is_empty());
+            let RemoteClose::Connection(close) = close else {
+                panic!("physical observer")
+            };
+            assert_eq!(close.reply_code, 200);
+            assert_eq!((close.class_id, close.method_id), (0, 0));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Some(Box::new(std::io::Error::other("received connection close")))
+        }
+    }
+    struct ChildObserver(AtomicUsize);
+    impl crate::RemoteCloseObserver for ChildObserver {
+        fn received(
+            &self,
+            _: &RemoteClose,
+            _: bool,
+        ) -> Option<Box<dyn std::error::Error + Send + Sync>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    }
+    let (mut channel, _rpc) = channel(ConnectionProperties::default());
+    let observer = Arc::new(Observer {
+        dispatch: channel.close_dispatch.clone(),
+        calls: AtomicUsize::new(0),
+    });
+    let child_observer = Arc::new(ChildObserver(AtomicUsize::new(0)));
+    channel.connection_close_observer = Some(observer.clone());
+    channel.remote_close_observer = Some(child_observer.clone());
+    let error = channel
+        .receive_method(AMQPClass::Connection(
+            protocol::connection::AMQPMethod::Close(protocol::connection::Close {
+                reply_code: 200,
+                reply_text: "stop".into(),
+                class_id: 0,
+                method_id: 0,
+            }),
+        ))
+        .unwrap_err();
+    assert!(matches!(error.kind(), ErrorKind::ProtocolViolation(_)));
+    assert_eq!(
+        error.remote_close_context().unwrap().to_string(),
+        "received connection close"
+    );
+    assert_eq!(observer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(child_observer.0.load(Ordering::SeqCst), 0);
+    assert_eq!(&*channel.close_dispatch.lock().unwrap(), &[(10, 50)]);
+}

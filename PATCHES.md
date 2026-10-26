@@ -935,3 +935,25 @@ passed gate. The observer's two Connection.CloseOk tests remain unchanged and
 blocked by #369; the four other observer tests, 61 library tests, 11 supplied
 driver tests, seven doctests, strict Clippy and formatting retain their recorded
 results. No shutdown/frame-poison repair is included.
+
+Additional W5d rejection controls (macOS arm64, based on f0d2cde5): a test-only,
+nonblocking close-dispatch probe sits immediately before close_connection in
+reject_connection_frame. The private probe records class/method ids; no native
+shutdown order or production observer API changes. The wrapper control checks
+one unchanged ProtocolViolation/503 with its original text and ids 70/20.
+The received nonzero Connection.Close control installs distinct connection and
+child observers, checks accepted=false and no dispatch inside the callback,
+then checks retained context and exactly one dispatch with ids 10/50. The child
+observer is never selected. These controls need no broker or Connection.CloseOk.
+`build-slot cargo test --lib --locked channel::topology_collection_tests::`
+exited 0 (eight passed). New unnecessary qualifications were then removed;
+`build-slot cargo clippy --lib --tests --locked -- -D warnings` exited 0, and
+`build-slot cargo fmt --all` exited 0.
+`build-slot cargo test --lib --test remote_close_observer --test supplied_driver --features tokio --locked --no-fail-fast`
+exited 101: all 63 unit tests and 11 supplied-driver tests passed; four observer
+tests passed and the same two Connection.CloseOk tests failed at the required
+frame header read with UnexpectedEof (early eof), then JoinError::Panic. Their
+assertions remain unchanged. The accepted control still prevents that existing
+integration test reaching its nonzero rejected subcase; the new independent
+native unit control covers rejection before effects. #369 remains unmodified.
+RabbitMQ workspace integration remains NOT RUN without a broker.

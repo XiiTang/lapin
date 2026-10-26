@@ -56,6 +56,8 @@ use tracing::{error, info, trace};
 /// tasks — or from different OS threads — concurrently.
 #[derive(Clone)]
 pub struct Channel {
+    #[cfg(test)]
+    close_dispatch: Arc<std::sync::Mutex<Vec<(Identifier, Identifier)>>>,
     connection_close_observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
     remote_close_observer: Option<Arc<dyn crate::RemoteCloseObserver>>,
     id: ChannelId,
@@ -127,6 +129,8 @@ impl Channel {
             )))
         };
         Self {
+            #[cfg(test)]
+            close_dispatch: Arc::default(),
             connection_close_observer,
             remote_close_observer,
             id: channel_id,
@@ -264,6 +268,8 @@ impl Channel {
     }
     fn reject_connection_frame(&self, error: &Error, class_id: Identifier, method_id: Identifier) {
         error!(channel=%self.id, "Got a connection frame on, closing connection");
+        #[cfg(test)]
+        self.close_dispatch.lock().unwrap().push((class_id, method_id));
         let _ = self.reject_frame_error(0, error.clone(), class_id, method_id);
     }
 
