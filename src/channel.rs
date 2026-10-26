@@ -1097,14 +1097,12 @@ impl Channel {
                 info!(channel=%self.id, "Connection closed");
                 ErrorKind::InvalidConnectionState(ConnectionState::Closed).into()
             });
-        let handshake = if self.recovery_config.can_recover(&error) {
+        let handshake = self.connection_status.defer_handshake_close(error.clone());
+        if self.recovery_config.can_recover(&error) {
             self.internal_rpc.init_connection_recovery(error.clone());
-            None
         } else {
-            let reply = self.connection_status.defer_handshake_close(error.clone());
             self.internal_rpc.init_connection_shutdown(error.clone());
-            reply
-        };
+        }
         self.internal_rpc.send_connection_close_ok(error, handshake);
         Ok(())
     }

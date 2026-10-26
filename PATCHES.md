@@ -225,8 +225,9 @@ HandshakeResolver is the private completion owner from ProtocolHeader through
 OpenOk, including auth_starter_async, continue_auth_async and finish_auth_async.
 ConnectionStatus holds only a weak handle, so it neither keeps an abandoned
 handshake alive nor cycles through a completed Connection. On peer Close this
-owner reserves the original cause before shutdown rejects ordinary work. Queued
-reply cancellation, AuthenticationGuard completion and cancellation all pass
+owner reserves the original cause before choosing shutdown or recovery and
+before either rejects ordinary work. Queued reply cancellation,
+AuthenticationGuard completion and cancellation all pass
 through it; auth errors cannot send a competing retirement command while CloseOk
 is pending. The same SendConnectionCloseOk command releases the owner after the
 write attempt ends. No queued-reply retention path remains. Ordinary RPCs still
