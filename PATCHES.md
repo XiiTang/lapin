@@ -1184,3 +1184,52 @@ Documentation verification: Darwin arm64, `git diff --check` exit0; native sourc
 diff against the reviewed combined revision is empty (exit0). No native regression
 rerun is claimed for this documentation-only change. Existing combined-regression
 commands/results above remain evidence on their explicitly named source revisions.
+
+
+## W4d: independently owned Publish receipts at admission (2026-10-28)
+
+Source revision: d5c08eb7ba0d148159077cdf8b3c2d722dff8a59, descendant of
+b58f943db3c0ed121b8eae7b269c60a34a86be9d. Platform: Darwin arm64, rustc 1.97.0.
+The following documentation commit changes no native source.
+
+`basic_publish_split_completion` transfers the frame-write and individual broker
+confirmation receivers together. It extracts `PublisherConfirm::into_completion`
+before invoking the original generation-checked body-frame admission. A failed
+write therefore cannot drop its captured PublisherConfirm into the legacy
+aggregate drain. The private write helper preserves frame construction, generation
+admission and enqueue order. The legacy public entry still maps successful writes
+to its original PublisherConfirm; confirms-disabled stays NotRequested. The new
+entry is generated from the publish metadata/template. No verdict, retry, recovery,
+limit, Close observer or allocation-account policy changed.
+
+All compile/test commands below ran through build-slot with the checkout's own
+target and local fork resolution; incremental compilation stayed enabled.
+
+- `cargo build --no-default-features --features tokio,smol,codegen-internal --locked`:
+  exit 0, generated the API. A second generation into a fresh output directory,
+  followed by rustfmt and byte comparison with src/generated/channel.rs, exited 0.
+- `cargo test --no-default-features --features tokio,smol --locked --lib --
+  channel::completion_tests:: promise::tests:: internal_rpc::tests:: task_scope::tests::`:
+  final exit 0, 30 passed. New tests drive actual frame write completion independently
+  of Ack/Nack, with/without returned-message reservations, both result orders,
+  failed writes, confirms disabled and legacy drain. Generation refusal queues
+  no publication and its real RPC error owner settles the registered confirm.
+  Existing resolver-abandonment, reserved rejection and completed-result controls
+  retain their assertions.
+- `cargo test --no-default-features --features tokio,smol --locked
+  --test connection_close --test remote_close_observer --test supplied_driver
+  --no-fail-fast`: exit 0; 16 + 6 + 11 = 33 passed.
+- `cargo clippy --no-default-features --features tokio,smol --locked --lib --tests
+  -- -D warnings`: exit 0.
+- `cargo fmt --all` and `cargo fmt --all --check`: exit 0 each.
+- `git diff --check`: exit 0. No broker-dependent integration run is claimed.
+
+Historical first targeted run exited 101: the new fixture assumed three frames
+while unnegotiated frame_max split each payload byte; its generation-refusal
+fixture also omitted the negotiated channel maximum. The narrowed second run
+exited 101 only for that missing channel maximum. The fixture now drives and
+checks actual write/confirm results without assuming a frame count, and sets
+the negotiated maximum before constructing the native channels. The final run
+above covers both corrections. Initial generation launches before this source
+compiled were stopped in the slot wrapper (exit 143): one had an incorrect PATH,
+and the corrected launch waited behind a lane. Neither ran Cargo.
