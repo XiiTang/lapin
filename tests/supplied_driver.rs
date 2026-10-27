@@ -265,6 +265,7 @@ struct StartStream {
     header_sent: bool,
     read_waker: Option<std::task::Waker>,
     eof_after_start: bool,
+    close_observed: Option<Arc<AtomicBool>>,
 }
 impl StartStream {
     fn new() -> Self {
@@ -287,6 +288,7 @@ impl StartStream {
             header_sent: false,
             read_waker: None,
             eof_after_start: false,
+            close_observed: None,
         }
     }
 }
@@ -301,7 +303,12 @@ impl AsyncRead for StartStream {
             return Poll::Pending;
         }
         if self.bytes.position() == self.bytes.get_ref().len() as u64 {
-            return if self.eof_after_start {
+            return if self.eof_after_start
+                && self
+                    .close_observed
+                    .as_ref()
+                    .is_none_or(|seen| seen.load(Ordering::Acquire))
+            {
                 Poll::Ready(Ok(0))
             } else {
                 Poll::Pending
@@ -450,6 +457,21 @@ async fn close_during_async_authentication_retains_peer_facts() {
         frame::{AMQPFrame, gen_frame},
         protocol::{AMQPClass, channel, connection},
     };
+    struct CloseSeen(Arc<AtomicBool>);
+    impl lapin::RemoteCloseObserver for CloseSeen {
+        fn received(
+            &self,
+            close: &lapin::RemoteClose,
+            accepted: bool,
+        ) -> Option<Box<dyn std::error::Error + Send + Sync>> {
+            if accepted
+                && matches!(close, lapin::RemoteClose::Connection(close) if close.reply_code == 403)
+            {
+                self.0.store(true, Ordering::Release);
+            }
+            None
+        }
+    }
     for eof_after_start in [false, true] {
         for route in 0..3 {
             let close = connection::Close {
@@ -480,6 +502,19 @@ async fn close_during_async_authentication_retains_peer_facts() {
             };
             let mut stream = StartStream::new();
             stream.eof_after_start = eof_after_start;
+            let observed = Arc::new(AtomicBool::new(false));
+            // This arm claims a received peer Close, then EOF during auth.
+            // Do not let an eager EOF overtake parsing the supplied Close bytes.
+            if route == 0 {
+                stream.close_observed = Some(observed.clone());
+            }
+            let mut properties = ConnectionProperties::default().with_auth_provider(PendingAuth {
+                entered: Arc::new(AtomicBool::new(false)),
+                dropped: Arc::new(AtomicBool::new(false)),
+            });
+            if route == 0 {
+                properties = properties.with_remote_close_observer(Arc::new(CloseSeen(observed)));
+            }
             let frame = AMQPFrame::Method(id, method);
             stream
                 .bytes
@@ -489,10 +524,7 @@ async fn close_during_async_authentication_retains_peer_facts() {
                 "amqp://invalid.invalid/%2f".parse().unwrap(),
                 Runtime::tokio_current(),
                 stream,
-                ConnectionProperties::default().with_auth_provider(PendingAuth {
-                    entered: Arc::new(AtomicBool::new(false)),
-                    dropped: Arc::new(AtomicBool::new(false)),
-                }),
+                properties,
             )
             .unwrap();
             let result = tokio::time::timeout(Duration::from_secs(10), handshake).await;
@@ -502,8 +534,16 @@ async fn close_during_async_authentication_retains_peer_facts() {
                 .unwrap()
                 .unwrap_err();
             let handshake = result.unwrap().unwrap_err();
-            assert!(matches!(handshake.kind(), lapin::ErrorKind::IOError(cause)
-                if cause.kind() == io::ErrorKind::ConnectionAborted));
+            if route == 0 {
+                assert!(
+                    matches!(handshake.kind(), lapin::ErrorKind::ProtocolError(error)
+                    if error.get_id() == 403),
+                    "route={route}, eof={eof_after_start}, handshake={handshake:?}, driver={driver:?}"
+                );
+            } else {
+                assert!(matches!(handshake.kind(), lapin::ErrorKind::IOError(cause)
+                    if cause.kind() == io::ErrorKind::ConnectionAborted));
+            }
             if route == 0 {
                 assert!(matches!(driver.kind(), lapin::ErrorKind::IOError(cause)
                     if cause.kind() == io::ErrorKind::ConnectionAborted));

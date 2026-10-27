@@ -18,6 +18,7 @@ struct Fixture {
     channels: Channels,
     rpc: InternalRPCHandle,
     events: Events,
+    frames: Frames,
 }
 
 impl Fixture {
@@ -47,7 +48,7 @@ impl Fixture {
             status.clone(),
             socket.handle(),
             handle.clone(),
-            frames,
+            frames.clone(),
             events.clone(),
         );
         channels.channel0().set_state(ChannelState::Connected);
@@ -59,6 +60,7 @@ impl Fixture {
             channels,
             rpc: handle,
             events,
+            frames,
         }
     }
 
@@ -69,6 +71,28 @@ impl Fixture {
             .unwrap();
         channel.set_state(ChannelState::Connected);
         channel
+    }
+
+    async fn acknowledge_connection_close(&self) {
+        // These transportless fixtures own the physical write completion.
+        // Shutdown first removes ordinary queued work and admits only CloseOk.
+        while self.frames.poison().is_none() {
+            tokio::task::yield_now().await;
+        }
+        let frame = loop {
+            if let Some(frame) = self.frames.pop(true) {
+                break frame;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(matches!(
+            &*frame,
+            AMQPFrame::Method(0, AMQPClass::Connection(connection::AMQPMethod::CloseOk(_)))
+        ));
+        frame.into_serialized_frame(1).1.resolve();
+        while !self.connection.status().closed() && !self.connection.status().errored() {
+            tokio::task::yield_now().await;
+        }
     }
 
     async fn stop(&self) {
@@ -160,6 +184,7 @@ async fn remote_connection_close_reaches_channels_and_pending_completions() {
                     AMQPClass::Connection(connection::AMQPMethod::Close(close)),
                 ))
                 .unwrap();
+            fixture.acknowledge_connection_close().await;
             let error = queue.await.unwrap_err();
             check(&error, &expected);
             assert_eq!(error.is_amqp_error(), matches!(reply_code, 320 | 406));
@@ -180,14 +205,13 @@ async fn remote_connection_close_reaches_channels_and_pending_completions() {
                 &fixture.connection.create_channel_completion().unwrap_err(),
                 &expected,
             );
-            // This fixture has no transport. The existing shutdown poison also
-            // rejects the Close-Ok write; its RPC task reports that same error,
-            // including for successful/unrecognized reply codes.
-            assert!(fixture.connection.status().errored());
-            assert!(!fixture.connection.status().closed());
+            let failed = matches!(reply_code, 320 | 406);
+            assert_eq!(fixture.connection.status().errored(), failed);
+            assert_eq!(fixture.connection.status().closed(), !failed);
             let mut cx = Context::from_waker(Waker::noop());
             match events.as_mut().poll_next(&mut cx) {
-                Poll::Ready(Some(Event::Error(error))) => check(&error, &expected),
+                Poll::Ready(Some(Event::Error(error))) if failed => check(&error, &expected),
+                Poll::Pending if !failed => {}
                 other => panic!("Close changed connection event emission: {other:?}"),
             }
             fixture.stop().await;
@@ -321,6 +345,7 @@ async fn remote_close_completes_an_abandoned_handshake_with_its_peer_facts() {
                     AMQPClass::Connection(connection::AMQPMethod::Close(close)),
                 ))
                 .unwrap();
+            fixture.acknowledge_connection_close().await;
             let error = receive.await.unwrap().unwrap_err();
             check(&error, &expected);
             assert_eq!(error.is_amqp_error(), reply_code == 403);

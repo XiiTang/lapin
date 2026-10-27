@@ -1035,3 +1035,47 @@ visibility was added. That attempt's strict Clippy exited 101 and fmt exited 0;
 the later strict result above supersedes only those compile errors.
 RabbitMQ workspace integration remains not run without a broker. Boundless's
 actual-wire T10 schedules and the final combined-tip rerun remain outstanding.
+
+
+### READY-page fixture reconciliation and final combined WIP gate
+
+Source base: `50e32cfd1d0fbdec4fad0049308dece77b3aa22f`, descendant of
+`9663115`; the two fixture changes are committed with this evidence. Platform:
+macOS arm64, Rust 1.97.0, `CARGO_INCREMENTAL=0`. No production path or runtime
+policy changes in this fixture follow-up.
+
+Transportless unit fixtures now complete their own admitted channel-zero CloseOk
+write using the existing Frames/FrameSending completion route. Normal200/599
+ends are Closed without an Error event; error320/406 retain their original
+Error event and facts. The async-auth fixture expects the #369 reserved original
+peer403 for accepted Connection.Close. Its EOF arm waits for the synchronous
+receive observer before exposing EOF, so it actually tests Close then EOF.
+Rejected routes retain their native ConnectionAborted expectations. No observer
+gate waits in production, and no Boundless test-wait dependency was added.
+
+- `build-slot cargo test --lib --test supplied_driver --features tokio --locked --no-fail-fast -- remote_connection_close_reaches_channels_and_pending_completions remote_close_completes_an_abandoned_handshake_with_its_peer_facts close_during_async_authentication_retains_peer_facts`:
+  exit 0, two unit tests and one supplied-driver test passed.
+- `build-slot cargo clippy --lib --tests --locked -- -D warnings`: exit 0.
+- `build-slot cargo fmt --all`: exit 0; `build-slot cargo fmt --all --check`:
+  exit 0.
+- `build-slot cargo test --lib --test connection_close --test remote_close_observer --test supplied_driver --features tokio --locked --no-fail-fast`:
+  exit 101. Library 65 passed; connection_close eight passed; observer five
+  passed/one failed; supplied_driver eleven passed. Zero ignored. The #369
+  `frames::close_ok_tests` test and all actual accepted CloseOk schedules ran.
+  The sole failure is `connection_close_context_precedes_rejection_effects`,
+  rejected=true: reading local Connection.Close503 fails with
+  `Custom { kind: UnexpectedEof, error: "early eof" }` at
+  tests/remote_close_observer.rs:97, followed by JoinError::Panic at :441.
+  Accepted CloseOk and all retained method/context assertions pass. The required
+  rejected-wire assertion remains unchanged; no EOF substitute or native
+  rejection repair is included. This remains an incomplete gate.
+
+Earlier fixture attempts are historical failures: the first completion adapter
+accessed private FrameEntry fields (compile exit101); its corrected public
+Deref/completion adapter passed both units. Before the EOF receive witness, the
+authentication arm intermittently returned ConnectionAborted; the diagnostic
+rerun passed but did not settle the ordering. The deterministic observer witness
+above supersedes that fixture schedule. The first combined-run coordinator had
+a Python NameError and exited1 before invoking Cargo; the corrected command
+produced the combined result above. RabbitMQ workspace integration remains
+NOT RUN without a broker.
