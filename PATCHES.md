@@ -299,9 +299,13 @@ Channels::set_connection_error, so neither can publish ConnectionAborted first.
 The private RPC actor no longer owns a separate rejection flag. An already queued
 SetConnectionClosed, local close, peer Close, error or explicit stop can abandon
 the attempt only with the original verdict. Explicit stop abandons immediately.
-Public RPC-queue callers also pass through InternalRPCHandle::await_reply: lost
-resolvers and an RPC scope that has finished retiring resolve against the same
-reserved verdict. Already-ready replies propagate before cancellation.
+Historical, superseded consumer checkpoint: public RPC-queue callers passed
+through InternalRPCHandle::await_reply to resolve lost resolvers and retired
+replies. On the current reviewed combined revision 71564e829bb74666d49e7bf4d7391f9ff9606c07,
+Promise State::complete owns that decision before any receiver, sink or map
+consumes it; await_reply is test-only. Historical commands/results in this #378
+section are retained as evidence of the earlier implementation, not the current
+checkpoint. Already-completed replies keep their value.
 Closing admission changes channel state without canceling a partial basic.get.
 Normal input is discarded while rejecting; a later Close cannot run native
 teardown against the retained verdict. Reads remain active to observe EOF.
@@ -441,9 +445,10 @@ Source inventory and instances:
   They are not instances of this RPC-command cancellation class. Fire-and-forget
   cleanup has no public caller promise; handshake completion keeps #369's owner.
 
-Checkpoint and enforcement: all public RPC-queue waits use the private
-InternalRPCHandle::await_reply entry, including Acker's single private RPC
-funnel. The handle carries the same ConnectionStatus as Channels, not a new end
+Historical checkpoint and enforcement (superseded by the current completion
+owner described in the reconciliation section): all public RPC-queue waits used
+the private InternalRPCHandle::await_reply entry, including Acker's RPC funnel.
+The handle carried the same ConnectionStatus as Channels, not a new end
 owner. Resolver-loss BrokenPipe and a pending reply after full scope retirement
 are projected to that owner's reserved ProtocolViolation. With no reservation,
 ordinary cancellation retains BrokenPipe. Completed successes and other completed
@@ -496,17 +501,18 @@ when its producer completes between the promise and retirement polls, or when a
 real completed BrokenPipe is mistaken for resolver abandonment. The six callers
 and frame-path exclusions inventoried above are unchanged.
 
-Checkpoint: InternalRPCHandle::await_reply rechecks the promise after observing
-full TaskScope retirement. The retirement state lock synchronizes with the last
-producer guard's release; the recheck therefore preserves its completed success
-or error before substituting for an unresolved reply. Promise's private State
-stores Completion::Completed(Result<T>) or Completion::Abandoned(Error). Only
-last-resolver Drop writes Abandoned, under the existing state mutex. The RPC
-checkpoint substitutes the reserved verdict only for that proven abandonment
-or an unresolved reply after retirement. A completed genuine BrokenPipe stays a
-completed I/O error. Public Error/ErrorKind and Promise's ordinary Future output
-are unchanged; outside this checkpoint abandonment still becomes the same
-BrokenPipe as before. There is no new public error, owner or cancellation path.
+Historical checkpoint, superseded on the current combined revision: the async
+InternalRPCHandle::await_reply consumer rechecked the promise after full scope
+retirement. The then-private stored shapes were Completion::Completed(Result<T>)
+and Completion::Abandoned(Error), with only last-resolver Drop constructing
+Abandoned. That consumer substituted the reserved rejection for abandonment or
+an unresolved retired reply; completed genuine BrokenPipe stayed an I/O error.
+The commands and results in this subsection are historical evidence for that
+implementation. The current checkpoint is Promise State::complete, documented
+in the reconciliation section: the private completion owner decides once for
+all receivers, sinks and map forwarding. await_reply now makes no verdict and
+exists only for tests. Public Error/ErrorKind and ordinary abandonment behavior
+remain unchanged.
 
 Source precedent: futures-channel 0.3.31 src/oneshot.rs represents sender loss as
 Canceled separately from a sent value; a Receiver<Result<T, E>> thus distinguishes
@@ -767,8 +773,10 @@ inspected before choosing this additive mechanism.
 
 `Error::remote_close() -> Option<&RemoteClose>` exposes either
 `RemoteClose::Connection(protocol::connection::Close)` or
-`RemoteClose::Channel(protocol::channel::Close)`. The generated receivers capture the complete method before validation or
-conversion, then pass the immutable capture into the native handler. Private shared error metadata is attached at
+`RemoteClose::Channel(protocol::channel::Close)`. The current generated receivers first perform pure channel/state validation,
+then capture the complete method before conversion or receiver effects. They
+retain the validation result until observation/context retention completes,
+then dispatch that error or pass the immutable capture to the native handler. Private shared error metadata is attached at
 `Error::with_remote_close`, which preserves an already captured Close across
 clones, notifier attachment and shutdown boundaries. Connection/channel status
 keeps that metadata for the existing state-error fallbacks, including normal
@@ -809,11 +817,12 @@ Regression evidence on macOS arm64, through build-slot with CARGO_INCREMENTAL=0:
   repeatable.
 
 The fresh W5d review found three uncovered paths at `7a13dfd1`:
-`src/generated/channel.rs:1329` validated channel zero before capture;
+`src/generated/channel.rs:1329` performed an effectful channel-zero assertion before capture;
 `src/channel.rs:1555` rejected canceled authentication with a bare ConnectionAborted;
 `src/io_loop.rs:268` enriched a clone at shutdown while returning a bare fallback.
-The Close-specific generator metadata now captures both native Close types before
-channel/state validation, retaining the same ProtocolViolation or state error.
+Current Close-specific generator metadata performs pure channel/state validation
+first, then captures either native Close before any validation-error dispatch or
+receiver effects, retaining the same ProtocolViolation or state error.
 All three authentication phases share a status-aware guard: explicit failure and
 cancellation attach the recorded Close before resolver rejection and return.
 Connector failure, handshake EOF and exhausted-backoff errors attach it before
@@ -893,10 +902,15 @@ stop behavior, retry decisions and error classification are unchanged.
 
 ## W5d receive observer (work in progress)
 
-The current combined line descends from landed #369 prerequisite
-966311590693c4b44bb0db0b9d7b105c650f3020. Its rebased required lineage is
-201b4b1 (W4d), 0e8a81c (W7d), 252e6da, c686e1b, fadaddc (topology removal),
-3542674 (Close facts), 1ba7ca3 (observer/context), 099a9b3, a597a4e and
+The current reviewed combined source revision is
+71564e829bb74666d49e7bf4d7391f9ff9606c07, based on landed #378
+355458c7fd33f2bbd7e6de28b10b4898ad31284e, which preserves #369 prerequisite
+966311590693c4b44bb0db0b9d7b105c650f3020. Its current completion-owner checkpoint
+and combined regression evidence are in the reconciliation section below.
+
+Historical pre-#378 rebased lineage (not the current tip): 201b4b1 (W4d),
+0e8a81c (W7d), 252e6da, c686e1b, fadaddc (topology removal), 3542674
+(Close facts), 1ba7ca3 (observer/context), 099a9b3, a597a4e and
 f930bdcbfeefdf2941acef1440eb9222b9769138. No old-line merge or restoration
 path is added. Integration removes the obsolete raw-resolver shutdown Drop arm
 and restores the Promise import required by the retained completion entry.
@@ -984,13 +998,14 @@ landed #369 prerequisite and do not describe the combined rebased tip.
 RabbitMQ workspace integration remains NOT RUN without a broker.
 
 
-### Combined #369/observer WIP evidence (macOS arm64)
+### Historical failing #369/observer WIP evidence (macOS arm64)
 
 Commands use the machine's `build-slot` wrapper, local fork resolution and
-`CARGO_INCREMENTAL=0`. The current rebased source is based on full tip
-f930bdcbfeefdf2941acef1440eb9222b9769138; the integration commit and final pin
-are identified by the implementation report. These are failing WIP results,
-not a combined regression pass.
+`CARGO_INCREMENTAL=0`. These historical commands ran the pre-#378 rebased source
+based on full tip f930bdcbfeefdf2941acef1440eb9222b9769138. The reviewed combined
+revision is 71564e829bb74666d49e7bf4d7391f9ff9606c07; its current
+checkpoint and passing combined evidence are below. Preserve these failing WIP
+results as historical evidence, not a combined regression pass.
 
 - `build-slot cargo build --no-default-features --features tokio,codegen-internal --locked`
   with `LAPIN_CODEGEN_DIR=src/generated` (absolute checkout directory at execution):
@@ -1080,7 +1095,11 @@ a Python NameError and exited1 before invoking Cargo; the corrected command
 produced the combined result above. RabbitMQ workspace integration remains
 NOT RUN without a broker.
 
-## Reconcile W5d/W4d completion ownership with landed #378 (2026-10-27)
+## Current checkpoint: W5d/W4d completion ownership with landed #378 (2026-10-27)
+
+Reviewed combined source revision: 71564e829bb74666d49e7bf4d7391f9ff9606c07.
+All earlier await_reply checkpoint descriptions above are historical and superseded
+by this completion-owner decision; their commands and results remain historical.
 
 Rebased the observer line onto 355458c7fd33f2bbd7e6de28b10b4898ad31284e.
 Keep #378's shared rejection admission, bounded Close write, genuine completed
@@ -1111,7 +1130,10 @@ replaced. No sink runs under the scope/completion mutex. with_sink and map consu
 only the decided Result, synchronously and without a new task. await_reply is now a
 test-only plain wait with the original inter-poll schedule probe; it makes no verdict.
 
-Evidence: Darwin arm64, Rust 1.98.1, this patch on rebased tip 0bde3a3. All Cargo
+Evidence: Darwin arm64, Rust 1.98.1. The commands below ran the working source
+subsequently committed as reviewed combined revision 71564e829bb74666d49e7bf4d7391f9ff9606c07;
+the checkout parent during those commands was 0bde3a3. These recorded commands and
+results are retained as historical execution evidence for that reviewed source. All Cargo
 commands use build-slot, CARGO_INCREMENTAL=0 and this checkout's target.
 
 - Without owner-side reservation/registration, `cargo test --no-default-features
@@ -1144,3 +1166,21 @@ commands use build-slot, CARGO_INCREMENTAL=0 and this checkout's target.
 - Initial compile exit101: two carried test fixtures lacked the new shared-status
   constructor argument. Both now pass that same existing status, with no extra owner.
   RabbitMQ workspace integration is not run here, as instructed for W5d without a broker.
+
+
+### Documentation reconciliation after W5d code re-review (2026-10-27)
+
+Reason: remove contradictory current-checkpoint/receive-order descriptions while
+retaining the actual historical commands and results. Reviewed combined source
+revision: 71564e829bb74666d49e7bf4d7391f9ff9606c07. This reconciliation changes
+PATCHES.md only; all native source remains byte-identical to that reviewed source.
+The current checkpoint is Promise State::complete for receivers, sinks and map;
+the current receive sequence is pure validation, capture/context retention, effects.
+The earlier await_reply checkpoint and pre-#378 source coordinates are historical
+and superseded, not a second completion route. No historical command/result is
+removed or promoted to a new run.
+
+Documentation verification: Darwin arm64, `git diff --check` exit0; native source
+diff against the reviewed combined revision is empty (exit0). No native regression
+rerun is claimed for this documentation-only change. Existing combined-regression
+commands/results above remain evidence on their explicitly named source revisions.
