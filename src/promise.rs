@@ -15,6 +15,22 @@ pub(crate) struct Promise<T> {
     listener: Listener,
 }
 
+// Private completion provenance: a transport BrokenPipe is a completed reply,
+// while only the last resolver's Drop can publish Abandoned.
+pub(crate) enum Completion<T> {
+    Completed(Result<T>),
+    Abandoned(Error),
+}
+
+impl<T> Completion<T> {
+    pub(crate) fn into_result(self) -> Result<T> {
+        match self {
+            Self::Completed(result) => result,
+            Self::Abandoned(error) => Err(error),
+        }
+    }
+}
+
 impl<T> fmt::Debug for Promise<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Promise")
@@ -48,7 +64,7 @@ impl<T> Promise<T> {
     }
 
     pub(crate) fn try_wait(&self) -> Option<Result<T>> {
-        self.shared.take()
+        self.shared.take().map(Completion::into_result)
     }
 
     fn resolver(&self) -> PromiseResolver<T> {
@@ -59,21 +75,27 @@ impl<T> Promise<T> {
     }
 }
 
-impl<T> Future for Promise<T> {
-    type Output = Result<T>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+impl<T> Promise<T> {
+    pub(crate) fn poll_completion(&mut self, cx: &mut Context<'_>) -> Poll<Completion<T>> {
         loop {
             self.listener.arm();
             if let Some(data) = self.shared.take() {
                 self.listener.disarm();
                 return Poll::Ready(data);
             }
-            match self.listener.poll(cx) {
+            match Pin::new(&mut self.listener).poll(cx) {
                 Poll::Ready(()) => {}
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+impl<T> Future for Promise<T> {
+    type Output = Result<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.poll_completion(cx).map(Completion::into_result)
     }
 }
 
@@ -102,11 +124,13 @@ impl<T> Drop for PromiseResolver<T> {
         state.resolvers -= 1;
         if state.resolvers == 0 && !state.completed {
             state.completed = true;
-            state.data = Some(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "promise lost its last resolver before completion",
-            )
-            .into()));
+            state.data = Some(Completion::Abandoned(
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "promise lost its last resolver before completion",
+                )
+                .into(),
+            ));
             drop(state);
             self.shared.listener.notify();
         }
@@ -148,7 +172,7 @@ struct Shared<T> {
 }
 
 struct State<T> {
-    data: Option<Result<T>>,
+    data: Option<Completion<T>>,
     // Taking the result does not allow another resolver to complete it again.
     completed: bool,
     // Count only resolver handles: the promise also holds an Arc to Shared.
@@ -166,7 +190,7 @@ impl<T> Shared<T> {
         Arc::new(Self {
             state: Mutex::new(State {
                 completed: data.is_some(),
-                data,
+                data: data.map(Completion::Completed),
                 resolvers: 0,
             }),
             listener: Listener::default(),
@@ -182,7 +206,7 @@ impl<T> Shared<T> {
         let mut lock = self.lock_state();
         if !lock.completed {
             lock.completed = true;
-            lock.data = Some(data);
+            lock.data = Some(Completion::Completed(data));
             // Release the lock before waking to avoid the woken task
             // immediately blocking on it.
             drop(lock);
@@ -190,7 +214,7 @@ impl<T> Shared<T> {
         }
     }
 
-    fn take(&self) -> Option<Result<T>> {
+    fn take(&self) -> Option<Completion<T>> {
         self.lock_state().data.take()
     }
 

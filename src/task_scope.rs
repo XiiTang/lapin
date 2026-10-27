@@ -39,6 +39,23 @@ impl TaskScope {
             guard: Some(Guard(self.clone())),
         }
     }
+    pub(crate) async fn retired(&self) {
+        // Let scoped tasks propagate already-ready replies before cancelling
+        // their external callers. Listen before checking to avoid missed stops
+        // or the final drain, including callers arriving after retirement.
+        loop {
+            let listener = self.0.stopped.listen();
+            let retired = {
+                let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.stopped && state.active == 0
+            };
+            if retired {
+                return;
+            }
+            listener.await;
+        }
+    }
+
     pub(crate) fn stop(&self) {
         self.0
             .state
@@ -73,6 +90,11 @@ impl Drop for Guard {
         state.active -= 1;
         if state.active == 0 {
             self.0.0.drained.notify_all();
+        }
+        let retired = state.stopped && state.active == 0;
+        drop(state);
+        if retired {
+            self.0.0.stopped.notify(usize::MAX);
         }
     }
 }

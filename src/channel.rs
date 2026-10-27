@@ -252,13 +252,7 @@ impl Channel {
                 AMQPHardError::COMMANDINVALID.into(),
                 format!("connection frame received on channel {}", self.id).into(),
             );
-            self.internal_rpc.close_connection(
-                error.get_id(),
-                error.get_message().clone(),
-                class_id,
-                method_id,
-            );
-            Err(ErrorKind::ProtocolViolation(error).into())
+            self.reject_frame(0, error, class_id, method_id)
         }
     }
 
@@ -626,15 +620,66 @@ impl Channel {
         method_id: Identifier,
     ) -> Result<()> {
         error!(%error);
-        self.internal_rpc.close_connection(
-            error.get_id(),
-            error.get_message().clone(),
+        self.reject_frame(0, error, class_id, method_id)
+    }
+
+    fn reject_frame(
+        &self,
+        close_channel: ChannelId,
+        error: AMQPError,
+        class_id: Identifier,
+        method_id: Identifier,
+    ) -> Result<()> {
+        let error = Error::from(ErrorKind::ProtocolViolation(error));
+        if !self.connection_status.admit_rejection(error.clone()) {
+            return Err(self.connection_status.rejection().unwrap_or(error));
+        }
+        let handshake = self.connection_status.defer_handshake_close(error.clone());
+        self.internal_rpc.reject_frame(
+            close_channel,
+            error.clone(),
             class_id,
             method_id,
+            handshake,
         );
-        let error = Error::from(ErrorKind::ProtocolViolation(error));
-        self.internal_rpc.set_connection_error(error.clone());
         Err(error)
+    }
+
+    // Called only by the rejection-to-shutdown handoff. This is a write
+    // completion, not a CloseOk RPC: the rejected frame already ends the
+    // connection, but its requested local close must reach the transport first.
+    pub(crate) fn protocol_violation_close(
+        &self,
+        error: &Error,
+        class_id: Identifier,
+        method_id: Identifier,
+    ) -> Promise<()> {
+        let ErrorKind::ProtocolViolation(error) = error.kind() else {
+            unreachable!("only a rejected frame requests a protocol-violation close");
+        };
+        self.connection_status.unblock();
+        let (written, resolver) = Promise::new("protocol-violation close write");
+        let method = if self.id == 0 {
+            AMQPClass::Connection(protocol::connection::AMQPMethod::Close(
+                protocol::connection::Close {
+                    reply_code: error.get_id(),
+                    reply_text: error.get_message().clone(),
+                    class_id,
+                    method_id,
+                },
+            ))
+        } else {
+            AMQPClass::Channel(protocol::channel::AMQPMethod::Close(
+                protocol::channel::Close {
+                    reply_code: error.get_id(),
+                    reply_text: error.get_message().clone(),
+                    class_id,
+                    method_id,
+                },
+            ))
+        };
+        self.send_method_frame(method, Box::new(resolver.clone()), None, Some(resolver));
+        written
     }
 
     fn handle_invalid_contents(
@@ -746,19 +791,7 @@ impl Channel {
         method_id: Identifier,
     ) -> Result<()> {
         error!("Got a bad acknowledgement from server, closing channel");
-        let channel = self.clone();
-        let err = error.clone();
-        self.internal_rpc.spawn(async move {
-            channel
-                .do_channel_close(
-                    error.get_id(),
-                    error.get_message().clone(),
-                    class_id,
-                    method_id,
-                )
-                .await
-        });
-        Err(ErrorKind::ProtocolViolation(err).into())
+        self.reject_frame(self.id, error, class_id, method_id)
     }
 
     fn before_connection_close_ok(&self) {
@@ -1573,6 +1606,7 @@ mod partial_get_tests {
             ),
             frames.clone(),
             socket.handle(),
+            connection_status.clone(),
         );
         let recovery = configuration.recovery_config();
         let channel = Channel::new(
@@ -1729,6 +1763,7 @@ mod authentication_step_tests {
             ),
             frames.clone(),
             socket.handle(),
+            connection_status.clone(),
         );
         let recovery = configuration.recovery_config();
         let channel = Channel::new(

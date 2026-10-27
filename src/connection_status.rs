@@ -6,7 +6,7 @@ use crate::{
 };
 use std::{
     fmt,
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 /// Shared, cheaply cloneable view of a connection's current state.
@@ -23,7 +23,32 @@ impl ConnectionStatus {
             vhost: uri.vhost.as_str().into(),
             username: uri.authority.userinfo.username.clone(),
             state: RwLock::new(StateInner::default()),
+            shutdown: Mutex::new(()),
         }))
+    }
+
+    // Serializes receive admission with shutdown effects, including driver stop.
+    // Acquire before any channel lock; never hold a channel lock on entry.
+    pub(crate) fn shutdown_guard(&self) -> MutexGuard<'_, ()> {
+        self.0.shutdown.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn admit_rejection(&self, error: Error) -> bool {
+        let mut inner = self.write();
+        if inner.rejection.is_some()
+            || matches!(
+                inner.state,
+                ConnectionState::Closed | ConnectionState::Error
+            )
+        {
+            return false;
+        }
+        inner.rejection = Some(error);
+        true
+    }
+
+    pub(crate) fn rejection(&self) -> Option<Error> {
+        self.read().rejection.clone()
     }
 
     pub(crate) fn set_handshake(&self, resolver: &HandshakeResolver) {
@@ -72,7 +97,8 @@ impl ConnectionStatus {
     }
 
     /// Returns `true` while writes are held by the broker's `Connection.Blocked`.
-    /// A peer's closing handshake releases this hold for its mandatory CloseOk.
+    /// A peer's closing handshake or a local protocol violation releases this
+    /// hold for its mandatory CloseOk or Close.
     #[must_use]
     pub fn blocked(&self) -> bool {
         self.read().blocked
@@ -177,6 +203,7 @@ struct Inner {
     vhost: ShortString,
     username: String,
     state: RwLock<StateInner>,
+    shutdown: Mutex<()>,
 }
 
 impl Default for Inner {
@@ -185,6 +212,7 @@ impl Default for Inner {
             vhost: "/".into(),
             username: "guest".into(),
             state: RwLock::new(StateInner::default()),
+            shutdown: Mutex::new(()),
         }
     }
 }
@@ -195,6 +223,7 @@ struct StateInner {
     state: ConnectionState,
     blocked: bool,
     poison: Option<Error>,
+    rejection: Option<Error>,
 }
 
 impl StateInner {
@@ -205,6 +234,7 @@ impl StateInner {
 
     fn set_reconnecting(&mut self) {
         let _ = self.poison.take();
+        self.rejection = None;
         self.state = ConnectionState::Reconnecting;
         self.blocked = false;
     }

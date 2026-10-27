@@ -515,6 +515,7 @@ mod test {
             secret_update,
             Frames::default(),
             socket_state.handle(),
+            status.clone(),
         );
         Consumer::new(
             ShortString::from(tag),

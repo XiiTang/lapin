@@ -268,3 +268,272 @@ also passed before the final handshake/blocked cases; those added files are
 included in the final per-file check. Broker-dependent tests, including
 tests/connection.rs, are not claimed run.
 This repair changes no Boundless API contract or observer mechanism.
+
+## Settle a rejected frame's local close before retiring I/O (#378)
+
+Base: `966311590693c4b44bb0db0b9d7b105c650f3020`, without W5d observers.
+A rejected peer frame could lose its requested local Close or have its original
+`ProtocolViolation` replaced by the I/O owner's `ConnectionAborted`. The receive
+path queued CloseConnection (or a channel-close future) and SetConnectionError;
+critical_error stopped I/O before those commands and their write ran. Poison
+then rejected the Close, or Drop canceled its RPC scope first. This predates
+#369; its CloseOk-only poisoned admission stays unchanged.
+
+Instances searched: all nine connection-method channel-zero checks (Start,
+Secure, Tune, OpenOk, Close, CloseOk, Blocked, Unblocked and UpdateSecretOk);
+invalid heartbeat and channel-zero content header; unexpected replies, content
+headers, content classes and bodies through report_protocol_violation; and
+invalid single Ack/Nack through acknowledgement_error. All three native verdict
+construction paths now use Channel::reject_frame. The multiple Ack/Nack
+complete_pending_before loop cannot return its error while it owns the pending
+map; an empty set succeeds, so that is not a reproduced rejection instance.
+Automatic connection/channel cleanup, caller-requested closes, parse/size
+errors and invalid connection states do not return ProtocolViolation after
+requesting a local close and are outside this class.
+
+The checkpoint is shared ConnectionStatus shutdown ownership. Channels::handle_frame
+holds its private serialization guard before entering any channel receive lock;
+Channel::reject_frame reserves the original verdict there, before queueing the
+write handoff. All Channels connection close, error, shutdown poison and recovery
+transitions use the same guard. Driver stop and IoLoop::drop enter through
+Channels::set_connection_error, so neither can publish ConnectionAborted first.
+The private RPC actor no longer owns a separate rejection flag. An already queued
+SetConnectionClosed, local close, peer Close, error or explicit stop can abandon
+the attempt only with the original verdict. Explicit stop abandons immediately.
+Public RPC-queue callers also pass through InternalRPCHandle::await_reply: lost
+resolvers and an RPC scope that has finished retiring resolve against the same
+reserved verdict. Already-ready replies propagate before cancellation.
+Closing admission changes channel state without canceling a partial basic.get.
+Normal input is discarded while rejecting; a later Close cannot run native
+teardown against the retained verdict. Reads remain active to observe EOF.
+Handshake rejection reuses #369's HandshakeResolver, released only when the write
+settles or is abandoned. A local Channel.Close remains channel-scoped; its
+original verdict still ends the connection. Blocked writes are released for the
+required Close. Frames::Inner::push and CloseOk-only poison admission are unchanged.
+
+The write attempt races a ten-second runtime timer. Lapin has no close or
+handshake deadline setting to reuse (ConnectionProperties, configuration, TCP
+entry points and handshake/RPC paths were searched). Its negotiated heartbeat
+may be zero and is canceled during closing, so it cannot bound this attempt.
+The private constant gives an already rejected connection a finite best-effort
+write without adding a public knob. It is a local policy choice, not a duration
+copied from another client. Successful poll_write means transport acceptance,
+not proof of peer delivery. Timeout, transport failure, peer EOF and competing
+shutdown retain the original ProtocolViolation; none substitutes a timeout or
+ConnectionAborted end. A rejected connection also skips potentially pending
+transport poll_close during physical retirement, and exits the outer handshake
+retry loop even when a caller configured connection backoff. An admitted end
+cannot become a second connection attempt.
+
+Source precedent: rabbitmq/amqp091-go `connection.go` at
+`30d99a718190e4dbd6c77d030b22b6b4fbf33b94`, closeWith defers shutdown until its
+close exchange returns; dispatch0 sends CloseOk before shutting down its writer.
+
+Regression evidence: macOS arm64, Rust 1.98.1, this patch on the base above.
+Commands below ran through the machine's build-slot wrapper, with incremental
+compilation disabled and the checkout's own target directory.
+
+- Before the fix: `build-slot cargo test --no-default-features --features tokio
+  --locked --test connection_close
+  rejected_connection_close_is_written_before_the_protocol_violation_retires_io
+  -- --exact`: **101**, actual wire read failed with UnexpectedEof, `early eof`.
+  The original verdict happened to win that run; the write was still lost.
+- Baseline `build-slot cargo clippy --no-default-features --features tokio --lib
+  --tests --locked -- -D warnings`: **0**.
+- Fixed `build-slot cargo test --no-default-features --features tokio,smol
+  --locked --test connection_close`: **0**, all 11 tests, including unchanged
+  #369 CloseOk/blocked/auth/recovery regressions, the actual Close 503, partial
+  basic.get, blocked/unblocked rejection, handshake write failure, other content
+  and reply rejections, and single Ack/Nack Close 406.
+- Two further runs of `build-slot cargo test --no-default-features --features
+  tokio,smol --locked --test connection_close
+  rejected_connection_close_is_written_before_the_protocol_violation_retires_io
+  -- --exact`: **0**, **0**. Together with the module run, three final regression
+  runs; each exercises all four pending-Declare/partial-Get × blocked/unblocked
+  schedules and proves a held write cannot finish the original waiter early.
+- `build-slot cargo test --no-default-features --features tokio,smol --locked
+  --no-fail-fast`: **0**, 61 unit/integration tests and 7 doctests. All broker
+  tests ran against an isolated RabbitMQ 4.3.5 with owned ports, data and process
+  PIDs; no tests were skipped or ignored. This includes
+  frames::close_ok_tests and the shared handshake-owner regression.
+- `build-slot cargo build --no-default-features --features tokio,smol --locked`:
+  **0**.
+- `build-slot cargo clippy --no-default-features --features tokio,smol
+  --all-targets --locked -- -D warnings`: **0**, no new or baseline findings.
+- `build-slot cargo fmt --all --check`: **0**.
+
+The private checkpoint unit regression
+internal_rpc::tests::frame_rejection_keeps_its_verdict_until_the_close_write_settles
+covers successful and failed writes, queued ConnectionAborted, SetConnectionClosing,
+InitConnectionShutdown and a SetConnectionClosed queued before the write handoff.
+Each arm retains the original verdict and publishes one end.
+An initial added fixture incorrectly expected multiple Ack/Nack of an empty set
+to reject and timed out (portable module command **101**); correcting that
+fixture to exercise actual rejection paths passed the narrow rerun (**0**) and
+the full suite above. No product assertion was weakened.
+
+### #378 review corrections (F1–F3), 2026-10-27
+
+Source precedents read before the correction:
+- amqp091-go connection.go at `30d99a718190e4dbd6c77d030b22b6b4fbf33b94`,
+  CloseDeadline/setDeadline apply a caller-supplied socket deadline before the
+  close exchange; closeWith defers shutdown until that exchange returns. Its
+  30-second default is a connection/handshake timeout, not a close-write bound.
+- rabbitmq-c amqp_api.c/amqp_socket.c/amqp_connection.c at
+  `8b7471eab8d09536b3c104dbb30a65699cf48104`: connection_close uses simple_rpc,
+  whose optional rpc_timeout bounds wait_frame_inner, but simple_rpc_inner calls
+  amqp_send_method with an infinite write deadline. This is not a bounded close
+  write precedent: the lower amqp_send_method_inner/send_frame_inner APIs accept
+  explicit deadlines, but connection_close does not supply one to the write.
+  A null RPC timeout is infinite; its separate default login timeout is 12 seconds.
+  Go's socket deadline is the applicable bounded-write precedent; neither client
+  supplies a reusable lapin setting or a close-write constant to copy.
+
+Regression evidence: Darwin arm64, Rust 1.98.1, this correction on
+`f30dd76a77e09d483e5555f7c21a3d6510b8be0a`. Every cargo invocation below
+used build-slot, CARGO_INCREMENTAL=0 and the checkout's own target.
+
+- With the previous production sources restored (new fixture and Tokio test-util
+  only), `cargo test --no-default-features --features tokio,smol --locked
+  --test connection_close rejected_close_ -- --nocapture`: **101**, all five
+  new regressions failed. Pending write, peer EOF and later peer Close hit the
+  fixture's bounded completion assertion. Explicit stop produced IOError /
+  ConnectionAborted instead of ProtocolViolation 503. Local close returned the
+  wrong end kind/code. No fixture schedule or assertion was changed for this run.
+- Fixed `cargo test --no-default-features --features tokio,smol --locked
+  --test connection_close`: **0** three consecutive final runs, 16 tests each.
+  The five new tests cover permanently pending writes (paused clock advanced
+  explicitly), peer EOF, local close with partial Get, peer Close and explicit
+  stop while the write is held. They use controlled gates, not sleeps. Existing
+  wire tests retain Close codes and end kind/code, with only necessary write /
+  waiter ordering. Exact text, full diagnostics and empty-tail assertions removed.
+- `cargo test --no-default-features --features tokio,smol --locked --lib
+  frame_rejection_keeps`: **0**, expanded shared-checkpoint regression.
+- `cargo test --no-default-features --features tokio,smol --locked
+  --no-fail-fast`: **0**, 66 unit/integration tests and 7 doctests, none ignored;
+  isolated RabbitMQ 4.3.5 with owned ports/data/PIDs. The first full run was
+  **101** because the old classification fixture sent a peer Close after a
+  rejection on the same connection. The independent peer-Close arm now uses a
+  fresh connection; its classification assertions are unchanged.
+- `cargo build --no-default-features --features tokio,smol --locked`: **0**.
+- `cargo clippy --no-default-features --features tokio,smol --all-targets
+  --locked -- -D warnings`: **0**, no baseline or new warnings.
+- `cargo fmt --all --check`: **0**.
+
+### #378 narrow re-review: cancelled public RPC callers (F2), 2026-10-27
+
+Class: a public caller awaiting a queued/scoped RPC reply returns resolver-loss
+BrokenPipe, or remains pending on an unprocessed command, after a protocol
+rejection has already reserved the connection's end. Merely guarding the actor's
+CloseConnection handler cannot govern a command that is never processed.
+
+Source inventory and instances:
+- Connection::close -> close_connection_checked: SetConnectionClosing can retire
+  the scope before the CloseConnection resolver is constructed/enqueued.
+- Connection::create_channel and Connection::update_secret: their single queued
+  command owns the caller's resolver; queue or spawned-task retirement can lose it.
+- Acker::ack/nack/reject: all use the one private Acker::rpc funnel, with the same
+  resolver ownership after its initial error check and before the reply returns.
+- Channel::close and Channel::basic_cancel do not enqueue multiple actor commands:
+  their frame and expected-reply registration use one Frames lock. Retirement
+  rejects registered replies; later pushes see the original poison. Other
+  generated method replies use that same frame path. Publisher confirmations
+  are retained in the acknowledgement map and rejected by channel error cleanup.
+  They are not instances of this RPC-command cancellation class. Fire-and-forget
+  cleanup has no public caller promise; handshake completion keeps #369's owner.
+
+Checkpoint and enforcement: all public RPC-queue waits use the private
+InternalRPCHandle::await_reply entry, including Acker's single private RPC
+funnel. The handle carries the same ConnectionStatus as Channels, not a new end
+owner. Resolver-loss BrokenPipe and a pending reply after full scope retirement
+are projected to that owner's reserved ProtocolViolation. With no reservation,
+ordinary cancellation retains BrokenPipe. Completed successes and other completed
+errors are preserved. The existing stopped Event also wakes retirement listeners
+when its last task guard drains; listening before checking the state prevents a
+missed stop, including a caller arriving after retirement. Waiting for the drain
+keeps TaskScope's existing final-poll rule: already-ready replies propagate before
+external cancellation. No new timeout, result registry or close path is added.
+
+Source precedent: amqp091-go connection.go at
+`30d99a718190e4dbd6c77d030b22b6b4fbf33b94`, Connection.call reads the buffered
+shutdown reason when the RPC channel closes, rather than replacing that reason
+with generic channel closure. Lapin's existing TaskScope::wrap likewise polls a
+ready reply once before dropping stopped work.
+
+Regression evidence: Darwin arm64, Rust 1.98.1, this patch on
+`87741d17e90e8ba05cc8ce3ad8e79c8a5162cfb4`. All cargo commands use build-slot,
+CARGO_INCREMENTAL=0 and this checkout's target.
+
+- Before the production fix, `cargo test --no-default-features --features
+  tokio,smol --locked --lib local_close_between_commands_keeps -- --nocapture`:
+  **101**, returned IOError/BrokenPipe (lost last resolver), not ProtocolViolation
+  503. A test-only Notify gate pauses immediately after SetConnectionClosing;
+  the controller witnesses the reserved verdict, fully retires the RPC scope,
+  and only then resumes the caller before CloseConnection enqueue.
+- Before the fix, `cargo test --no-default-features --features tokio,smol
+  --locked --lib queued_rpc_callers_keep -- --nocapture`: **101** with the
+  deterministic readiness assertion: retirement left the queued caller pending.
+  An initial version awaited that pending reply; its owned process tree was
+  recorded and terminated (**143**). The bounded reproduction uses a single
+  state probe, not a sleep or timeout, and keeps the required end assertions.
+- Fixed `cargo test --no-default-features --features tokio,smol --locked --lib
+  internal_rpc::tests::`: **0** three final runs, five tests each. This includes
+  the inter-command gate, six queued public-call routes, and a control that a
+  ready scoped reply completes successfully before cancellation. The existing
+  rejection/write and queue-limit checkpoint tests also pass.
+- `cargo test --no-default-features --features tokio,smol --locked
+  --no-fail-fast`: **0**, 69 unit/integration tests and 7 doctests, none ignored,
+  using isolated owned RabbitMQ 4.3.5. #369's poisoned admission and CloseOk
+  regressions remain unchanged.
+- `cargo build --no-default-features --features tokio,smol --locked`: **0**.
+- `cargo clippy --no-default-features --features tokio,smol --locked --all-targets
+  -- -D warnings`: **0**.
+- `cargo fmt --all --check`: **0**.
+
+### #378 reply precedence and abandonment provenance (narrow review r2), 2026-10-27
+
+Class: a completed RPC result is replaced by a reserved shutdown verdict, either
+when its producer completes between the promise and retirement polls, or when a
+real completed BrokenPipe is mistaken for resolver abandonment. The six callers
+and frame-path exclusions inventoried above are unchanged.
+
+Checkpoint: InternalRPCHandle::await_reply rechecks the promise after observing
+full TaskScope retirement. The retirement state lock synchronizes with the last
+producer guard's release; the recheck therefore preserves its completed success
+or error before substituting for an unresolved reply. Promise's private State
+stores Completion::Completed(Result<T>) or Completion::Abandoned(Error). Only
+last-resolver Drop writes Abandoned, under the existing state mutex. The RPC
+checkpoint substitutes the reserved verdict only for that proven abandonment
+or an unresolved reply after retirement. A completed genuine BrokenPipe stays a
+completed I/O error. Public Error/ErrorKind and Promise's ordinary Future output
+are unchanged; outside this checkpoint abandonment still becomes the same
+BrokenPipe as before. There is no new public error, owner or cancellation path.
+
+Source precedent: futures-channel 0.3.31 src/oneshot.rs represents sender loss as
+Canceled separately from a sent value; a Receiver<Result<T, E>> thus distinguishes
+abandonment from a producer's completed error. The change retains lapin's existing
+arm-before-recheck listener loop and releases the state lock before notification.
+
+Regression evidence: Darwin arm64, Rust 1.98.1, this patch on
+7c0337164983e2320ffb417c248b2833a5272247. Every Cargo command uses build-slot,
+CARGO_INCREMENTAL=0 and this worktree's target.
+
+- Baseline `cargo test --no-default-features --features tokio,smol --locked --lib
+  internal_rpc::tests::rpc_ -- --nocapture`: **101**, the success and ordinary
+  error completed between polls and the completed genuine BrokenPipe all fail;
+  each is replaced by ProtocolViolation. The abandoned-resolver arm passes on
+  the baseline as a positive control. A test-only synchronous hook executes the
+  ready producer and releases its final guard after the first pending promise
+  poll and before retirement is observed, with no sleep.
+- Fixed `cargo test --no-default-features --features tokio,smol --locked --lib
+  internal_rpc::tests::`: **0**, three final runs, nine tests each; all four new
+  cases and the existing inter-command, queued-caller and ready-reply controls.
+- `cargo test --no-default-features --features tokio,smol --locked --lib
+  promise::tests::`: **0**, three existing promise completion/abandonment tests.
+- `cargo build --no-default-features --features tokio,smol --locked`: **0**.
+- `cargo fmt --all --check`: **0**.
+- `cargo clippy --no-default-features --features tokio,smol --locked --all-targets
+  -- -D warnings`: **0**, no warnings.
+- `cargo test --no-default-features --features tokio,smol --locked
+  --no-fail-fast`: **0**, 73 unit/integration tests and seven doctests, zero
+  ignored, with isolated owned RabbitMQ 4.3.5. #369's regressions are unchanged.

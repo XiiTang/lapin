@@ -39,7 +39,8 @@ impl fmt::Debug for ConnectionStep {
 }
 
 // Every handshake completion, including authentication task cancellation, goes
-// through this owner. Peer Close reserves its cause until CloseOk's write ends.
+// through this owner. Peer Close and a local protocol-violation close reserve
+// their cause until the required close write ends.
 #[derive(Clone, Debug)]
 pub(crate) struct HandshakeResolver(Arc<Mutex<HandshakeCompletion>>);
 #[derive(Default, Debug)]
@@ -73,7 +74,7 @@ impl HandshakeResolver {
         if let Err(error) = &result
             && !self.complete(Err(error.clone()))
         {
-            // The peer-close owner also owns retirement; an auth task must not
+            // The close owner also owns retirement; an auth task must not
             // send a competing SetConnectionError while its write is pending.
             return Ok(());
         }

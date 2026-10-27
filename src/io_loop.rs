@@ -61,6 +61,7 @@ pub(crate) struct IoLoop<
     serialized_frames: VecDeque<(FrameSize, FrameSending)>,
     half_closed: bool,
     first_connection: bool,
+    rejected_frame: Option<Error>,
     force_stop: KillSwitch,
 }
 
@@ -111,12 +112,14 @@ impl<
             serialized_frames: VecDeque::default(),
             half_closed: false,
             first_connection: true,
+            rejected_frame: None,
             force_stop,
         }
     }
 
     fn reset(&mut self) {
         self.status = Status::Initial;
+        self.rejected_frame = None;
         self.receive_buffer.reset();
         self.send_buffer.reset();
         self.socket_state.reset();
@@ -256,7 +259,7 @@ impl<
                         ErrorKind::InvalidConnectionState(ConnectionState::Closed).into(),
                     ));
 
-                    if !connecting && !reconnect {
+                    if self.connection_status.rejection().is_some() || (!connecting && !reconnect) {
                         break (stream, res);
                     }
 
@@ -282,7 +285,7 @@ impl<
 
                 trace!(status=?self.status, connection_status=?self.connection_status.state(), "io_loop entering exit/cleanup phase");
                 self.internal_rpc.stop();
-                if !self.force_stop.killed() && self.heartbeat.killswitch().killed()
+                if self.connection_status.rejection().is_none() && !self.force_stop.killed() && self.heartbeat.killswitch().killed()
                     && let Err(err) = self.runtime.block_on(std::future::poll_fn(move |cx| {
                         Pin::new(&mut stream)
                             .poll_close(cx)
@@ -355,10 +358,24 @@ impl<
     }
 
     fn critical_error(&mut self, connection_killswitch: &KillSwitch, error: Error) -> Result<()> {
-        if error.is_io_error() {
+        // The receive path queued its local close before returning this error.
+        // Keep I/O and its RPC scope alive until that close's write completion
+        // applies the original error. Later input can abandon the attempt, but
+        // shared shutdown ownership prevents any of its native side effects.
+        if matches!(error.kind(), ErrorKind::ProtocolViolation(_))
+            && self.rejected_frame.is_none()
+            && !self.connection_status.errored()
+        {
+            self.rejected_frame = Some(error.clone());
+            return Err(error);
+        }
+        // If writing fails, the rejection still owns the connection's end.
+        let io_error = error.is_io_error();
+        let error = self.rejected_frame.clone().unwrap_or(error);
+        if io_error {
             connection_killswitch.kill();
         }
-        if self.channels.can_recover(&error) {
+        if self.connection_status.rejection().is_none() && self.channels.can_recover(&error) {
             self.internal_rpc.init_connection_recovery(error.clone());
             return Err(error);
         }
@@ -367,7 +384,11 @@ impl<
             resolver.reject(error.clone());
         }
         self.stop();
-        self.internal_rpc.set_connection_error(error.clone());
+        if self.rejected_frame.is_some() {
+            self.channels.set_connection_error(error.clone());
+        } else {
+            self.internal_rpc.set_connection_error(error.clone());
+        }
         self.clear_serialized_frames(error.clone());
         Err(error)
     }
@@ -532,6 +553,8 @@ impl<
 
                         trace!("read {} bytes", sz);
                         self.receive_buffer.fill(sz);
+                    } else if let Some(error) = self.connection_status.rejection() {
+                        return Err(error);
                     } else if self.half_closed {
                         return self.handle_half_closed_connection(false);
                     } else {
@@ -604,9 +627,7 @@ impl<
         let mut did_something = false;
         while self.can_parse() {
             if let Some(frame) = self.parse(connection_killswitch)? {
-                self.channels
-                    .handle_frame(frame)
-                    .inspect_err(|err| self.internal_rpc.set_connection_error(err.clone()))?;
+                self.channels.handle_frame(frame)?;
                 did_something = true;
             } else {
                 break;
@@ -698,10 +719,19 @@ where
         // Resolve library waiters before canceling the RPC task that owns them.
         if !self.connection_status.closed() && !self.connection_status.errored() {
             let error = self
-                .frames
-                .poison()
+                .rejected_frame
+                .clone()
+                .or_else(|| self.frames.poison())
                 .unwrap_or_else(|| io::Error::from(io::ErrorKind::ConnectionAborted).into());
             self.channels.set_connection_error(error);
+        }
+        // A failed/aborted write can stop the RPC task before its completion
+        // future runs. The physical loop has ended now, so release the same
+        // reserved handshake verdict before canceling that task.
+        if let Some(error) = &self.rejected_frame
+            && let Some(handshake) = self.connection_status.defer_handshake_close(error.clone())
+        {
+            handshake.finish_close();
         }
         self.internal_rpc.task_scope.stop();
     }

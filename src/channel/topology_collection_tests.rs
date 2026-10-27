@@ -23,6 +23,7 @@ fn channel(
         SecretUpdate::new(status.clone(), runtime, configuration.auth_provider.clone()),
         frames.clone(),
         socket.handle(),
+        status.clone(),
     );
     let recovery = configuration.recovery_config();
     let channel = Channel::new(

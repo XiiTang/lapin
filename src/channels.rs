@@ -8,7 +8,7 @@ use crate::{
     id_sequence::IdSequence,
     internal_rpc::InternalRPCHandle,
     killswitch::KillSwitch,
-    protocol::{AMQPClass, AMQPError, AMQPHardError},
+    protocol::{AMQPClass, AMQPError, AMQPHardError, channel, connection},
     socket_state::SocketStateHandle,
     types::{ChannelId, Identifier, PayloadSize},
 };
@@ -141,13 +141,37 @@ impl Channels {
     }
 
     pub(crate) fn set_connection_closing(&self) {
+        let _shutdown = self.connection_status.shutdown_guard();
+        if let Some(error) = self.connection_status.rejection() {
+            self.apply_connection_error(error);
+            return;
+        }
         self.connection_status.set_state(ConnectionState::Closing);
         for channel in self.read().channels.values() {
             channel.set_closing(None);
         }
     }
 
+    // Stop new operations without settling existing waiters before the
+    // rejection's close write. set_closing would cancel a partial basic.get.
+    pub(crate) fn begin_frame_rejection(&self) {
+        let _shutdown = self.connection_status.shutdown_guard();
+        if self.connection_status.errored() {
+            return;
+        }
+        self.connection_status.set_state(ConnectionState::Closing);
+        for channel in self.read().channels.values() {
+            channel.set_state(ChannelState::Closing);
+        }
+    }
+
     pub(crate) fn set_connection_closed(&self, error: Error) {
+        let _shutdown = self.connection_status.shutdown_guard();
+        if let Some(error) = self.connection_status.rejection() {
+            self.apply_connection_error(error);
+            return;
+        }
+        self.frames.clear_all_expected_replies(error.clone());
         self.connection_status.set_state(ConnectionState::Closed);
         for channel in self.read().channels.values() {
             channel.set_closed(error.clone());
@@ -163,6 +187,11 @@ impl Channels {
     }
 
     pub(crate) fn set_connection_error(&self, error: Error) {
+        let _shutdown = self.connection_status.shutdown_guard();
+        self.apply_connection_error(self.connection_status.rejection().unwrap_or(error));
+    }
+
+    fn apply_connection_error(&self, error: Error) {
         // Do nothing if we were already in error
         if let ConnectionState::Error = self.connection_status.set_state(ConnectionState::Error) {
             return;
@@ -178,6 +207,11 @@ impl Channels {
         for channel in self.read().channels.values() {
             channel.set_connection_error(error.clone());
         }
+        if let Some(error) = self.connection_status.rejection()
+            && let Some(handshake) = self.connection_status.defer_handshake_close(error)
+        {
+            handshake.finish_close();
+        }
     }
 
     pub(crate) fn flow(&self) -> bool {
@@ -185,6 +219,29 @@ impl Channels {
     }
 
     pub(crate) fn handle_frame(&self, f: AMQPFrame) -> Result<()> {
+        let _shutdown = self.connection_status.shutdown_guard();
+        if let Some(error) = self.connection_status.rejection() {
+            // Closing ignores ordinary input. A competing close may abandon
+            // the write, but none of its native teardown effects may run.
+            if matches!(
+                f,
+                AMQPFrame::Method(
+                    _,
+                    AMQPClass::Connection(
+                        connection::AMQPMethod::Close(_) | connection::AMQPMethod::CloseOk(_)
+                    )
+                ) | AMQPFrame::Method(
+                    _,
+                    AMQPClass::Channel(
+                        channel::AMQPMethod::Close(_) | channel::AMQPMethod::CloseOk(_)
+                    )
+                )
+            ) {
+                self.apply_connection_error(error.clone());
+                return Err(error);
+            }
+            return Ok(());
+        }
         trace!(channel = f.channel_id(), "will handle frame");
         match f {
             AMQPFrame::ProtocolHeader(version) => {
@@ -240,6 +297,11 @@ impl Channels {
     }
 
     pub(crate) fn init_connection_recovery(&self, error: Error) -> Error {
+        let _shutdown = self.connection_status.shutdown_guard();
+        if let Some(error) = self.connection_status.rejection() {
+            self.apply_connection_error(error.clone());
+            return error;
+        }
         trace!("init connection recovery");
         self.connection_status.set_reconnecting();
         self.frames.clear_connection_steps(&error);
@@ -290,10 +352,19 @@ impl Channels {
     }
 
     pub(crate) fn init_connection_shutdown(&self, error: Error) {
+        let _shutdown = self.connection_status.shutdown_guard();
+        if let Some(error) = self.connection_status.rejection() {
+            self.apply_connection_error(error);
+            return;
+        }
         self.frames.drop_pending(error, &self.internal_rpc);
     }
 
     pub(crate) fn finish_connection_shutdown(&self) {
+        let _shutdown = self.connection_status.shutdown_guard();
+        if let Some(error) = self.connection_status.rejection() {
+            self.apply_connection_error(error);
+        }
         self.connection_killswitch.kill();
     }
 

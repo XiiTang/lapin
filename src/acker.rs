@@ -119,7 +119,7 @@ impl Acker {
         if let Some(internal_rpc) = self.internal_rpc.as_ref() {
             let (promise, resolver) = Promise::new(marker);
             f(internal_rpc, resolver);
-            promise.await?;
+            internal_rpc.await_reply(promise).await?;
         }
         Ok(true)
     }

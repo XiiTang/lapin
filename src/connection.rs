@@ -279,9 +279,16 @@ impl Connection {
     ///
     /// Sends `Connection.Close` to the broker and waits for `Connection.Close-Ok`.
     /// `reply_code` should be `200` and `reply_text` `"OK"` for a normal shutdown.
-    /// Returns an error if the connection is not in [`crate::ConnectionState::Connected`].
+    /// An admitted protocol rejection keeps its verdict and abandons its pending
+    /// close write. Otherwise the connection must be connected.
     pub async fn close(&self, reply_code: ReplyCode, reply_text: ShortString) -> Result<()> {
-        self.status.ensure_connected()?;
+        if let Some(error) = self.status.rejection() {
+            if self.status.errored() {
+                return Err(error);
+            }
+        } else {
+            self.status.ensure_connected()?;
+        }
         self.internal_rpc
             .close_connection_checked(reply_code, reply_text, 0, 0)
             .await
@@ -342,6 +349,7 @@ impl Connection {
             secret_update,
             frames.clone(),
             socket_state.handle(),
+            status.clone(),
         );
         let events = Events::new();
         events.bind(internal_rpc.handle());
@@ -597,6 +605,7 @@ mod tests {
             secret_update,
             frames.clone(),
             socket_state.handle(),
+            status.clone(),
         );
         let events = Events::new();
         events.bind(internal_rpc.handle());
@@ -899,6 +908,11 @@ mod tests {
         );
         assert!(!error.is_amqp_error());
 
+        // Peer Close is a separate connection: the rejected frame above already
+        // owns its connection's end, including all later peer frames.
+        let (conn, channels, _) = create_connection();
+        conn.closer.noop();
+        conn.configuration.negotiated_config.set_channel_max(4);
         let closed = channels.create(conn.closer.clone()).unwrap();
         closed.set_state(ChannelState::Connected);
         let pending = closed.register_publisher_confirm();
