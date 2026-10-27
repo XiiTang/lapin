@@ -83,13 +83,23 @@ impl<T> Completion<T> {
         promise
     }
 
-    pub(crate) fn rpc(marker: &str, status: crate::ConnectionStatus, scope: &crate::task_scope::TaskScope) -> (Self, PromiseResolver<T>)
-    where T: Send + 'static {
+    pub(crate) fn rpc(
+        marker: &str,
+        status: crate::ConnectionStatus,
+        scope: &crate::task_scope::TaskScope,
+        context: crate::frames::FrameErrorContext,
+        channel: crate::types::ChannelId,
+    ) -> (Self, PromiseResolver<T>)
+    where
+        T: Send + 'static,
+    {
         let (promise, resolver) = Self::new(marker);
-        let retirement: Arc<dyn crate::task_scope::RetiringReply> = Arc::new(ReplyRetirement(Arc::downgrade(&promise.shared)));
+        let retirement: Arc<dyn crate::task_scope::RetiringReply> =
+            Arc::new(ReplyRetirement(Arc::downgrade(&promise.shared)));
         {
             let mut state = promise.shared.lock_state();
             state.rejection = Some(status);
+            state.rpc_context = Some((context, channel));
             state.retirement = Some(retirement.clone());
         }
         scope.register_reply(retirement);
@@ -233,6 +243,7 @@ struct State<T> {
     closed: bool,
     sink: Option<CompletionSink<T>>,
     rejection: Option<crate::ConnectionStatus>,
+    rpc_context: Option<(crate::frames::FrameErrorContext, crate::types::ChannelId)>,
     retirement: Option<Arc<dyn crate::task_scope::RetiringReply>>,
     resolver_close: Option<Arc<ReceivedClose>>,
 }
@@ -242,7 +253,10 @@ type CompletionAction<T> = Option<(Option<CompletionSink<T>>, Result<T>)>;
 
 // Only resolver Drop and full scope retirement construct abandonment. A real
 // completed I/O error always stays Completed, even when its kind is BrokenPipe.
-enum ReplyOutcome<T> { Completed(Result<T>), Abandoned }
+enum ReplyOutcome<T> {
+    Completed(Result<T>),
+    Abandoned,
+}
 
 struct ReplyRetirement<T>(Weak<Shared<T>>);
 impl<T: Send + 'static> crate::task_scope::RetiringReply for ReplyRetirement<T> {
@@ -259,11 +273,30 @@ impl<T> State<T> {
     fn complete(&mut self, outcome: ReplyOutcome<T>) -> CompletionAction<T> {
         if self.completed {
             // A late result is dropped outside the mutex by the existing dispatcher.
-            return match outcome { ReplyOutcome::Completed(data) => Some((None, data)), ReplyOutcome::Abandoned => None };
+            return match outcome {
+                ReplyOutcome::Completed(data) => Some((None, data)),
+                ReplyOutcome::Abandoned => None,
+            };
         }
         let data = match outcome {
             ReplyOutcome::Completed(data) => data,
-            ReplyOutcome::Abandoned => Err(self.rejection.as_ref().and_then(crate::ConnectionStatus::rejection).unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "promise lost its last resolver before completion").into())),
+            ReplyOutcome::Abandoned => Err(self
+                .rejection
+                .as_ref()
+                .and_then(crate::ConnectionStatus::rejection)
+                .unwrap_or_else(|| {
+                    Error::from(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "promise lost its last resolver before completion",
+                    ))
+                    .with_remote_close(self.resolver_close.clone().or_else(
+                        || {
+                            self.rpc_context
+                                .as_ref()
+                                .and_then(|(context, channel)| context.remote_close(*channel))
+                        },
+                    ))
+                })),
         };
         self.completed = true;
         self.retirement.take();
@@ -291,6 +324,7 @@ impl<T> Shared<T> {
             closed: false,
             sink: None,
             rejection: None,
+            rpc_context: None,
             retirement: None,
             resolver_close: None,
         };

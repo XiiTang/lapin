@@ -1079,3 +1079,68 @@ above supersedes that fixture schedule. The first combined-run coordinator had
 a Python NameError and exited1 before invoking Cargo; the corrected command
 produced the combined result above. RabbitMQ workspace integration remains
 NOT RUN without a broker.
+
+## Reconcile W5d/W4d completion ownership with landed #378 (2026-10-27)
+
+Rebased the observer line onto 355458c7fd33f2bbd7e6de28b10b4898ad31284e.
+Keep #378's shared rejection admission, bounded Close write, genuine completed
+error precedence and #369's CloseOk-only poison admission. Ingress precedes the
+shutdown guard, which precedes channel receiver effects. Rejected Connection.Close
+keeps the observed envelope on the same original ProtocolViolation handed to the
+one reject_frame_error checkpoint; it does not queue the old unowned Close path.
+
+Owner decision: move the reply verdict from async await_reply to the completion
+owner. InternalRPCHandle::reply/reply_on privately construct the six RPC routes'
+Completion with the actual connection status, scope and existing FrameErrorContext
+(channel zero for connection operations, actual channel for Ack/Nack/Reject).
+Promise State::complete is the once-only decision checkpoint. Its private
+ReplyOutcome distinguishes Completed(Result<T>) from Abandoned. Only last-resolver
+Drop and full retirement construct Abandoned; only that variant reads the reserved
+rejection. Completed success and genuine errors, including BrokenPipe, pass unchanged.
+Ordinary abandonment retains its previous error and the original Close envelope.
+The retained FrameErrorContext also supplies facts when a reply is constructed after
+RPC exit, before any command can retain its envelope. No public Error variant changes.
+
+The existing TaskScope tracks weak reply-retirement registrations. Shared completion
+owns each live registration and releases it at completion; new registration prunes
+dead weak entries. The registry retains neither completed replies nor their payloads.
+Stop and last-guard release mark retirement under the scope mutex, then decide all
+remaining replies outside that mutex before reporting drained. Each decision takes
+the same promise completion mutex as a producer, so a completed result cannot be
+replaced. No sink runs under the scope/completion mutex. with_sink and map consume
+only the decided Result, synchronously and without a new task. await_reply is now a
+test-only plain wait with the original inter-poll schedule probe; it makes no verdict.
+
+Evidence: Darwin arm64, Rust 1.98.1, this patch on rebased tip 0bde3a3. All Cargo
+commands use build-slot, CARGO_INCREMENTAL=0 and this checkout's target.
+
+- Without owner-side reservation/registration, `cargo test --no-default-features
+  --features tokio,smol --locked --lib internal_rpc::tests::owner_ -- --nocapture`:
+  exit101, all four new receiver/sink matrix tests fail. Completed success, ordinary
+  error and genuine BrokenPipe are controls; abandonment returns BrokenPipe and
+  unresolved retirement fails the deterministic ready-result probe. Fixed source
+  was restored immediately; no sleep or timeout makes those failures pass.
+- `cargo test --no-default-features --features tokio,smol --locked --lib
+  internal_rpc::tests::`: exit0 three final runs, 14 tests each. The four #378
+  regressions keep their assertions; only construction plumbing uses the owner.
+  New matrices cover native Completion and with_sink/map, completed success/error,
+  genuine BrokenPipe, resolver loss, full retirement with a live resolver and
+  construction after retirement. The held producer proves stopping alone cannot
+  cancel a reply before its final task poll.
+- Combined `cargo test --no-default-features --features tokio,smol --locked --lib
+  --test connection_close --test remote_close_observer --test supplied_driver
+  --no-fail-fast`: exit0, 77+16+6+11=110 tests, zero ignored. Includes all #369/#378
+  actual-wire controls and W5d accepted/rejected observer schedules. Its initial
+  exit101 (76/77 library tests, every integration passing) exposed the after-exit
+  envelope ordering above; the unchanged assertion now passes.
+- `cargo build --no-default-features --features tokio,smol --locked`: exit0.
+- `cargo clippy --no-default-features --features tokio,smol --locked --lib --tests
+  -- -D warnings`: final exit0. Initial exit101 named two redundant qualifications
+  in channels.rs introduced by combining imports; corrected without a waiver.
+- `cargo fmt --all --check`: exit0.
+- `LAPIN_CODEGEN_DIR=src/generated cargo build --no-default-features --features
+  tokio,smol,codegen-internal --locked` and `rustfmt --edition 2024
+  src/generated/channel.rs`: exit0 each, generated output unchanged.
+- Initial compile exit101: two carried test fixtures lacked the new shared-status
+  constructor argument. Both now pass that same existing status, with no extra owner.
+  RabbitMQ workspace integration is not run here, as instructed for W5d without a broker.

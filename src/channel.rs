@@ -269,7 +269,10 @@ impl Channel {
     fn reject_connection_frame(&self, error: &Error, class_id: Identifier, method_id: Identifier) {
         error!(channel=%self.id, "Got a connection frame on, closing connection");
         #[cfg(test)]
-        self.close_dispatch.lock().unwrap().push((class_id, method_id));
+        self.close_dispatch
+            .lock()
+            .unwrap()
+            .push((class_id, method_id));
         let _ = self.reject_frame_error(0, error.clone(), class_id, method_id);
     }
 
@@ -672,10 +675,21 @@ impl Channel {
         class_id: Identifier,
         method_id: Identifier,
     ) -> Result<()> {
-        self.reject_frame_error(close_channel, Error::from(ErrorKind::ProtocolViolation(error)), class_id, method_id)
+        self.reject_frame_error(
+            close_channel,
+            Error::from(ErrorKind::ProtocolViolation(error)),
+            class_id,
+            method_id,
+        )
     }
 
-    fn reject_frame_error(&self, close_channel: ChannelId, error: Error, class_id: Identifier, method_id: Identifier) -> Result<()> {
+    fn reject_frame_error(
+        &self,
+        close_channel: ChannelId,
+        error: Error,
+        class_id: Identifier,
+        method_id: Identifier,
+    ) -> Result<()> {
         if !self.connection_status.admit_rejection(error.clone()) {
             return Err(self.connection_status.rejection().unwrap_or(error));
         }

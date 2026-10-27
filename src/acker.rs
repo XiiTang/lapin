@@ -131,7 +131,7 @@ impl Acker {
             return Promise::new_with_data(marker, Err(error));
         }
         if let Some(internal_rpc) = self.internal_rpc.as_ref() {
-            let (promise, resolver) = internal_rpc.reply(marker);
+            let (promise, resolver) = internal_rpc.reply_on(marker, self.channel_id);
             f(internal_rpc, resolver);
             return promise.map(marker, |()| true);
         }

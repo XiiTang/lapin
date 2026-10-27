@@ -52,8 +52,25 @@ pub(crate) struct InternalRPCHandle {
 
 impl InternalRPCHandle {
     // The promise owner decides cancellation before any read or sink delivery.
-    pub(crate) fn reply<T: Send + 'static>(&self, marker: &str) -> (Promise<T>, PromiseResolver<T>) {
-        Promise::rpc(marker, self.connection_status.clone(), &self.task_scope)
+    pub(crate) fn reply<T: Send + 'static>(
+        &self,
+        marker: &str,
+    ) -> (Promise<T>, PromiseResolver<T>) {
+        self.reply_on(marker, 0)
+    }
+
+    pub(crate) fn reply_on<T: Send + 'static>(
+        &self,
+        marker: &str,
+        channel: ChannelId,
+    ) -> (Promise<T>, PromiseResolver<T>) {
+        Promise::rpc(
+            marker,
+            self.connection_status.clone(),
+            &self.task_scope,
+            self.error_context.clone(),
+            channel,
+        )
     }
 
     #[cfg(test)]
@@ -64,19 +81,27 @@ impl InternalRPCHandle {
                 tests::after_pending_reply_poll(self);
             }
             result
-        }).await
+        })
+        .await
     }
 
     #[cfg(test)]
-    async fn close_connection_checked(&self, code: ReplyCode, text: ShortString, class: Identifier, method: Identifier) -> Result<()> {
+    async fn close_connection_checked(
+        &self,
+        code: ReplyCode,
+        text: ShortString,
+        class: Identifier,
+        method: Identifier,
+    ) -> Result<()> {
         self.set_connection_closing();
         tests::pause_between_close_commands(self).await;
-        self.enqueue_connection_close(code, text, class, method).await
+        self.enqueue_connection_close(code, text, class, method)
+            .await
     }
 
     #[cfg(test)]
     async fn create_channel(&self, closer: Arc<ConnectionCloser>) -> Result<Channel> {
-        self.create_channel_completion(closer).await
+        self.create_channel_completion(closer, None).await
     }
 
     pub(crate) fn basic_ack(
@@ -192,7 +217,13 @@ impl InternalRPCHandle {
         self.enqueue_connection_close(reply_code, reply_text, class_id, method_id)
     }
 
-    fn enqueue_connection_close(&self, reply_code: ReplyCode, reply_text: ShortString, class_id: Identifier, method_id: Identifier) -> Promise<()> {
+    fn enqueue_connection_close(
+        &self,
+        reply_code: ReplyCode,
+        reply_text: ShortString,
+        class_id: Identifier,
+        method_id: Identifier,
+    ) -> Promise<()> {
         let (promise, resolver) = self.reply("connection.close");
         self.send(InternalCommand::CloseConnection(
             reply_code,
@@ -1055,6 +1086,106 @@ mod tests {
         let error = handle.await_reply(promise).await.unwrap_err();
         assert!(matches!(error.kind(), ErrorKind::ProtocolViolation(cause)
             if cause.get_id() == 503));
+    }
+
+    async fn owner_completion_case(forward: bool, case: u8, after_retirement: bool) {
+        let handle = reserved_reply_handle();
+        if after_retirement {
+            handle.task_scope.stop();
+        }
+        let (native, resolver) = handle.reply::<u8>("owner-decided reply");
+        let mut output: std::pin::Pin<Box<dyn Future<Output = Result<u8>>>> = if forward {
+            let (send, recv) = tokio::sync::oneshot::channel();
+            drop(
+                native
+                    .map("mapped final reply", |value| value + 1)
+                    .with_sink(move |result| {
+                        send.send(result).unwrap();
+                    }),
+            );
+            Box::pin(async move { recv.await.unwrap() })
+        } else {
+            Box::pin(native)
+        };
+        let mut resolver = Some(resolver);
+        if !after_retirement {
+            assert!(
+                futures_lite::future::poll_once(output.as_mut())
+                    .await
+                    .is_none()
+            );
+            match case {
+                0 => resolver.as_ref().unwrap().resolve(7),
+                1 => resolver
+                    .as_ref()
+                    .unwrap()
+                    .reject(ErrorKind::MissingHeartbeatError.into()),
+                2 => resolver
+                    .as_ref()
+                    .unwrap()
+                    .reject(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into()),
+                3 => drop(resolver.take()),
+                4 => {
+                    let held = handle.task_scope.wrap(std::future::pending());
+                    handle.task_scope.stop();
+                    assert!(
+                        futures_lite::future::poll_once(output.as_mut())
+                            .await
+                            .is_none()
+                    );
+                    drop(held);
+                }
+                _ => unreachable!(),
+            }
+            handle.task_scope.stop();
+        }
+        assert!(handle.task_scope.is_finished());
+        let result = futures_lite::future::poll_once(output.as_mut())
+            .await
+            .expect("full retirement has decided the native completion without another task");
+        match case {
+            0 => assert_eq!(result.unwrap(), if forward { 8 } else { 7 }),
+            1 => assert!(matches!(
+                result.unwrap_err().kind(),
+                ErrorKind::MissingHeartbeatError
+            )),
+            2 => assert!(
+                matches!(result.unwrap_err().kind(), ErrorKind::IOError(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+            ),
+            3 | 4 => assert!(
+                matches!(result.unwrap_err().kind(), ErrorKind::ProtocolViolation(error) if error.get_id() == 503)
+            ),
+            _ => unreachable!(),
+        }
+        drop(resolver);
+    }
+
+    #[tokio::test]
+    async fn owner_native_completion_keeps_completed_results_and_reserved_abandonment() {
+        for case in 0..4 {
+            owner_completion_case(false, case, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_sink_and_map_keep_completed_results_and_reserved_abandonment() {
+        for case in 0..4 {
+            owner_completion_case(true, case, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_native_completion_settles_unresolved_and_late_retirement() {
+        for late in [false, true] {
+            owner_completion_case(false, 4, late).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_sink_and_map_settle_unresolved_and_late_retirement() {
+        for late in [false, true] {
+            owner_completion_case(true, 4, late).await;
+        }
     }
 
     #[test]

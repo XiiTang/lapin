@@ -36,6 +36,7 @@ impl Fixture {
             SecretUpdate::new(status.clone(), runtime, config.auth_provider.clone()),
             frames.clone(),
             socket.handle(),
+            status.clone(),
         );
         let handle = rpc.handle();
         handle

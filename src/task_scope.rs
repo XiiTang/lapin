@@ -21,7 +21,18 @@ struct State {
     retiring: bool,
     replies: Vec<Weak<dyn RetiringReply>>,
 }
-pub(crate) trait RetiringReply: Send + Sync { fn retire(&self); }
+impl State {
+    fn begin_retirement(&mut self) -> Option<Vec<Weak<dyn RetiringReply>>> {
+        if !self.stopped || self.active != 0 || self.retiring {
+            return None;
+        }
+        self.retiring = true;
+        Some(std::mem::take(&mut self.replies))
+    }
+}
+pub(crate) trait RetiringReply: Send + Sync {
+    fn retire(&self);
+}
 
 impl TaskScope {
     pub(crate) fn register_reply(&self, reply: Arc<dyn RetiringReply>) {
@@ -35,16 +46,12 @@ impl TaskScope {
         }
     }
 
-    fn retire_replies(&self) {
-        let replies = {
-            let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-            if !state.stopped || state.active != 0 || state.retiring { return; }
-            state.retiring = true;
-            std::mem::take(&mut state.replies)
-        };
+    fn finish_retirement(&self, replies: Vec<Weak<dyn RetiringReply>>) {
         // Never run completion sinks with the scope state lock held.
         for reply in replies {
-            if let Some(reply) = reply.upgrade() { reply.retire(); }
+            if let Some(reply) = reply.upgrade() {
+                reply.retire();
+            }
         }
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         state.retiring = false;
@@ -73,13 +80,15 @@ impl TaskScope {
         }
     }
     pub(crate) fn stop(&self) {
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .stopped = true;
+        let replies = {
+            let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.stopped = true;
+            state.begin_retirement()
+        };
         self.0.stopped.notify(usize::MAX);
-        self.retire_replies();
+        if let Some(replies) = replies {
+            self.finish_retirement(replies);
+        }
     }
     pub(crate) fn is_finished(&self) -> bool {
         let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -101,10 +110,14 @@ impl Drop for Guard {
     fn drop(&mut self) {
         let mut state = self.0.0.state.lock().unwrap_or_else(|e| e.into_inner());
         state.active -= 1;
-        let retired = state.stopped && state.active == 0;
-        if !retired && state.active == 0 { self.0.0.drained.notify_all(); }
+        let replies = state.begin_retirement();
+        if state.active == 0 && !state.retiring {
+            self.0.0.drained.notify_all();
+        }
         drop(state);
-        if retired { self.0.retire_replies(); }
+        if let Some(replies) = replies {
+            self.0.finish_retirement(replies);
+        }
     }
 }
 pub(crate) struct ScopedFuture {

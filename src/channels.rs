@@ -157,10 +157,10 @@ impl Channels {
             }
             // Routing can reject a Close before a generated receiver is reached.
             let close = match method {
-                AMQPClass::Connection(crate::protocol::connection::AMQPMethod::Close(close)) => {
+                AMQPClass::Connection(connection::AMQPMethod::Close(close)) => {
                     Some(RemoteClose::Connection(close))
                 }
-                AMQPClass::Channel(crate::protocol::channel::AMQPMethod::Close(close)) => {
+                AMQPClass::Channel(channel::AMQPMethod::Close(close)) => {
                     Some(RemoteClose::Channel(close))
                 }
                 _ => None,

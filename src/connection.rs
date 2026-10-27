@@ -336,7 +336,9 @@ impl Connection {
         } else {
             self.status.ensure_connected()?;
         }
-        Ok(self.internal_rpc.close_connection_checked_completion(reply_code, reply_text, 0, 0))
+        Ok(self
+            .internal_rpc
+            .close_connection_checked_completion(reply_code, reply_text, 0, 0))
     }
 
     /// Update the authentication secret (e.g. rotate an OAuth2 token).
