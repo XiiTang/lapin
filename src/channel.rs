@@ -622,6 +622,22 @@ impl Channel {
         properties: BasicProperties,
         publisher_confirms_result: Option<PublisherConfirm>,
     ) -> Result<Promise<PublisherConfirm>> {
+        let promise =
+            self.send_method_frame_with_body_completion(ctx, method, payload, properties)?;
+        let returned_messages = self.returned_messages.clone();
+        Ok(promise.map(ctx, move |()| {
+            publisher_confirms_result
+                .unwrap_or_else(|| PublisherConfirm::not_requested(returned_messages))
+        }))
+    }
+
+    fn send_method_frame_with_body_completion(
+        &self,
+        ctx: &'static str,
+        method: AMQPClass,
+        payload: &[u8],
+        properties: BasicProperties,
+    ) -> Result<Promise<()>> {
         let class_id = method.get_amqp_class_id();
         let header = AMQPContentHeader {
             class_id,
@@ -651,11 +667,7 @@ impl Channel {
             self.frames.push_frames(self.id, frames, resolver);
         }
         self.wake();
-        let returned_messages = self.returned_messages.clone();
-        Ok(promise.map(ctx, move |()| {
-            publisher_confirms_result
-                .unwrap_or_else(|| PublisherConfirm::not_requested(returned_messages))
-        }))
+        Ok(promise)
     }
 
     pub(crate) fn report_protocol_violation(

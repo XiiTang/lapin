@@ -524,6 +524,7 @@
     },
     "publish": {
       "metadata": {
+        "split_completion": true,
         "carry_headers": true,
         "extra_args": [
           {

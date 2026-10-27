@@ -159,6 +159,31 @@ impl Channel {
   }
   {{/if ~}}
 
+  {{#if method.metadata.split_completion ~}}
+  /// Admit a publication and transfer its independent write and confirm receivers.
+  /// A write failure cannot drop the individual broker confirmation into the
+  /// legacy aggregate drain. Install both sinks at admission.
+  pub fn basic_publish_split_completion(
+    &self, exchange: ShortString, routing_key: ShortString,
+    options: BasicPublishOptions, payload: &[u8], properties: BasicProperties,
+  ) -> Result<(crate::Completion<()>, crate::Completion<Confirmation>)> {
+    if !self.status.connected() {
+      return Err(self.status.state_error("basic.publish"));
+    }
+    let confirm = self.before_basic_publish()
+      .unwrap_or_else(|| PublisherConfirm::not_requested(self.returned_messages.clone()))
+      .into_completion();
+    let BasicPublishOptions { mandatory, immediate } = options;
+    let method = AMQPClass::Basic(protocol::basic::AMQPMethod::Publish(protocol::basic::Publish {
+      exchange, routing_key, mandatory, immediate,
+    }));
+    let written = self.send_method_frame_with_body_completion(
+      "basic.publish", method, payload, properties,
+    )?;
+    Ok((written, confirm))
+  }
+  {{/if ~}}
+
   {{#if method.s2c ~}}
   fn receive_{{snake class.name false}}_{{snake method.name false}}(&self, method: protocol::{{snake class.name}}::{{camel method.name}}) -> Result<()> {
   {{#if method.is_reply ~}}
