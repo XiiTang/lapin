@@ -404,14 +404,6 @@ impl Channel {
         )
     }
 
-    /// Transfer abandoned publisher-confirm receivers without flattening Ack,
-    /// Nack, errors or returned messages. Each receiver is removed exactly once.
-    /// The legacy `wait_for_confirms` drain consumes these same receivers.
-    #[must_use]
-    pub fn take_dropped_confirms(&self) -> Vec<crate::Completion<Confirmation>> {
-        self.returned_messages.take_dropped_confirms()
-    }
-
     /// Wait for all outstanding publisher confirms and return any returned messages.
     ///
     /// Blocks until every [`PublisherConfirm`] produced by prior
@@ -428,7 +420,6 @@ impl Channel {
     }
 
     /// Admit the legacy confirm drain and expose its native completion receiver.
-    /// Use `take_dropped_confirms` for individual Ack/Nack/error ownership.
     pub fn wait_for_confirms_completion(&self) -> crate::Completion<Vec<BasicReturnMessage>> {
         if let Some(last_pending) = self.acknowledgements.get_last_pending() {
             trace!("Waiting for pending confirms");

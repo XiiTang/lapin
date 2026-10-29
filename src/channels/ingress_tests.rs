@@ -199,12 +199,12 @@ fn freeze_seals_ingress_and_preserves_buffered_consumer_and_get_results() {
             "post-freeze delivery reached the consumer"
         );
     }
-    let message = get.try_take().unwrap().unwrap().unwrap();
+    let message = get.try_wait().unwrap().unwrap().unwrap();
     assert_eq!(message.delivery_tag, 21);
     assert_eq!(message.generation, 0);
     assert_eq!(message.data, b"get");
     assert!(
-        later_get.try_take().is_none(),
+        later_get.try_wait().is_none(),
         "post-freeze GetOk completed a get"
     );
     assert_eq!(frozen.get(&first.id()), Some(&21));
@@ -214,7 +214,7 @@ fn freeze_seals_ingress_and_preserves_buffered_consumer_and_get_results() {
     channels.set_connection_error(ErrorKind::MissingHeartbeatError.into());
     assert_eq!(message.data, b"get");
     assert!(
-        matches!(later_get.try_take(), Some(Err(error)) if matches!(error.kind(), ErrorKind::MissingHeartbeatError))
+        matches!(later_get.try_wait(), Some(Err(error)) if matches!(error.kind(), ErrorKind::MissingHeartbeatError))
     );
     assert_eq!(channels.freeze_ingress(), frozen);
     drop(confirms);
@@ -269,7 +269,7 @@ fn freeze_counts_partial_get_and_consume_tags_and_keeps_error_completion() {
         .handle_frame(AMQPFrame::Body(second.id(), vec![3, 4]))
         .unwrap();
     assert!(next(&mut consumer).is_pending());
-    assert!(get.try_take().is_none());
+    assert!(get.try_wait().is_none());
     assert_eq!(frozen.get(&first.id()), Some(&13));
     assert_eq!(frozen.get(&second.id()), Some(&25));
     drop(get);
@@ -358,7 +358,7 @@ fn freeze_after_candidate_failure_keeps_its_tags_and_complete_data() {
     assert!(
         matches!(next(&mut consumer), Poll::Ready(Some(Err(error))) if matches!(error.kind(), ErrorKind::MissingHeartbeatError))
     );
-    let message = get.try_take().unwrap().unwrap().unwrap();
+    let message = get.try_wait().unwrap().unwrap().unwrap();
     assert_eq!(message.delivery_tag, 15);
     assert_eq!(message.generation, 0);
     assert_eq!(message.data, b"candidate get");

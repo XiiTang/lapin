@@ -48,27 +48,6 @@ impl<T> Completion<T> {
         self
     }
 
-    /// Close the receiver and take an already committed result atomically.
-    /// A result arriving later goes to the installed sink. Do not poll again.
-    #[must_use]
-    pub fn close_and_take(&self) -> Option<Result<T>> {
-        let (data, sink) = {
-            let mut state = self.shared.lock_state();
-            state.closed = true;
-            let data = state.data.take();
-            let sink = data.as_ref().and_then(|_| state.sink.take());
-            (data, sink)
-        };
-        drop(sink);
-        data
-    }
-
-    /// Take a completed result without closing a still-pending receiver.
-    #[must_use]
-    pub fn try_take(&self) -> Option<Result<T>> {
-        self.shared.take()
-    }
-
     pub(crate) fn map<U>(
         self,
         marker: &str,
@@ -509,20 +488,19 @@ mod tests {
     }
 
     #[test]
-    fn close_then_take_keeps_the_committed_answer_and_routes_only_late_answers() {
+    fn taken_completion_keeps_the_answer_and_drop_routes_pending_answers() {
         for ready in [false, true] {
-            let (promise, resolver) = Completion::new("close then take");
+            let (promise, resolver) = Completion::new("take or drop");
             let (send, recv) = std::sync::mpsc::channel();
             let promise = promise.with_sink(move |result| send.send(result).unwrap());
             if ready {
                 resolver.resolve(7);
-                assert!(matches!(promise.close_and_take(), Some(Ok(7))));
+                assert!(matches!(futures_lite::future::block_on(promise), Ok(7)));
             } else {
-                assert!(promise.close_and_take().is_none());
+                drop(promise);
                 resolver.resolve(7);
                 assert!(matches!(recv.try_recv(), Ok(Ok(7))));
             }
-            drop(promise);
             drop(resolver);
             assert!(recv.try_recv().is_err());
         }

@@ -542,19 +542,16 @@ CARGO_INCREMENTAL=0 and this worktree's target.
 - `cargo test --no-default-features --features tokio,smol --locked
   --no-fail-fast`: **0**, 73 unit/integration tests and seven doctests, zero
   ignored, with isolated owned RabbitMQ 4.3.5. #369's regressions are unchanged.
-## Preserve native completion and abandoned confirm ownership (plan W4d)
+## Preserve native completion ownership (plan W4d)
 
 Rule 7 requires the owner of an untaken native answer to retain its disposition.
 At the preceding fork revision `f34c12f`, `src/promise.rs:24-30` only logged receiver
 drop; `Shared::set` stored an answer in private receiver state. Dropping an outer
 RPC/get future could therefore discard a completed result or its later answer.
-`src/returned_messages.rs:126-150` flattened abandoned Ack/Nack values to returned
-messages, losing their distinction and errors, and `src/acknowledgement.rs:176-183`
-cleared abandoned confirms when the channel failed.
 
-The native receiver is now public as `Completion<T>`. Its `with_sink`,
-`close_and_take` and `try_take` transfer the actual typed result. Receiver drop
-closes and takes under the same private state mutex used by `State::complete`;
+The native receiver is now public as `Completion<T>`. Its Future and `with_sink`
+transfer the actual typed result. Receiver drop closes and takes under the same
+private state mutex used by `State::complete`;
 that checkpoint owns explicit success/error and last-resolver-drop completion.
 Only the receiver or its sink can take an answer. The sink runs once, outside
 the completion mutex; it must hand work to the embedding owner's queue without
@@ -567,10 +564,8 @@ Channel RPCs expose synchronous `*_completion` admission methods generated from
 the same template as their unchanged lazy async entry points, including
 `basic_get_completion` and `basic_publish_completion`. The publish write's
 completion hands over its `PublisherConfirm`; `PublisherConfirm::into_completion`
-then transfers the broker-confirm receiver. `Channel::take_dropped_confirms`
-transfers abandoned native receivers, pending or ready, preserving Ack, Nack,
-NotRequested, errors, returned bodies and reservations. The legacy explicit
-`wait_for_confirms` drain retains its returned-message API. Connection RPCs,
+then transfers the broker-confirm receiver. The legacy explicit
+`wait_for_confirms` drain retains its upstream returned-message API. Connection RPCs,
 supplied-stream/connector handshakes and Acker RPCs expose the same typed native
 receiver through their `*_completion` entry points. Pre-admission errors are
 returned directly; the sink owns only an admitted operation's untaken result.
@@ -581,12 +576,7 @@ maintenance tasks keep their existing owner and scheduling.
 
 Regression evidence (macOS arm64):
 
-- `cargo test --locked --no-default-features --features tokio --lib
-  dropped_confirms_retain_ack_nack_and_error_for_their_owner` with only the test
-  added to `f34c12f` fails its retained-error assertion (exit 101); the patch
-  preserves all three outcomes both before and after receiver drop, and also
-  NotRequested.
-- `promise::tests` forces send-before-drop, drop-before-send, close-then-take,
+- `promise::tests` forces send-before-drop, drop-before-send, take-before-drop,
   concurrent send/drop, explicit error and last-resolver loss. It verifies one
   handoff and that the sink runs outside the completion mutex.
 - `channel::completion_tests` drives actual expected-reply dispatch, complete
@@ -1233,3 +1223,46 @@ the negotiated maximum before constructing the native channels. The final run
 above covers both corrections. Initial generation launches before this source
 compiled were stopped in the slot wrapper (exit 143): one had an incorrect PATH,
 and the corrected launch waited behind a lane. Neither ran Cargo.
+
+## Remove unused confirmation drain and completion probes (plan M27/L17)
+
+W14c uses W4d's individual split write/confirm receivers. The second abandoned
+confirmation drain and the public Completion close/take probes had no callers
+in Boundless at f625bc9d or land/w17 b95cda9e; current main d49d24a8 was also
+checked. They and their dedicated assertions are removed. Native ingress tests
+use the existing private probe; the completion arbitration test awaits its ready
+answer through Future and drops its pending receiver.
+
+The legacy returned-message path now matches upstream v4.11.0 (0dc84fc1):
+registration processes an already-ready confirmation into returned messages,
+retains only pending confirmations for wait_for_confirms, and channel error
+clears abandoned receivers after rejecting pending resolvers. Receive-budget
+reservations and payload-free logging remain the only differences in
+returned_messages.rs. Acknowledgement reset still rejects the last waiter before
+reusing tags. Split write/confirm admission and tag correlation are unchanged;
+their individual receivers never enter this legacy drain. Error completion,
+last-resolver drop and receiver Drop/sink arbitration still share the private
+State::complete checkpoint. No new completion, retry or recovery path is added.
+
+Validation on Darwin arm64, all Cargo commands through build-slot, with
+--locked --no-default-features --features tokio,smol and incremental configuration
+unset:
+
+- `cargo test --lib -- acknowledgement::tests:: promise::tests::
+  channel::completion_tests:: channels::ingress_tests:: internal_rpc::tests::
+  task_scope::tests::`: exit 0, 37 passed. Retained controls cover Ack/Nack,
+  returned-body reservations, independent write failures, generation refusal,
+  resolver loss, committed errors and one sink handoff.
+- `cargo test --test supplied_driver --test connection_close
+  --test remote_close_observer --no-fail-fast`: exit 0, 33 passed.
+- `cargo test --test publisher_confirms -- connection`: exit 0, 1 passed against
+  an owned isolated RabbitMQ 4.3.5; includes the legacy wait_for_confirms path.
+- `cargo check --all-targets` and `cargo clippy --all-targets -- -D warnings`:
+  exit 0 each. No lint suppression.
+- `cargo fmt --all`, `cargo fmt --all --check` and `git diff --check`: exit 0
+  each. Templates and generated source are unchanged.
+
+Initial unit/integration/check/Clippy attempts exited 101 before compilation:
+the machine's sccache rejects an explicitly set CARGO_INCREMENTAL=1. Retrying
+with it unset, as the build guidance permits, produced the passing results above.
+The Boundless pin update remains deferred until W17 lands.

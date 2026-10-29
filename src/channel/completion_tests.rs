@@ -195,7 +195,6 @@ fn confirm_completion_keeps_ack_nack_returned_message_and_error() {
                 assert_eq!(message.data, [1, 2, 3, 4]);
             }
             assert!(recv.try_recv().is_err());
-            assert!(channel.take_dropped_confirms().is_empty());
         }
     }
 }
@@ -221,19 +220,14 @@ fn abandoned_publish_write_hands_its_confirm_to_the_owner() {
         frame.into_serialized_frame(1).1.resolve();
     }
     let confirm = recv.try_recv().unwrap().unwrap();
-    drop(confirm);
-    let mut confirms = channel.take_dropped_confirms();
-    assert_eq!(confirms.len(), 1);
     let (send, recv) = mpsc::channel();
     drop(
-        confirms
-            .pop()
-            .unwrap()
+        confirm
+            .into_completion()
             .with_sink(move |result| send.send(result).unwrap()),
     );
     channel.acknowledgements.nack(1).unwrap();
     assert!(matches!(recv.try_recv(), Ok(Ok(Confirmation::Nack(None)))));
-    assert!(channel.take_dropped_confirms().is_empty());
 }
 
 #[test]
@@ -316,7 +310,6 @@ fn split_publish_keeps_confirm_on_write_failure() {
                     }
                     // The legacy consumer cannot take the split owner's verdict or return.
                     assert!(channel.returned_messages.drain().is_empty());
-                    assert!(channel.take_dropped_confirms().is_empty());
                     let confirmation = confirm_recv.try_recv().unwrap().unwrap();
                     assert_eq!(confirmation.is_ack(), ack);
                     assert_eq!(confirmation.is_nack(), !ack);
@@ -414,7 +407,6 @@ async fn split_publish_generation_refusal_retires_its_confirm_registration() {
         pending.await.unwrap_err().kind(),
         ErrorKind::StaleGeneration
     ));
-    assert!(channel.take_dropped_confirms().is_empty());
     assert!(frames.pop(true).is_none());
     handle.task_scope.stop();
 }
