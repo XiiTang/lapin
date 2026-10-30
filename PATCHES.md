@@ -288,7 +288,8 @@ complete_pending_before loop cannot return its error while it owns the pending
 map; an empty set succeeds, so that is not a reproduced rejection instance.
 Automatic connection/channel cleanup, caller-requested closes, parse/size
 errors and invalid connection states do not return ProtocolViolation after
-requesting a local close and are outside this class.
+requesting a local close. The missed fatal-error publication path for those
+errors is covered by the W1-D2 Q5 follow-up below.
 
 The checkpoint is shared ConnectionStatus shutdown ownership. Channels::handle_frame
 holds its private serialization guard before entering any channel receive lock;
@@ -374,6 +375,62 @@ An initial added fixture incorrectly expected multiple Ack/Nack of an empty set
 to reject and timed out (portable module command **101**); correcting that
 fixture to exercise actual rejection paths passed the narrow rerun (**0**) and
 the full suite above. No product assertion was weakened.
+
+### #378 missed fatal-error publication path (W1-D2 Q5), 2026-10-30
+
+Base: `202997c40025cc56fc5cf8c639c6a158705a8e3a`. Class: a fatal connection
+error is replaced by `ConnectionAborted`. Non-rejection fatal receive errors
+(`ResourceLimitExceeded` and `FrameTooLarge`) still queued SetConnectionError
+through InternalRPC after stopping I/O. If the actor had not run before
+IoLoop::drop, the fork's synchronous fallback published Aborted and canceled the
+same RPC scope. First-error retention then made the wrong cause observable to a
+pending Get, the native error event and Boundless's canonical physical end.
+The oversized-content and oversized-frame Boundless effects reproduced this at
+the unchanged pin; no successful baseline sample is claimed as a reproduction.
+
+IoLoop::critical_error now always enters Channels::set_connection_error
+synchronously in its non-recovery fatal branch. The existing shared
+ConnectionStatus shutdown guard remains the checkpoint. The private single
+fatal disposition cannot queue this publication after I/O disposal anymore.
+There is no new owner, state, callback, carrier or recovery. The deferred first
+ProtocolViolation/local Close-write attempt and the recoverable-error branch
+are unchanged; drop and explicit stop keep their existing fallback.
+
+Upstream v4.11.0 (`0dc84fc1`) queues the fatal error through InternalRPC on this
+path. Upstream has no fork IoLoop::drop fan-out that can publish a competing
+Aborted and cancel that task. Our supplied/scoped-driver drop fallback is
+required to settle native waiters on abandonment, so this fork must publish the
+actual fatal cause through its existing synchronous shutdown checkpoint before
+retiring I/O, rather than copy upstream's asynchronous route on this branch.
+
+The existing internal_rpc::tests::frame_rejection_keeps_its_verdict_until_the_close_write_settles
+checkpoint test retains its six rejection/write/competing-shutdown schedules.
+Two additional cases publish ResourceLimitExceeded and FrameTooLarge through
+Channels::set_connection_error before polling the real RPC actor's competing
+Aborted command. The native event and frame poison must keep the typed original
+verdict and publish one end. No private API is widened or test hook added.
+Boundless's two real-peer effects cover the critical_error route and separately
+assert the original Get result, canonical physical terminal and close share
+that failure identity.
+
+Validation (macOS arm64, on the base above with this patch): all commands use
+build-slot, CARGO_INCREMENTAL unset and this checkout's own target.
+
+- `cargo test --no-default-features --features tokio,smol --lib --locked --
+  internal_rpc::tests::`: **0**, all 14 tests, including the extended checkpoint.
+- `cargo test --no-default-features --features tokio,smol --locked --test
+  connection_close --test supplied_driver`: **0**, all 16 + 11 tests, including
+  held/rejected Close writes, EOF, competing shutdown and supplied-driver stop.
+- `cargo clippy --no-default-features --features tokio,smol --lib --tests
+  --locked -- -D warnings`: **0**.
+- `cargo fmt --all --check`: **0**.
+
+An initial test-only relocation to io_loop::tests failed compilation (**101**)
+because InternalRPC::run is private. It is not a defect reproduction. That
+relocation was discarded; neither private API is widened in this patch.
+The prior Boundless oversized-content/frame wrong-result runs are the observed
+regression evidence; the real-peer reruns against this pin are recorded by the
+Boundless package.
 
 ### #378 review corrections (F1–F3), 2026-10-27
 

@@ -389,11 +389,7 @@ impl<
             resolver.reject(error.clone());
         }
         self.stop();
-        if self.rejected_frame.is_some() {
-            self.channels.set_connection_error(error.clone());
-        } else {
-            self.internal_rpc.set_connection_error(error.clone());
-        }
+        self.channels.set_connection_error(error.clone());
         self.clear_serialized_frames(error.clone());
         Err(error)
     }

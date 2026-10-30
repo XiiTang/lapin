@@ -1299,7 +1299,7 @@ mod tests {
     #[tokio::test]
     async fn frame_rejection_keeps_its_verdict_until_the_close_write_settles() {
         use futures_lite::StreamExt;
-        for competing in 0..6 {
+        for competing in 0..8 {
             let runtime = Runtime::tokio_current();
             let uri = crate::uri::AMQPUri::default();
             let config = crate::Configuration::new(&uri, crate::ConnectionProperties::default());
@@ -1331,6 +1331,65 @@ mod tests {
                 frames.clone(),
                 events,
             );
+            if competing >= 6 {
+                let error: Error = if competing == 6 {
+                    ErrorKind::ResourceLimitExceeded {
+                        limit: crate::ResourceLimit::MessageBytes,
+                        maximum: 32,
+                        observed: Some(33),
+                    }
+                } else {
+                    ErrorKind::FrameTooLarge {
+                        maximum: 8192,
+                        observed: 8193,
+                    }
+                }
+                .into();
+                // Fatal I/O publication uses this same synchronous checkpoint
+                // before the owner can drop and supply its Aborted fallback.
+                channels.set_connection_error(error);
+                handle.set_connection_error(
+                    std::io::Error::from(std::io::ErrorKind::ConnectionAborted).into(),
+                );
+                let mut run = Box::pin(rpc.run(channels));
+                assert!(
+                    futures_lite::future::poll_once(run.as_mut())
+                        .await
+                        .is_none()
+                );
+                assert!(status.errored());
+                let crate::Event::Error(actual) = listener.next().await.unwrap() else {
+                    panic!("expected fatal error event");
+                };
+                for retained in [actual, frames.poison().unwrap()] {
+                    if competing == 6 {
+                        assert!(matches!(
+                            retained.kind(),
+                            ErrorKind::ResourceLimitExceeded {
+                                limit: crate::ResourceLimit::MessageBytes,
+                                maximum: 32,
+                                observed: Some(33),
+                            }
+                        ));
+                    } else {
+                        assert!(matches!(
+                            retained.kind(),
+                            ErrorKind::FrameTooLarge {
+                                maximum: 8192,
+                                observed: 8193,
+                            }
+                        ));
+                    }
+                }
+                assert!(
+                    futures_lite::future::poll_once(listener.next())
+                        .await
+                        .is_none()
+                );
+                handle.stop();
+                run.await;
+                continue;
+            }
             let error: Error = ErrorKind::ProtocolViolation(crate::protocol::AMQPError::new(
                 crate::protocol::AMQPHardError::COMMANDINVALID.into(),
                 "rejected frame".into(),
