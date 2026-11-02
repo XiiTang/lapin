@@ -1000,12 +1000,14 @@ impl Channel {
                 let mechanism = auth_provider.mechanism();
                 let locale = configuration.amqp_locale.clone();
 
-                if !method
+                // Boundless: an unoffered mechanism fails the handshake, through
+                // the provider-failure exit below, before anything is sent.
+                let offered = method
                     .mechanisms
                     .to_string()
                     .split_whitespace()
-                    .any(|m| m == mechanism.as_str())
-                {
+                    .any(|m| m == mechanism.as_str());
+                if !offered {
                     error!(%mechanism, "unsupported mechanism");
                 }
                 if !method
@@ -1055,7 +1057,14 @@ impl Channel {
                     resolver: Some(resolver.clone()),
                     status: self.connection_status.clone(),
                 };
+                let unoffered = (!offered).then(|| ErrorKind::UnsupportedMechanism {
+                    mechanism: mechanism.clone(),
+                    offered: method.mechanisms.clone(),
+                });
                 self.internal_rpc.spawn(async move {
+                    if let Some(unoffered) = unoffered {
+                        return guard.finish(Err(unoffered.into()));
+                    }
                     let auth_starter = match auth_provider.auth_starter_async().await {
                         Ok(response) => response,
                         Err(message) => {

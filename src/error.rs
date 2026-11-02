@@ -1,5 +1,8 @@
 use crate::{
-    ChannelState, ConnectionState, notifier::Notifier, protocol::AMQPError, types::ChannelId,
+    ChannelState, ConnectionState,
+    notifier::Notifier,
+    protocol::AMQPError,
+    types::{ChannelId, LongString, ShortString},
 };
 use amq_protocol::{
     frame::{GenError, ParserError, ProtocolVersion},
@@ -89,6 +92,14 @@ pub enum ErrorKind {
     ChannelsLimitReached,
     /// The server only supports an AMQP version that this client does not speak.
     InvalidProtocolVersion(ProtocolVersion),
+    /// The server's Connection.Start does not offer the configured SASL
+    /// mechanism; nothing was sent in answer.
+    UnsupportedMechanism {
+        /// The mechanism the authentication provider uses.
+        mechanism: ShortString,
+        /// The `mechanisms` field of the server's Connection.Start, as received.
+        offered: LongString,
+    },
 
     /// An operation was attempted on a channel number that does not exist.
     InvalidChannel(ChannelId),
@@ -249,6 +260,7 @@ impl Error {
         match self.kind() {
             ErrorKind::ChannelsLimitReached => false,
             ErrorKind::InvalidProtocolVersion(_) => false,
+            ErrorKind::UnsupportedMechanism { .. } => false,
 
             ErrorKind::InvalidChannel(_) => true,
             ErrorKind::InvalidChannelState(..) => true,
@@ -288,6 +300,9 @@ impl fmt::Display for Error {
             ),
             ErrorKind::InvalidProtocolVersion(version) => {
                 write!(f, "the server only supports AMQP {version}")
+            }
+            ErrorKind::UnsupportedMechanism { mechanism, .. } => {
+                write!(f, "the server does not offer SASL mechanism {mechanism}")
             }
 
             ErrorKind::InvalidChannel(channel) => write!(f, "invalid channel: {channel}"),
@@ -374,6 +389,16 @@ impl PartialEq for Error {
             (InvalidProtocolVersion(left_inner), InvalidProtocolVersion(right_version)) => {
                 left_inner == right_version
             }
+            (
+                UnsupportedMechanism {
+                    mechanism: left_mechanism,
+                    offered: left_offered,
+                },
+                UnsupportedMechanism {
+                    mechanism: right_mechanism,
+                    offered: right_offered,
+                },
+            ) => left_mechanism == right_mechanism && left_offered == right_offered,
 
             (InvalidChannel(left_inner), InvalidChannel(right_inner)) => left_inner == right_inner,
             (

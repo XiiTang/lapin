@@ -1323,3 +1323,51 @@ Initial unit/integration/check/Clippy attempts exited 101 before compilation:
 the machine's sccache rejects an explicitly set CARGO_INCREMENTAL=1. Retrying
 with it unset, as the build guidance permits, produced the passing results above.
 The Boundless pin update remains deferred until W17 lands.
+
+## Refuse a SASL mechanism the server does not offer (Boundless #461)
+
+Connection.Start lists the SASL mechanisms the server accepts. lapin compared
+the provider's mechanism with that list and only logged a mismatch
+(`unsupported mechanism`), then sent Start-Ok with the unoffered mechanism. The
+server then closed the connection, and the caller saw a bare I/O abort with
+nothing saying which capability was missing.
+
+The patch keeps upstream's comparison unchanged: a whitespace split with an
+exact match, in `Channel::on_connection_start_received`. Only the outcome
+changes. On a mismatch, the spawned authentication task returns
+`ErrorKind::UnsupportedMechanism { mechanism, offered }` through
+`AuthenticationGuard::finish` before it asks the provider. This is the same
+exit as a provider's `AuthProviderError`. No Start-Ok is sent, and the
+connection ends as it does on a provider refusal. `offered` is the Start's
+`mechanisms` field as received. `Display` names only the configured mechanism,
+because peer text stays out of `Display`. The variant is not recoverable, and
+`PartialEq` compares both fields.
+
+What upstream and mature clients do at this point:
+- **Upstream:** lapin v4.11.0 (the base) and upstream `main` at v4.12.3
+  (`src/channel.rs:800-807`) still log only. No upstream issue or PR covers
+  this.
+- **Mature clients:** all refuse before Start-Ok.
+  - amqp091-go `openStart` returns `ErrSASL`.
+  - rabbitmq-java-client `AMQConnection.start` and rabbitmq-dotnet-client
+    `GetAuthMechanismFactory` throw `IOException("No compatible
+    authentication mechanism found …")`.
+  - pika `_get_credentials` raises `AuthenticationError`.
+  - amqplib `onStart` bails with "SASL mechanism … is not provided by the
+    server".
+
+Regression: `an_unoffered_mechanism_fails_the_handshake_before_start_ok` in
+`tests/supplied_driver.rs`. A scripted Start offers only `EXTERNAL` to a PLAIN
+provider whose starter panics. The test asserts the typed error and its
+`Display`, and that only the 8-byte protocol header was written.
+
+Validation on Darwin arm64, through build-slot, with `--locked
+--no-default-features --features tokio`:
+- `cargo test --lib --test supplied_driver --test connection_retry`: exit 0;
+  78 unit, 12 supplied-driver and 3 retry tests passed.
+- Negative control, with `src/channel.rs` reverted and the new variant kept:
+  `cargo test --test supplied_driver an_unoffered_mechanism` exited 101. The
+  provider was asked, and Start-Ok was written.
+- `cargo clippy --lib --test supplied_driver --test connection_retry -- -D
+  warnings`: exit 0.
+- `cargo fmt --all --check`: exit 0.

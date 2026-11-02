@@ -266,6 +266,7 @@ struct StartStream {
     read_waker: Option<std::task::Waker>,
     eof_after_start: bool,
     close_observed: Option<Arc<AtomicBool>>,
+    written: Arc<AtomicUsize>,
 }
 impl StartStream {
     fn new() -> Self {
@@ -289,6 +290,7 @@ impl StartStream {
             read_waker: None,
             eof_after_start: false,
             close_observed: None,
+            written: Arc::default(),
         }
     }
 }
@@ -324,6 +326,7 @@ impl AsyncWrite for StartStream {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         self.header_sent = true;
+        self.written.fetch_add(bytes.len(), Ordering::SeqCst);
         if let Some(waker) = self.read_waker.take() {
             waker.wake();
         }
@@ -424,6 +427,52 @@ async fn authentication_failure_resolves_waiter_without_waiting_for_server() {
     let _ = tokio::task::spawn_blocking(move || owner.join())
         .await
         .unwrap();
+}
+
+/// A PLAIN provider the server's Start (offering only EXTERNAL) does not
+/// support: it is never asked.
+struct UnofferedAuth;
+impl AuthProvider for UnofferedAuth {
+    fn mechanism(&self) -> lapin::types::ShortString {
+        "PLAIN".into()
+    }
+    fn auth_starter(&self) -> Result<lapin::types::LongString, String> {
+        panic!("an unoffered mechanism must not be started")
+    }
+}
+#[tokio::test]
+async fn an_unoffered_mechanism_fails_the_handshake_before_start_ok() {
+    let stream = StartStream::new();
+    let written = stream.written.clone();
+    let (owner, handshake) = Connection::from_stream(
+        "amqp://invalid.invalid/%2f".parse().unwrap(),
+        Runtime::tokio_current(),
+        stream,
+        ConnectionProperties::default().with_auth_provider(UnofferedAuth),
+    )
+    .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(3), handshake)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        error,
+        lapin::Error::from(lapin::ErrorKind::UnsupportedMechanism {
+            mechanism: "PLAIN".into(),
+            offered: "EXTERNAL".into(),
+        })
+    );
+    assert_eq!(
+        error.to_string(),
+        "the server does not offer SASL mechanism PLAIN"
+    );
+    owner.stop();
+    until(|| owner.is_finished()).await;
+    let _ = tokio::task::spawn_blocking(move || owner.join())
+        .await
+        .unwrap();
+    // Only the protocol header was written: no Start-Ok.
+    assert_eq!(written.load(Ordering::SeqCst), 8);
 }
 
 #[tokio::test]
