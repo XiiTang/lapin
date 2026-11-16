@@ -746,9 +746,13 @@ impl Channel {
             start_hook_res,
         )
     }
-    /// Admit a publication and transfer its independent write and confirm receivers.
-    /// A write failure cannot drop the individual broker confirmation into the
-    /// legacy aggregate drain. Install both sinks at admission.
+    /// Admit a publication: install `confirmed` as the sink of its individual
+    /// broker confirmation, then send it and return its write receiver.
+    /// A write failure cannot drop the confirmation into the legacy aggregate
+    /// drain. The sink is installed after the confirmation is registered and
+    /// before the frames are queued, so the broker cannot confirm before it
+    /// exists: an Ack or Nack reaches it on the I/O thread in wire order, before
+    /// a later frame such as a Connection.Close is processed.
     pub fn basic_publish_split_completion(
         &self,
         exchange: ShortString,
@@ -756,14 +760,17 @@ impl Channel {
         options: BasicPublishOptions,
         payload: &[u8],
         properties: BasicProperties,
-    ) -> Result<(crate::Completion<()>, crate::Completion<Confirmation>)> {
+        confirmed: impl FnOnce(Result<Confirmation>) + Send + 'static,
+    ) -> Result<crate::Completion<()>> {
         if !self.status.connected() {
             return Err(self.status.state_error("basic.publish"));
         }
-        let confirm = self
-            .before_basic_publish()
-            .unwrap_or_else(|| PublisherConfirm::not_requested(self.returned_messages.clone()))
-            .into_completion();
+        drop(
+            self.before_basic_publish()
+                .unwrap_or_else(|| PublisherConfirm::not_requested(self.returned_messages.clone()))
+                .into_completion()
+                .with_sink(confirmed),
+        );
         let BasicPublishOptions {
             mandatory,
             immediate,
@@ -776,13 +783,7 @@ impl Channel {
                 immediate,
             },
         ));
-        let written = self.send_method_frame_with_body_completion(
-            "basic.publish",
-            method,
-            payload,
-            properties,
-        )?;
-        Ok((written, confirm))
+        self.send_method_frame_with_body_completion("basic.publish", method, payload, properties)
     }
     fn receive_basic_return(&self, method: protocol::basic::Return) -> Result<()> {
         if !self.status.can_receive_messages() {

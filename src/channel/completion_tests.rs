@@ -245,22 +245,22 @@ fn split_publish_keeps_confirm_on_write_failure() {
                             },
                         ));
                     channel.status.set_confirm();
-                    let (write, confirm) = channel
+                    let (write_send, write_recv) = mpsc::channel();
+                    let (confirm_send, confirm_recv) = mpsc::channel();
+                    let write = channel
                         .basic_publish_split_completion(
                             "".into(),
                             "missing".into(),
                             BasicPublishOptions::default(),
                             b"body",
                             BasicProperties::default(),
+                            move |value| {
+                                let _ = confirm_send.send(value);
+                            },
                         )
                         .unwrap();
-                    let (write_send, write_recv) = mpsc::channel();
-                    let (confirm_send, confirm_recv) = mpsc::channel();
                     drop(write.with_sink(move |value| {
                         let _ = write_send.send(value);
-                    }));
-                    drop(confirm.with_sink(move |value| {
-                        let _ = confirm_send.send(value);
                     }));
                     let write = || {
                         while let Some(frame) = channel.frames.pop(true) {
@@ -330,18 +330,22 @@ fn split_publish_keeps_confirm_on_write_failure() {
         }
     }
     let (channel, _rpc) = channel(crate::ConnectionProperties::default());
-    let (write, confirm) = channel
+    let (confirm_send, confirm_recv) = mpsc::channel();
+    let write = channel
         .basic_publish_split_completion(
             "".into(),
             "queue".into(),
             BasicPublishOptions::default(),
             b"",
             BasicProperties::default(),
+            move |value| {
+                let _ = confirm_send.send(value);
+            },
         )
         .unwrap();
     assert!(matches!(
-        confirm.try_wait(),
-        Some(Ok(Confirmation::NotRequested))
+        confirm_recv.try_recv(),
+        Ok(Ok(Confirmation::NotRequested))
     ));
     while let Some(frame) = channel.frames.pop(true) {
         frame.into_serialized_frame(1).1.resolve();
@@ -389,6 +393,7 @@ async fn split_publish_generation_refusal_retires_its_confirm_registration() {
     channel.set_state(ChannelState::Connected);
     channel.status.set_confirm();
     let stale = channel.at_generation(channel.status.generation() + 1);
+    let (confirm_send, confirm_recv) = mpsc::channel();
     let error = stale
         .basic_publish_split_completion(
             "".into(),
@@ -396,6 +401,9 @@ async fn split_publish_generation_refusal_retires_its_confirm_registration() {
             BasicPublishOptions::default(),
             b"body",
             BasicProperties::default(),
+            move |value| {
+                let _ = confirm_send.send(value);
+            },
         )
         .unwrap_err();
     assert!(matches!(error.kind(), ErrorKind::StaleGeneration));
@@ -405,6 +413,12 @@ async fn split_publish_generation_refusal_retires_its_confirm_registration() {
     // The pending completion is the barrier for the real RPC owner's error path.
     assert!(matches!(
         pending.await.unwrap_err().kind(),
+        ErrorKind::StaleGeneration
+    ));
+    // The confirmation registered at the refused admission reaches its sink as
+    // the refusal, not as a peer confirmation.
+    assert!(matches!(
+        confirm_recv.try_recv().unwrap().unwrap_err().kind(),
         ErrorKind::StaleGeneration
     ));
     assert!(frames.pop(true).is_none());
