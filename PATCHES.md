@@ -1371,3 +1371,52 @@ Validation on Darwin arm64, through build-slot, with `--locked
 - `cargo clippy --lib --test supplied_driver --test connection_retry -- -D
   warnings`: exit 0.
 - `cargo fmt --all --check`: exit 0.
+
+## Install the split confirmation sink at admission (Boundless #799)
+
+Source revision: f9bb32ba4e5b72c20b7e669dc539a62a7c6d40e7. Platform: Darwin
+arm64. The following documentation commit changes no native source.
+
+`basic_publish_split_completion` returned the confirmation `Completion` after
+it had queued the publication's frames, and Boundless installed its sink only
+after its own dispatch bookkeeping. An Ack or Nack the I/O thread processed in
+between was stored in the promise. A normal Connection.Close processed next
+ended the embedding application's generation first, so the stored Ack, handed
+to the sink when it was installed later, lost to that end: a confirmation the
+broker sent before closing normally was answered as `protocol_closed`.
+
+The split entry now takes the caller's confirmation sink and installs it on
+the registered `PublisherConfirm` (`before_basic_publish`) before
+`send_method_frame_with_body_completion` queues the frames. It returns only the
+write receiver. An Ack or Nack therefore reaches the sink on the I/O thread in
+wire order, before a later frame such as a Connection.Close is processed. If
+the generation check refuses the admission, the registered confirmation reaches
+the sink as that refusal (`StaleGeneration`), never as a peer confirmation; a
+disconnected channel refuses before registering and drops the sink unused.
+The template (`templates/channel.rs`) and the generated
+`src/generated/channel.rs` change together; `regen-code.sh` produced the
+generated source.
+
+What upstream does: lapin v4.11.0's `basic_publish` registers the
+`PublisherConfirm` in `before_basic_publish`, sends, and returns the confirm
+future to the caller, which polls it; there is no sink, and a result that
+arrives before the caller polls is kept in the promise. Upstream has no split
+entry. amqplib's `ConfirmChannel.publish` likewise registers its confirm
+callback in the same synchronous turn as the write.
+
+Regression evidence:
+- Boundless `protocols::amqp::tests::ownership::outcomes::an_ack_before_a_normal_close_confirms_while_the_publisher_is_held`
+  holds the publisher between admission and bookkeeping while a scripted
+  broker sends the Ack and then Connection.Close 200. On the previous pin
+  (4cecebe) its outcome is `protocol_closed` (fail); with this patch it is the
+  Ack (pass), on macOS arm64, together with Boundless's AMQP module.
+- `cargo test --locked --no-default-features --features tokio,smol --lib`:
+  exit 0, 78 passed. The split completion tests now hand the sink to the
+  entry; the generation-refusal test also asserts the sink receives
+  `StaleGeneration`.
+- `cargo test --locked --no-default-features --features tokio,smol
+  --test supplied_driver --test connection_close --test remote_close_observer
+  --test connection_retry --no-fail-fast`: exit 0, 37 passed.
+- `cargo clippy --locked --no-default-features --features tokio,smol
+  --all-targets -- -D warnings`, `cargo fmt --all --check` and
+  `git diff --check`: exit 0 each. No broker-dependent run is claimed.
