@@ -1527,13 +1527,13 @@ Every input to the sleep decision, and where it comes from at the check:
 
 | Input | lapin v4.11.0 | Tokio current-thread `park` | Fork now |
 |---|---|---|---|
-| socket readable | flag set by reactor wakes at the poll, cleared on `Pending` | driver readiness | same flag; also false while paused (`held_frame`, `events_held`, current) |
+| socket readable | `readable` flag, set by each `SocketEvent::Readable` that `poll_events` or `wait` takes and cleared on `Pending` or an I/O error | driver readiness | same flag, set from the readiness bits; `can_read` is also false while paused (`held_frame`, `events_held`, current) |
 | receive space | `receive_buffer`, current | — | same, current |
 | writable work | `writable` flag and `has_data()` (frames, send buffer, serialized frames), current | — | same, current |
 | connection blocked | `connection_status`, current | — | same, current |
 | buffered work | none needed: `handle_frames` parses all it can each pass | run queue `core.tasks.is_empty()`, current | `held_frame` room and `frame_buffered()`, current; `54ba7cd` used the `reading_paused` snapshot |
-| keep running | `should_continue()`, current | — | same, current |
-| the wake itself | coalesced channel, one slot; `wait` returns at once if a wake is pending | unpark token | same channel |
+| keep running | `should_continue()`, current | — | same, plus the fork's `force_stop` check, current |
+| the wake itself | `flume::unbounded()` of `SocketEvent` values (`socket_state.rs`); `poll_events` drains each one and applies its readiness, and `wait` blocks for the next, returning at once if one is queued | unpark token | `flume::bounded(1)` of `()` as the notification, with readiness kept separately as bits in an `AtomicU8`; a send sets its bit and tries the one slot, so wakes coalesce; `poll_events` takes the notification and applies every bit, and `wait` returns at once if it is queued |
 
 Upstream never needs the buffered-work row because nothing stops its parsing
 before the buffer is exhausted or incomplete; the pause adds that state, and
