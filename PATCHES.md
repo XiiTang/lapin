@@ -1513,28 +1513,44 @@ event the frames already read behind it wait for parsing while the socket
 has nothing more to read. With heartbeats off and no other input, reading
 never resumed.
 
-`IoLoop::can_resume` now joins the sleep condition: the held header has room,
-or the pause the last pass ended with (`reading_paused`) has lifted. It is
-false while the pause stands, so the loop does not spin; the next pass clears
-`reading_paused` or holds again.
+`54ba7cd` added `IoLoop::can_resume` to the sleep condition, but read the
+event case from `reading_paused`, a snapshot `update_pause` takes after
+`handle_frames`. An event read between parsing stopping for the held event
+and that snapshot left `reading_paused` false, and the loop slept with whole
+frames buffered. `can_resume` now reads only state current at the sleep
+check: the held header has room, or no event is held and `frame_buffered`
+finds a whole frame (or a header `parse` already refuses for its size).
+While a pause stands it is false, and an incomplete frame waits for the
+socket, so the loop does not spin.
 
-What upstream does: lapin v4.11.0's sleep condition is the same
-`!can_read() && !can_write()`, but each of its inputs is derived from state
-(`can_write` includes `has_data()`: pending frames, the send buffer and
-serialized frames), so an internal RPC whose wake was polled is still seen;
-and `handle_frames` parses everything buffered on every pass, so it never
-sleeps with parseable frames. Tokio's current-thread scheduler parks in the
-same way only when its run queue is empty (`scheduler/current_thread`,
-`park`): a wake is a state change checked before sleeping, never only a
-notification. The patch keeps that rule for the state the pause adds.
+Every input to the sleep decision, and where it comes from at the check:
+
+| Input | lapin v4.11.0 | Tokio current-thread `park` | Fork now |
+|---|---|---|---|
+| socket readable | flag set by reactor wakes at the poll, cleared on `Pending` | driver readiness | same flag; also false while paused (`held_frame`, `events_held`, current) |
+| receive space | `receive_buffer`, current | — | same, current |
+| writable work | `writable` flag and `has_data()` (frames, send buffer, serialized frames), current | — | same, current |
+| connection blocked | `connection_status`, current | — | same, current |
+| buffered work | none needed: `handle_frames` parses all it can each pass | run queue `core.tasks.is_empty()`, current | `held_frame` room and `frame_buffered()`, current; `54ba7cd` used the `reading_paused` snapshot |
+| keep running | `should_continue()`, current | — | same, current |
+| the wake itself | coalesced channel, one slot; `wait` returns at once if a wake is pending | unpark token | same channel |
+
+Upstream never needs the buffered-work row because nothing stops its parsing
+before the buffer is exhausted or incomplete; the pause adds that state, and
+the fork derives it the way upstream derives `has_data()` and Tokio its run
+queue, so a polled wake is never the only record of work.
 
 Regression evidence (macOS arm64):
 - `connection::receive_pause_tests::a_release_whose_wake_the_loop_consumed_resumes_a_held_header`
   and `a_read_whose_wake_the_loop_consumed_resumes_parsing_behind_a_held_event`
-  hold the loop at the end of the pass that paused (a test-only gate,
-  `Events::hold_next_paused_pass`), release room, then let it poll: both
-  stall for 60 s at `688ed60` and pass with the patch, 20 of 20 times.
+  hold the loop at the end of the pass that paused (test-only gate,
+  `Events::hold_next_paused_pass`); both stall for 60 s at `688ed60`.
+  `a_read_before_the_pause_is_recorded_still_resumes_parsing` holds it where
+  parsing stops for the held event, before `update_pause`
+  (`Events::hold_next_parse_stop`), and reads an event there; it stalls for
+  60 s at `54ba7cd`. With the patch all three pass, 20 of 20 times, as do
+  all five pause tests.
 - `cargo test --locked --no-default-features --features tokio,smol --lib`:
-  84 passed; the four integration targets above: 37 passed;
+  85 passed; the four integration targets above: 37 passed;
   `cargo clippy --locked --no-default-features --features tokio --all-targets
   -- -D warnings` and `cargo fmt --check`: exit 0.

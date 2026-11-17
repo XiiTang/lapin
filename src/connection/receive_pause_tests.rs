@@ -441,3 +441,65 @@ async fn a_read_whose_wake_the_loop_consumed_resumes_parsing_behind_a_held_event
     ends(connection.close(200, "done".into())).await.unwrap();
     ends(peer).await.unwrap();
 }
+
+/// The program reads an event after parsing stopped for the held one but
+/// before the loop recorded that pause, and the loop's next notification
+/// poll takes the wake: the frames already read behind it are still parsed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_before_the_pause_is_recorded_still_resumes_parsing() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let mut stream = established(listener).await;
+        assert!(matches!(
+            read(&mut stream).await,
+            AMQPFrame::Method(1, AMQPClass::Channel(channel::AMQPMethod::Open(_)))
+        ));
+        let mut bytes = Vec::new();
+        let mut frame = |frame: AMQPFrame| {
+            bytes.extend(gen_frame(&frame)(Vec::new().into()).unwrap().into_inner().0)
+        };
+        for _ in 0..70 {
+            frame(AMQPFrame::Method(
+                0,
+                AMQPClass::Connection(connection::AMQPMethod::Unblocked(connection::Unblocked {})),
+            ));
+        }
+        frame(AMQPFrame::Method(
+            1,
+            AMQPClass::Channel(channel::AMQPMethod::OpenOk(channel::OpenOk {})),
+        ));
+        // One write: the frames behind the held event are already read.
+        stream.write_all(&bytes).await.unwrap();
+        close(&mut stream).await;
+    });
+    let connection = connect(address, None).await;
+    let mut events = Box::pin(connection.events_listener());
+    let gate = connection.events.hold_next_parse_stop();
+    let (opened, ()) = ends(async {
+        tokio::join!(connection.create_channel(), async {
+            until(|| gate.entered()).await;
+            assert!(connection.events.held());
+            assert!(matches!(
+                events.next().await.unwrap(),
+                crate::Event::ConnectionUnblocked
+            ));
+            assert!(
+                !connection.events.held(),
+                "the read moved the held event in"
+            );
+            gate.release();
+            for _ in 1..70 {
+                assert!(matches!(
+                    events.next().await.unwrap(),
+                    crate::Event::ConnectionUnblocked
+                ));
+            }
+        })
+    })
+    .await;
+    let _channel = opened.unwrap();
+    assert!(connection.status().connected());
+    ends(connection.close(200, "done".into())).await.unwrap();
+    ends(peer).await.unwrap();
+}

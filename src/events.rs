@@ -32,6 +32,8 @@ struct Inner {
     rpc: Mutex<Option<crate::internal_rpc::InternalRPCHandle>>,
     #[cfg(test)]
     paused_pass: Mutex<Option<Arc<PassGate>>>,
+    #[cfg(test)]
+    parse_stop: Mutex<Option<Arc<PassGate>>>,
 }
 
 /// Holds the I/O loop at the end of its next pass that ends paused, so a
@@ -71,6 +73,8 @@ impl Events {
             rpc: Mutex::new(None),
             #[cfg(test)]
             paused_pass: Mutex::new(None),
+            #[cfg(test)]
+            parse_stop: Mutex::new(None),
         }))
     }
 
@@ -93,6 +97,24 @@ impl Events {
         let gate = Arc::new(PassGate::default());
         *self.0.paused_pass.lock().unwrap() = Some(gate.clone());
         gate
+    }
+
+    /// Holds the I/O loop where its parsing next stops for a held event,
+    /// before it records the pause.
+    #[cfg(test)]
+    pub(crate) fn hold_next_parse_stop(&self) -> Arc<PassGate> {
+        let gate = Arc::new(PassGate::default());
+        *self.0.parse_stop.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// Where the I/O loop's parsing stops for a held event.
+    #[cfg(test)]
+    pub(crate) fn parse_stopped(&self) {
+        let gate = self.0.parse_stop.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.pass();
+        }
     }
 
     /// Where the I/O loop ends a paused pass.

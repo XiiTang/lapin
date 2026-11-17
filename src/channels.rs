@@ -292,6 +292,11 @@ impl Channels {
         self.events.paused_pass();
     }
 
+    #[cfg(test)]
+    pub(crate) fn parse_stopped(&self) {
+        self.events.parse_stopped();
+    }
+
     pub(crate) fn flow(&self) -> bool {
         self.read().channels.values().all(|c| c.status().flow())
     }

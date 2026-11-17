@@ -201,15 +201,33 @@ impl<
         }
     }
 
-    /// Whether work a pause left can now go on: the held header has room,
-    /// or the pause the last pass ended with has lifted, leaving frames it
-    /// already read to parse. The wake that made it so may already have been
-    /// polled, so the loop must not sleep on it (Boundless ADR-0192).
+    /// Whether work a pause left can go on now, read from the state at the
+    /// moment the loop would sleep: the held header has room, or no event is
+    /// held and a whole frame is already buffered. The wake that made it so
+    /// may already have been polled, so the loop must not sleep on it
+    /// (Boundless ADR-0192); an incomplete frame waits for the socket.
     fn can_resume(&self) -> bool {
         match &self.held_frame {
             Some(frame) => !self.no_room(frame),
-            None => self.reading_paused && !self.channels.events_held(),
+            None => !self.channels.events_held() && self.frame_buffered(),
         }
+    }
+
+    /// Whether `parse` would act on what is buffered: a whole frame, or a
+    /// header that already fails the frame size check.
+    fn frame_buffered(&self) -> bool {
+        if self.receive_buffer.available_data() == 0 {
+            return false;
+        }
+        let context = self.receive_buffer.parsing_context();
+        let header: Vec<u8> = context.iter().take(7).copied().collect();
+        if header.len() == 7 && header[0] != b'A' {
+            let size = u32::from_be_bytes([header[3], header[4], header[5], header[6]]) as u64 + 8;
+            if size > u64::from(self.frame_size) {
+                return true;
+            }
+        }
+        !matches!(parse_frame(context), Err(error) if error.is_incomplete())
     }
 
     /// Whether `frame` is a content header whose body has no room now.
@@ -707,6 +725,10 @@ impl<
             } else {
                 break;
             }
+        }
+        #[cfg(test)]
+        if self.channels.events_held() {
+            self.channels.parse_stopped();
         }
         self.update_pause();
         Ok(did_something)
