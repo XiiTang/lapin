@@ -682,6 +682,9 @@ impl Connect for &str {
 }
 
 #[cfg(test)]
+mod receive_pause_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::Promise;

@@ -282,6 +282,11 @@ impl Channels {
         }
     }
 
+    /// Whether a connection event waits for room, so the I/O loop must not read.
+    pub(crate) fn events_held(&self) -> bool {
+        self.events.held()
+    }
+
     pub(crate) fn flow(&self) -> bool {
         self.read().channels.values().all(|c| c.status().flow())
     }

@@ -63,6 +63,13 @@ pub(crate) struct IoLoop<
     first_connection: bool,
     rejected_frame: Option<Error>,
     force_stop: KillSwitch,
+    /// A content header whose body found no room in the receive budget:
+    /// dispatched once a release makes room, and nothing is read or parsed
+    /// behind it until then.
+    held_frame: Option<AMQPFrame>,
+    /// Reading is paused for a held header or a held event, as the
+    /// heartbeat last learned.
+    reading_paused: bool,
 }
 
 impl<
@@ -91,6 +98,9 @@ impl<
             configuration.frame_max(),
         );
         let global_backoff = backoff.build();
+        if let Some(budget) = &configuration.budget {
+            budget.bind(socket_state.handle());
+        }
 
         Self {
             connection_status,
@@ -114,12 +124,16 @@ impl<
             first_connection: true,
             rejected_frame: None,
             force_stop,
+            held_frame: None,
+            reading_paused: false,
         }
     }
 
     fn reset(&mut self) {
         self.status = Status::Initial;
         self.rejected_frame = None;
+        self.held_frame = None;
+        self.update_pause();
         self.receive_buffer.reset();
         self.send_buffer.reset();
         self.socket_state.reset();
@@ -164,11 +178,37 @@ impl<
     }
 
     fn can_read(&mut self) -> bool {
-        self.socket_state.readable() && self.receive_buffer.available_space() > 0
+        !self.paused() && self.socket_state.readable() && self.receive_buffer.available_space() > 0
     }
 
     fn can_parse(&self) -> bool {
-        self.receive_buffer.available_data() > 0
+        !self.paused() && self.receive_buffer.available_data() > 0
+    }
+
+    /// A held header or a held event waits for room: the peer's input
+    /// behind it stays unread until the program reads (Boundless ADR-0192).
+    fn paused(&self) -> bool {
+        self.held_frame.is_some() || self.channels.events_held()
+    }
+
+    /// The one owner of the pause the heartbeat sees: its missing-heartbeat
+    /// check is skipped while paused, and starts again from the resume.
+    fn update_pause(&mut self) {
+        let paused = self.paused();
+        if paused != self.reading_paused {
+            self.reading_paused = paused;
+            self.heartbeat.set_paused(paused);
+        }
+    }
+
+    /// Whether `frame` is a content header whose body has no room now.
+    fn no_room(&self, frame: &AMQPFrame) -> bool {
+        match (frame, &self.configuration.budget) {
+            (AMQPFrame::Header(channel_id, header), Some(budget)) => {
+                *channel_id != 0 && !budget.has_room(header.body_size)
+            }
+            _ => false,
+        }
     }
 
     fn connecting(&self) -> bool {
@@ -340,6 +380,7 @@ impl<
             self.socket_state.wait();
         }
         self.poll_socket_events();
+        self.update_pause();
         if self.force_stop.killed() {
             return Ok(());
         }
@@ -628,14 +669,27 @@ impl<
 
     fn handle_frames(&mut self, connection_killswitch: &KillSwitch) -> Result<bool> {
         let mut did_something = false;
+        if let Some(frame) = self.held_frame.take() {
+            if self.no_room(&frame) {
+                self.held_frame = Some(frame);
+            } else {
+                self.channels.handle_frame(frame)?;
+                did_something = true;
+            }
+        }
         while self.can_parse() {
             if let Some(frame) = self.parse(connection_killswitch)? {
+                if self.no_room(&frame) {
+                    self.held_frame = Some(frame);
+                    break;
+                }
                 self.channels.handle_frame(frame)?;
                 did_something = true;
             } else {
                 break;
             }
         }
+        self.update_pause();
         Ok(did_something)
     }
 

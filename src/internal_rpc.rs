@@ -301,6 +301,11 @@ impl InternalRPCHandle {
         self.send(InternalCommand::SetConnectionError(error));
     }
 
+    /// Wakes the I/O loop, for room it waits for.
+    pub(crate) fn wake(&self) {
+        self.waker.wake();
+    }
+
     pub(crate) fn spawn(&self, f: impl Future<Output = Result<()>> + Send + 'static) {
         self.send(InternalCommand::Spawn(InternalFuture(Box::pin(f))));
     }

@@ -72,6 +72,13 @@ impl<RK: RuntimeKit + Clone + Send + 'static> Heartbeat<RK> {
         self.lock_inner().update_last_read();
     }
 
+    /// The I/O loop stops or resumes reading while it waits for room. The
+    /// missing-heartbeat check waits for the peer, so it is skipped while
+    /// reading is paused and starts again from the resume.
+    pub(crate) fn set_paused(&self, paused: bool) {
+        self.lock_inner().set_paused(paused);
+    }
+
     pub(crate) fn cancel(&self) {
         self.lock_inner().cancel();
     }
@@ -97,6 +104,7 @@ struct Inner {
     last_write: Instant,
     timeout: Option<Duration>,
     poison: KillSwitch,
+    paused: bool,
 }
 
 impl Default for Inner {
@@ -106,6 +114,7 @@ impl Default for Inner {
             last_write: Instant::now(),
             timeout: None,
             poison: KillSwitch::default(),
+            paused: false,
         }
     }
 }
@@ -120,7 +129,8 @@ impl Inner {
 
         // The value stored in timeout is half the configured heartbeat value as the spec recommends to send heartbeats at twice the configured pace.
         // The specs tells us to close the connection after twice the configured interval has passed.
-        if Instant::now().duration_since(self.last_read) > timeout.saturating_mul(4) {
+        if !self.paused && Instant::now().duration_since(self.last_read) > timeout.saturating_mul(4)
+        {
             error!(
                 "We haven't received anything from the server for too long, closing connection."
             );
@@ -149,6 +159,13 @@ impl Inner {
         self.last_read = Instant::now();
     }
 
+    fn set_paused(&mut self, paused: bool) {
+        if self.paused && !paused {
+            self.update_last_read();
+        }
+        self.paused = paused;
+    }
+
     fn cancel(&mut self) {
         self.timeout = None;
         self.poison.kill();
@@ -156,8 +173,54 @@ impl Inner {
 
     fn reset(&mut self) {
         self.cancel();
+        self.paused = false;
         self.update_last_read();
         self.update_last_write();
         self.poison = KillSwitch::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ConnectionStatus, frames::Frames, internal_rpc::InternalRPC, secret_update::SecretUpdate,
+        socket_state::SocketState, uri::AMQPUri,
+    };
+
+    #[tokio::test]
+    async fn a_paused_read_skips_the_missing_heartbeat_check_and_restarts_it_at_resume() {
+        let runtime = Runtime::tokio_current();
+        let uri = AMQPUri::default();
+        let config = crate::Configuration::new(&uri, crate::ConnectionProperties::default());
+        let status = ConnectionStatus::new(&uri);
+        let socket = SocketState::default();
+        let rpc = InternalRPC::new(
+            runtime.clone(),
+            Heartbeat::new(status.clone(), runtime.clone()),
+            SecretUpdate::new(status.clone(), runtime, config.auth_provider.clone()),
+            Frames::default(),
+            socket.handle(),
+            status,
+        );
+        let handle = rpc.handle();
+        let timeout = Duration::from_millis(500);
+        let silent = timeout.saturating_mul(5);
+        let killswitch = KillSwitch::default();
+        let mut inner = Inner {
+            timeout: Some(timeout),
+            ..Default::default()
+        };
+        inner.last_read -= silent;
+        inner.set_paused(true);
+        assert!(inner.poll_timeout(&handle, &killswitch).is_some());
+        assert!(!killswitch.killed());
+        // The resume is the last read; silence after it is judged from there.
+        inner.set_paused(false);
+        assert!(inner.poll_timeout(&handle, &killswitch).is_some());
+        assert!(!killswitch.killed());
+        inner.last_read -= silent;
+        assert!(inner.poll_timeout(&handle, &killswitch).is_none());
+        assert!(killswitch.killed());
     }
 }

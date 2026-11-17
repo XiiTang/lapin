@@ -1420,3 +1420,80 @@ Regression evidence:
 - `cargo clippy --locked --no-default-features --features tokio,smol
   --all-targets -- -D warnings`, `cargo fmt --all --check` and
   `git diff --check`: exit 0 each. No broker-dependent run is claimed.
+
+## Pause reading for room instead of failing a full receive (Boundless #783)
+
+Boundless ADR-0192: a producer that can wait for room waits, and the
+connection's reader is such a producer. At `1fd89df` a content header whose
+body found the receive budget (`ReceiveLimits.retained_bytes` or
+`retained_messages`) full was refused in `Budget::reserve`, and the error
+ended the connection through `IoLoop::critical_error`; a connection event that
+found the 64-entry event queue full set the connection's error
+(`EventQueueMessages`). A consumer the program reads slowly, or 64 retained
+returned messages, therefore ended a healthy connection.
+
+The patch keeps lapin's own decisions and adds one: lapin already stops
+reading while its receive buffer is full (`can_read`). Now it also stops while
+it holds one item that has no room:
+
+- **One held frame.** `Budget::has_room` tells a body with no room now from
+  one that can never fit; the latter still reaches `reserve` and its
+  `MessageBytes` refusal. Before dispatch, `IoLoop::handle_frames` holds a
+  content header with no room instead of dispatching it, and retries it
+  first on every pass. While it is held, `can_read` and `can_parse` are
+  false. Only the I/O thread reserves, so the check and the reservation do not
+  race; the room it waits for always comes, because `retained_bytes` is at
+  least `message_bytes`.
+- **One held event.** `EventsSender::send` keeps an event that finds the
+  queue full in one held slot instead of overflowing; `can_read` and
+  `can_parse` are false while it is occupied, so nothing else from the peer
+  arrives behind it. Its handler (Blocked, Unblocked, Flow and its FlowOk) has
+  already run once. `EventStream::poll_next` moves it into the room a dequeue
+  made. An `Error` event is never held: it keeps the overflow path, since it is
+  the connection's end.
+- **Wakes.** A dropped `Reservation` wakes the I/O loop through the
+  `SocketStateHandle` the budget is bound to in `IoLoop::new`, only when a
+  header waits; moving the held event in wakes it through the
+  `InternalRPCHandle` the events already bind. Reading resumes with heartbeats
+  off and no other input.
+- **Heartbeat.** `IoLoop::update_pause` is the one owner of the pause the
+  heartbeat sees: while a header or an event is held, the missing-heartbeat
+  check in `heartbeat.rs` is skipped, and on resume `last_read` becomes now.
+  Without it the peer's heartbeats, unread behind the held item, would end a
+  healthy connection with `MissingHeartbeatError`. Outbound heartbeats and all
+  writes are unchanged: `can_write` does not depend on `can_read`.
+
+`ResourceLimit::RetainedBytes` and `RetainedMessages` stay in the enum and in
+`reserve`, but the I/O loop no longer lets a header reach `reserve` without
+room, so lapin no longer answers them.
+
+What upstream does: lapin v4.11.0 reads whenever the socket is readable and
+its receive buffer has space (`io_loop.rs` `can_read`), and buffers deliveries
+in an unbounded per-consumer queue; it never pauses for a slow consumer and
+has no receive budget. Its event queue is unbounded (`flume::unbounded`). Its
+missing-heartbeat check (`heartbeat.rs`, `now - last_read > 4 × timeout`) runs
+whenever the heartbeat task wakes, and `last_read` moves only on socket reads.
+amqplib likewise reads every frame on `'readable'`; RabbitMQ relies on TCP
+back-pressure for a client that stops reading.
+
+Regression evidence (macOS arm64):
+- `cargo test --locked --no-default-features --features tokio,smol --lib`:
+  exit 0, 82 passed, including
+  `connection::receive_pause_tests::a_held_delivery_header_resumes_once_a_delivery_is_dropped`
+  (a scripted broker; the third header waits while two deliveries are held,
+  survives a Basic.Qos write and later passes, and arrives with the QosOk
+  behind it once one delivery is dropped),
+  `connection::receive_pause_tests::a_held_event_resumes_reading_once_an_event_is_read`
+  (70 Unblocked events and a Channel.OpenOk: the 65th is held, and every
+  event, then the OpenOk, arrives once the listener reads),
+  `limits::tests::a_body_without_room_waits_and_the_release_wakes_the_reader`,
+  `events::tests::a_full_event_queue_holds_one_event_and_overflows_only_an_error`
+  and `heartbeat::tests::a_paused_read_skips_the_missing_heartbeat_check_and_restarts_it_at_resume`.
+  At `1fd89df` the same exchanges end the connection: Boundless's RabbitMQ
+  reproduction of an unread consumer ended with `limit_exceeded {limit:
+  retained_messages}`.
+- `cargo test --locked --no-default-features --features tokio,smol
+  --test supplied_driver --test connection_close --test remote_close_observer
+  --test connection_retry --no-fail-fast`: exit 0, 37 passed.
+- `cargo clippy --locked --no-default-features --features tokio --all-targets
+  -- -D warnings` and `cargo fmt --check`: exit 0.

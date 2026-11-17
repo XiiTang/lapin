@@ -179,6 +179,14 @@ impl Wake for SocketStateWaker {
     }
 }
 
+impl SocketState {
+    /// Whether a wake is pending, for tests of what wakes the I/O loop.
+    #[cfg(test)]
+    pub(crate) fn woken(&self) -> bool {
+        !self.events.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
