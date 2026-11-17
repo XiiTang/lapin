@@ -201,6 +201,17 @@ impl<
         }
     }
 
+    /// Whether work a pause left can now go on: the held header has room,
+    /// or the pause the last pass ended with has lifted, leaving frames it
+    /// already read to parse. The wake that made it so may already have been
+    /// polled, so the loop must not sleep on it (Boundless ADR-0192).
+    fn can_resume(&self) -> bool {
+        match &self.held_frame {
+            Some(frame) => !self.no_room(frame),
+            None => self.reading_paused && !self.channels.events_held(),
+        }
+    }
+
     /// Whether `frame` is a content header whose body has no room now.
     fn no_room(&self, frame: &AMQPFrame) -> bool {
         match (frame, &self.configuration.budget) {
@@ -375,7 +386,11 @@ impl<
             has_data=%self.has_data(),
             "io_loop do_run",
         );
-        if !self.can_read() && !self.can_write() && self.should_continue(connection_killswitch) {
+        if !self.can_read()
+            && !self.can_write()
+            && !self.can_resume()
+            && self.should_continue(connection_killswitch)
+        {
             trace!("io_loop cannot do anything for now, waiting for socket events.");
             self.socket_state.wait();
         }
@@ -391,6 +406,10 @@ impl<
             self.read(stream, readable_context, connection_killswitch)?;
         }
         self.handle_frames(connection_killswitch)?;
+        #[cfg(test)]
+        if self.paused() {
+            self.channels.paused_pass();
+        }
         self.check_connection_state();
         trace!(
             can_read=%self.socket_state.readable(),

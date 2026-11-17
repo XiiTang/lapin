@@ -287,6 +287,11 @@ impl Channels {
         self.events.held()
     }
 
+    #[cfg(test)]
+    pub(crate) fn paused_pass(&self) {
+        self.events.paused_pass();
+    }
+
     pub(crate) fn flow(&self) -> bool {
         self.read().channels.values().all(|c| c.status().flow())
     }

@@ -30,6 +30,34 @@ struct Inner {
     /// a dequeue moves it in and wakes the loop.
     held: Mutex<Option<Event>>,
     rpc: Mutex<Option<crate::internal_rpc::InternalRPCHandle>>,
+    #[cfg(test)]
+    paused_pass: Mutex<Option<Arc<PassGate>>>,
+}
+
+/// Holds the I/O loop at the end of its next pass that ends paused, so a
+/// test can release room before the loop's next notification poll.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct PassGate {
+    state: Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+#[cfg(test)]
+impl PassGate {
+    pub(crate) fn entered(&self) -> bool {
+        self.state.lock().unwrap().0
+    }
+    pub(crate) fn release(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+    fn pass(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        while !state.1 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
 }
 
 impl Events {
@@ -41,6 +69,8 @@ impl Events {
             overflow: AtomicBool::new(false),
             held: Mutex::new(None),
             rpc: Mutex::new(None),
+            #[cfg(test)]
+            paused_pass: Mutex::new(None),
         }))
     }
 
@@ -55,6 +85,23 @@ impl Events {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
+    }
+
+    /// Holds the I/O loop at the end of its next paused pass.
+    #[cfg(test)]
+    pub(crate) fn hold_next_paused_pass(&self) -> Arc<PassGate> {
+        let gate = Arc::new(PassGate::default());
+        *self.0.paused_pass.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// Where the I/O loop ends a paused pass.
+    #[cfg(test)]
+    pub(crate) fn paused_pass(&self) {
+        let gate = self.0.paused_pass.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.pass();
+        }
     }
 
     pub(crate) fn sender(&self) -> EventsSender {

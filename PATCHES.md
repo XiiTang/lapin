@@ -1501,3 +1501,40 @@ Regression evidence (macOS arm64):
   --test connection_retry --no-fail-fast`: exit 0, 37 passed.
 - `cargo clippy --locked --no-default-features --features tokio --all-targets
   -- -D warnings` and `cargo fmt --check`: exit 0.
+
+## Check what a pause left before sleeping (Boundless #783 review)
+
+At `688ed60` the I/O loop decided to sleep from `can_read` and `can_write`
+alone, after its first notification poll. A wake that a release sends (a
+dropped delivery, or the program reading a held event) carries no socket
+readiness, so when that poll consumed it the loop slept: with a held header
+`can_read` stays false until `handle_frames` retries it, and after a held
+event the frames already read behind it wait for parsing while the socket
+has nothing more to read. With heartbeats off and no other input, reading
+never resumed.
+
+`IoLoop::can_resume` now joins the sleep condition: the held header has room,
+or the pause the last pass ended with (`reading_paused`) has lifted. It is
+false while the pause stands, so the loop does not spin; the next pass clears
+`reading_paused` or holds again.
+
+What upstream does: lapin v4.11.0's sleep condition is the same
+`!can_read() && !can_write()`, but each of its inputs is derived from state
+(`can_write` includes `has_data()`: pending frames, the send buffer and
+serialized frames), so an internal RPC whose wake was polled is still seen;
+and `handle_frames` parses everything buffered on every pass, so it never
+sleeps with parseable frames. Tokio's current-thread scheduler parks in the
+same way only when its run queue is empty (`scheduler/current_thread`,
+`park`): a wake is a state change checked before sleeping, never only a
+notification. The patch keeps that rule for the state the pause adds.
+
+Regression evidence (macOS arm64):
+- `connection::receive_pause_tests::a_release_whose_wake_the_loop_consumed_resumes_a_held_header`
+  and `a_read_whose_wake_the_loop_consumed_resumes_parsing_behind_a_held_event`
+  hold the loop at the end of the pass that paused (a test-only gate,
+  `Events::hold_next_paused_pass`), release room, then let it poll: both
+  stall for 60 s at `688ed60` and pass with the patch, 20 of 20 times.
+- `cargo test --locked --no-default-features --features tokio,smol --lib`:
+  84 passed; the four integration targets above: 37 passed;
+  `cargo clippy --locked --no-default-features --features tokio --all-targets
+  -- -D warnings` and `cargo fmt --check`: exit 0.

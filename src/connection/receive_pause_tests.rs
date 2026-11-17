@@ -300,3 +300,144 @@ async fn a_held_event_resumes_reading_once_an_event_is_read() {
     ends(connection.close(200, "done".into())).await.unwrap();
     ends(peer).await.unwrap();
 }
+
+/// A release that comes while the I/O loop runs, so its wake is consumed by
+/// the loop's next notification poll, still resumes reading: the loop checks
+/// what the pause left before it sleeps. Nothing else arrives to wake it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_whose_wake_the_loop_consumed_resumes_a_held_header() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let mut stream = established(listener).await;
+        open_channel(&mut stream).await;
+        let AMQPFrame::Method(1, AMQPClass::Basic(basic::AMQPMethod::Consume(consume))) =
+            read(&mut stream).await
+        else {
+            panic!("Basic.Consume expected")
+        };
+        let mut bytes = Vec::new();
+        let mut frame = |frame: AMQPFrame| {
+            bytes.extend(gen_frame(&frame)(Vec::new().into()).unwrap().into_inner().0)
+        };
+        frame(AMQPFrame::Method(
+            1,
+            AMQPClass::Basic(basic::AMQPMethod::ConsumeOk(basic::ConsumeOk {
+                consumer_tag: consume.consumer_tag.clone(),
+            })),
+        ));
+        for tag in 1..=3u8 {
+            frame(AMQPFrame::Method(
+                1,
+                AMQPClass::Basic(basic::AMQPMethod::Deliver(basic::Deliver {
+                    consumer_tag: consume.consumer_tag.clone(),
+                    delivery_tag: u64::from(tag),
+                    redelivered: false,
+                    exchange: "".into(),
+                    routing_key: "held".into(),
+                })),
+            ));
+            frame(AMQPFrame::Header(
+                1,
+                AMQPContentHeader {
+                    class_id: 60,
+                    body_size: 1,
+                    properties: Default::default(),
+                },
+            ));
+            frame(AMQPFrame::Body(1, vec![tag]));
+        }
+        // One write: the loop reads it all before it holds the third header.
+        stream.write_all(&bytes).await.unwrap();
+        close(&mut stream).await;
+    });
+    let connection = connect(
+        address,
+        Some(ReceiveLimits {
+            message_bytes: 1,
+            retained_bytes: 2,
+            retained_messages: 2,
+        }),
+    )
+    .await;
+    let gate = connection.events.hold_next_paused_pass();
+    let channel = ends(connection.create_channel()).await.unwrap();
+    let mut consumer = ends(channel.basic_consume(
+        "held".into(),
+        "pause".into(),
+        Default::default(),
+        Default::default(),
+    ))
+    .await
+    .unwrap();
+    let first = ends(consumer.next()).await.unwrap().unwrap();
+    let second = ends(consumer.next()).await.unwrap().unwrap();
+    // The loop ended the pass that held the third header; its next pass
+    // polls the wake this release sends.
+    until(|| gate.entered()).await;
+    drop(first);
+    gate.release();
+    let third = ends(consumer.next()).await.unwrap().unwrap();
+    assert_eq!(third.data, [3]);
+    assert!(connection.status().connected());
+    drop((second, third));
+    ends(connection.close(200, "done".into())).await.unwrap();
+    ends(peer).await.unwrap();
+}
+
+/// The same for a held event: once the program reads an event, the frames
+/// the loop already read behind the held one are parsed, though the socket
+/// has nothing more to read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_whose_wake_the_loop_consumed_resumes_parsing_behind_a_held_event() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let mut stream = established(listener).await;
+        assert!(matches!(
+            read(&mut stream).await,
+            AMQPFrame::Method(1, AMQPClass::Channel(channel::AMQPMethod::Open(_)))
+        ));
+        let mut bytes = Vec::new();
+        let mut frame = |frame: AMQPFrame| {
+            bytes.extend(gen_frame(&frame)(Vec::new().into()).unwrap().into_inner().0)
+        };
+        for _ in 0..70 {
+            frame(AMQPFrame::Method(
+                0,
+                AMQPClass::Connection(connection::AMQPMethod::Unblocked(connection::Unblocked {})),
+            ));
+        }
+        frame(AMQPFrame::Method(
+            1,
+            AMQPClass::Channel(channel::AMQPMethod::OpenOk(channel::OpenOk {})),
+        ));
+        // One write: the frames behind the held event are already read.
+        stream.write_all(&bytes).await.unwrap();
+        close(&mut stream).await;
+    });
+    let connection = connect(address, None).await;
+    let mut events = Box::pin(connection.events_listener());
+    let gate = connection.events.hold_next_paused_pass();
+    let (opened, ()) = ends(async {
+        tokio::join!(connection.create_channel(), async {
+            until(|| gate.entered() && connection.events.held()).await;
+            assert!(matches!(
+                events.next().await.unwrap(),
+                crate::Event::ConnectionUnblocked
+            ));
+            gate.release();
+            for _ in 1..70 {
+                assert!(matches!(
+                    events.next().await.unwrap(),
+                    crate::Event::ConnectionUnblocked
+                ));
+            }
+        })
+    })
+    .await;
+    let _channel = opened.unwrap();
+    assert!(connection.status().connected());
+    ends(connection.close(200, "done".into())).await.unwrap();
+    ends(peer).await.unwrap();
+}
