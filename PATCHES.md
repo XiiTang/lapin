@@ -15,7 +15,9 @@ transactions and recovery engine remain the only protocol implementation.
   for the I/O thread and owned resources. Wakeup notifications coalesce in one slot.
 - ReceiveLimits checks advertised frame/body sizes before body allocation and
   reserves aggregate message bytes/count until Delivery/Get/Return values drop.
-  Event and internal RPC queues are bounded and fail closed on overflow.
+  A body without room, or an event that finds the bounded event queue full,
+  pauses reading until room returns; an Error event and the internal RPC queue
+  still fail closed on overflow.
 - Boundless disables Registry collection with `with_topology_collection(false)`;
   its journal owns structural restoration. Consumer payload queues retain native
   delivery reservations. Upstream automatic recovery remains opt-in and unchanged.
@@ -186,7 +188,9 @@ event queue or an internal RPC queue as retained body bytes. It now carries a
 `Budget::reserve` checks one body's advertised bytes before aggregate bytes and
 delivery count; queue owners supply their own count bounds. Reservation ownership,
 queue sizes and non-recoverability are unchanged. Topology collection is outside
-this patch.
+this patch. Since the #783 patch below, the I/O loop holds a header that has no
+room instead of reserving it, so `RetainedBytes` and `RetainedMessages` are no
+longer answered.
 
 `IoLoop::parse` reports an oversized peer frame as `FrameTooLarge`, retaining
 its whole advertised size and the receiving maximum. This keeps a malformed peer
