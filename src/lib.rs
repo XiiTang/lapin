@@ -163,7 +163,9 @@ pub use consumer::{Consumer, ConsumerDelegate};
 pub use error::{Error, ErrorKind, RemoteClose, RemoteCloseObserver, Result};
 pub use events::Event;
 pub use exchange::ExchangeKind;
-pub use promise::Completion;
+pub use promise::{
+    Completion, DispatchKey, observe_claimed_dispatch, observe_dispatch, observe_dispatch_with_key,
+};
 pub use publisher_confirm::{Confirmation, PublisherConfirm};
 pub use queue::Queue;
 

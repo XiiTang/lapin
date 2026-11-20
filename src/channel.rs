@@ -330,11 +330,11 @@ impl Channel {
         arguments: FieldTable,
     ) -> Result<crate::Completion<Consumer>> {
         let id = self.id;
-        Ok(self
-            .do_basic_consume_completion(queue, consumer_tag, options, arguments, None)?
-            .map("basic.consume.external", move |consumer| {
-                consumer.external(id)
-            }))
+        Promise::map_dispatch(
+            "basic.consume.external",
+            || self.do_basic_consume_completion(queue, consumer_tag, options, arguments, None),
+            move |consumer| consumer.external(id),
+        )
     }
 
     /// Synchronously fetch a single message from `queue`.

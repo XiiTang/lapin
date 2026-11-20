@@ -73,6 +73,17 @@ pub trait RemoteCloseObserver: Send + Sync + 'static {
         close: &RemoteClose,
         accepted: bool,
     ) -> Option<Box<dyn error::Error + Send + Sync>>;
+
+    /// An accepted channel Close can also answer one exact, written request.
+    /// The identity exists only while the native method reply is still expected.
+    fn received_with_dispatch(
+        &self,
+        close: &RemoteClose,
+        accepted: bool,
+        _dispatch: Option<&crate::DispatchKey>,
+    ) -> Option<Box<dyn error::Error + Send + Sync>> {
+        self.received(close, accepted)
+    }
 }
 
 impl fmt::Debug for dyn RemoteCloseObserver {

@@ -1701,10 +1701,20 @@ impl Channel {
             Some(close) => close,
             None => {
                 let received = RemoteClose::Channel(method.clone());
-                let context = self
-                    .remote_close_observer
-                    .as_ref()
-                    .and_then(|observer| observer.received(&received, validation.is_ok()));
+                let dispatch = if validation.is_ok() && AMQPError::try_from(method.clone()).is_ok()
+                {
+                    self.frames
+                        .matching_dispatch(self.id, method.class_id, method.method_id)
+                } else {
+                    None
+                };
+                let context = self.remote_close_observer.as_ref().and_then(|observer| {
+                    observer.received_with_dispatch(
+                        &received,
+                        validation.is_ok(),
+                        dispatch.as_ref(),
+                    )
+                });
                 Arc::new(ReceivedClose::new(received, context))
             }
         };

@@ -653,11 +653,13 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                     }
                     let channel0 = channels.channel0();
                     if let Some(resolver) = resolver {
-                        Self::forward_completion(
-                            channel0.connection_close_completion(
-                                reply_code, reply_text, class_id, method_id,
-                            ),
-                            resolver,
+                        crate::observe_dispatch(
+                            || {
+                                channel0.connection_close_completion(
+                                    reply_code, reply_text, class_id, method_id,
+                                )
+                            },
+                            move |result| resolver.complete(result),
                         )
                     } else {
                         self.register_internal_future(async move {
@@ -704,9 +706,9 @@ impl<RK: RuntimeKit + Clone + Send + 'static> InternalRPC<RK> {
                 }
                 CreateChannel(closer, observer, resolver) => {
                     match channels.create(closer, observer) {
-                        Ok(channel) => Self::forward_completion(
-                            channel.channel_open_completion(channel.clone()),
-                            resolver,
+                        Ok(channel) => crate::observe_dispatch(
+                            || channel.channel_open_completion(channel.clone()),
+                            move |result| resolver.complete(result),
                         ),
                         Err(err) => resolver.reject(err),
                     }

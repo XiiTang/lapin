@@ -1554,3 +1554,26 @@ Regression evidence (macOS arm64):
   85 passed; the four integration targets above: 37 passed;
   `cargo clippy --locked --no-default-features --features tokio --all-targets
   -- -D warnings` and `cargo fmt --check`: exit 0.
+
+## Pre-dispatch observation of response and write receipts
+
+The upstream RPC awaits a native promise returned after enqueue. The existing
+completion extension can attach a sink afterwards, which leaves a scheduling
+gap for a host whose operation reply may close while admission returns.
+Bind the original observer to the native frame or internal command before
+visibility. Keep resolver scope, rejection, cancellation and late disposal
+semantics. Boundless uses this for AMQP 0-9-1 RPC and ending receipts in
+`src/protocols/amqp/completion.rs`.
+
+A received channel Close may carry the offending method. The observer gets a
+request key only when the exact native resolver is still expecting that method
+on the receiving channel and the I/O loop has written the full request frame.
+This leaves upstream Close acknowledgement and broadcast behaviour in place.
+
+The internal channel-zero close forwards through the same pre-dispatch binder.
+The resolver test covers decoded and channel-implied settlement before admission
+returns. The resolver keeps the provenance and outcome in one mutex commit.
+
+Consume prebinds its external Consumer projection before the raw Consumer is
+admitted. Both receipts have the same result type. The mapped-dispatch test
+exercises native completion before the admission call returns.

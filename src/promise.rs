@@ -1,6 +1,8 @@
 use crate::error::ReceivedClose;
 use crate::{Error, Result, listener::Listener};
 use std::{
+    any::Any,
+    cell::RefCell,
     fmt,
     future::Future,
     panic::RefUnwindSafe,
@@ -37,6 +39,86 @@ impl<T> Drop for Completion<T> {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct DispatchKey(Arc<()>);
+
+impl DispatchKey {
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ExpectedDispatch {
+    pub key: DispatchKey,
+    pub class: u16,
+    pub method: u16,
+    pub written: Arc<std::sync::atomic::AtomicBool>,
+}
+
+type DispatchObserver<T> = Box<dyn FnOnce(Result<T>, Option<Error>) + Send>;
+type DispatchSink = (Option<DispatchKey>, Box<dyn Any>);
+
+thread_local! {
+    static DISPATCH_SINK: RefCell<Option<DispatchSink>> = RefCell::default();
+}
+
+struct DispatchScope(Option<DispatchSink>);
+impl Drop for DispatchScope {
+    fn drop(&mut self) {
+        DISPATCH_SINK.with_borrow_mut(|slot| *slot = self.0.take());
+    }
+}
+
+/// Install the observer at the promise behind one synchronous native
+/// admission, before a frame or internal command can resolve it. A resolver
+/// may run the observer during admission. The observer must not reenter lapin.
+pub fn observe_dispatch<T: Send + 'static>(
+    dispatch: impl FnOnce() -> Result<Completion<T>>,
+    observer: impl FnOnce(Result<T>) + Send + 'static,
+) {
+    observe_dispatch_inner(None, dispatch, move |result, _| observer(result));
+}
+
+/// Bind a caller's exact request identity to the expected reply as well as its sink.
+pub fn observe_dispatch_with_key<T: Send + 'static>(
+    key: DispatchKey,
+    dispatch: impl FnOnce() -> Result<Completion<T>>,
+    observer: impl FnOnce(Result<T>) + Send + 'static,
+) {
+    observe_dispatch_inner(Some(key), dispatch, move |result, _| observer(result));
+}
+
+/// Observe a closing exchange. The second argument identifies a cancellation
+/// implied by native channel retirement instead of a decoded CancelOk.
+pub fn observe_claimed_dispatch<T: Send + 'static>(
+    dispatch: impl FnOnce() -> Result<Completion<T>>,
+    observer: impl FnOnce(Result<T>, Option<Error>) + Send + 'static,
+) {
+    observe_dispatch_inner(None, dispatch, observer);
+}
+
+fn observe_dispatch_inner<T: Send + 'static>(
+    key: Option<DispatchKey>,
+    dispatch: impl FnOnce() -> Result<Completion<T>>,
+    observer: impl FnOnce(Result<T>, Option<Error>) + Send + 'static,
+) {
+    let observer: DispatchObserver<T> = Box::new(observer);
+    let previous = DISPATCH_SINK.with_borrow_mut(|slot| slot.replace((key, Box::new(observer))));
+    let _scope = DispatchScope(previous);
+    let result = dispatch();
+    let remaining = DISPATCH_SINK.with_borrow_mut(Option::take);
+    if let Some((_, observer)) = remaining {
+        let observer = observer
+            .downcast::<DispatchObserver<T>>()
+            .expect("the observer belongs to this native admission");
+        match result {
+            Ok(completion) => drop(completion.with_sink(move |result| observer(result, None))),
+            Err(error) => observer(Err(error), None),
+        }
+    }
+}
+
 impl<T> Completion<T> {
     /// Own any result this receiver does not take, including errors and loss of
     /// the last resolver. The sink runs synchronously, outside the completion
@@ -58,8 +140,33 @@ impl<T> Completion<T> {
         U: Send + 'static,
     {
         let (promise, resolver) = Completion::new(marker);
+        promise.shared.observe_dispatch();
         drop(self.with_sink(move |result| resolver.complete(result.map(map))));
         promise
+    }
+
+    /// Prebind a mapping that sits in front of native admission. The inner
+    /// and outer receipts can have the same type, so claim the caller's sink
+    /// on the outer receipt before the inner resolver can see it.
+    pub(crate) fn map_dispatch<U>(
+        marker: &str,
+        dispatch: impl FnOnce() -> Result<Self>,
+        map: impl FnOnce(T) -> U + Send + 'static,
+    ) -> Result<Completion<U>>
+    where
+        T: Send + 'static,
+        U: Send + 'static,
+    {
+        let observed = DISPATCH_SINK.with_borrow(|slot| {
+            slot.as_ref().is_some_and(|(_, sink)| sink.is::<DispatchObserver<U>>())
+        });
+        if !observed {
+            return Ok(dispatch()?.map(marker, map));
+        }
+        let (outer, resolver) = Completion::new(marker);
+        outer.shared.observe_dispatch();
+        observe_dispatch(dispatch, move |result| resolver.complete(result.map(map)));
+        Ok(outer)
     }
 
     pub(crate) fn rpc(
@@ -82,6 +189,7 @@ impl<T> Completion<T> {
             state.retirement = Some(retirement.clone());
         }
         scope.register_reply(retirement);
+        promise.shared.observe_dispatch();
         (promise, resolver)
     }
 
@@ -197,13 +305,102 @@ impl<T> PromiseResolver<T> {
     }
 }
 
-pub(crate) trait Cancelable {
-    fn cancel(&self, err: Error);
+impl PromiseResolver<()> {
+    pub(crate) fn settle_cancel(&self, cause: Error) {
+        let action = {
+            let mut state = self.shared.lock_state();
+            if state.completed {
+                return;
+            }
+            state.implied_cancel = Some(cause);
+            state.complete(ReplyOutcome::Completed(Ok(())))
+        };
+        Shared::dispatch(action);
+        self.shared.listener.notify();
+    }
 }
 
-impl<T> Cancelable for PromiseResolver<T> {
+pub(crate) trait Cancelable {
+    fn cancel(&self, err: Error);
+    fn observe_dispatch(&self) {}
+    fn expect_method(
+        &self,
+        _class: u16,
+        _method: u16,
+    ) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
+    fn expected_dispatch(&self) -> Option<ExpectedDispatch> {
+        None
+    }
+}
+
+impl<T: Send + 'static> Cancelable for PromiseResolver<T> {
     fn cancel(&self, err: Error) {
         self.reject(err)
+    }
+
+    fn observe_dispatch(&self) {
+        self.shared.observe_dispatch();
+    }
+
+    fn expect_method(&self, class: u16, method: u16) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        let mut state = self.shared.lock_state();
+        let key = state.dispatch_key.take()?;
+        let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.expected_dispatch = Some(ExpectedDispatch {
+            key,
+            class,
+            method,
+            written: written.clone(),
+        });
+        Some(written)
+    }
+
+    fn expected_dispatch(&self) -> Option<ExpectedDispatch> {
+        let state = self.shared.lock_state();
+        (!state.completed)
+            .then(|| state.expected_dispatch.clone())
+            .flatten()
+    }
+}
+
+impl<T: Send + 'static> Shared<T> {
+    fn observe_dispatch(self: &Arc<Self>) {
+        let observer = DISPATCH_SINK.with_borrow_mut(|slot| {
+            if slot
+                .as_ref()
+                .is_some_and(|(_, sink)| sink.is::<DispatchObserver<T>>())
+            {
+                let (key, sink) = slot.take().expect("checked observer");
+                Some((
+                    key,
+                    sink.downcast::<DispatchObserver<T>>()
+                        .expect("checked observer type"),
+                ))
+            } else {
+                None
+            }
+        });
+        if let Some((key, observer)) = observer {
+            let mut state = self.lock_state();
+            state.dispatch_key = key;
+            let data = state.data.take();
+            state.closed = true;
+            if let Some(data) = data {
+                let implied = state.implied_cancel.take();
+                drop(state);
+                observer(data, implied);
+            } else {
+                let owner = Arc::downgrade(self);
+                state.sink = Some(Box::new(move |result| {
+                    let implied = owner
+                        .upgrade()
+                        .and_then(|owner| owner.lock_state().implied_cancel.take());
+                    observer(result, implied);
+                }));
+            }
+        }
     }
 }
 
@@ -225,6 +422,9 @@ struct State<T> {
     rpc_context: Option<(crate::frames::FrameErrorContext, crate::types::ChannelId)>,
     retirement: Option<Arc<dyn crate::task_scope::RetiringReply>>,
     resolver_close: Option<Arc<ReceivedClose>>,
+    dispatch_key: Option<DispatchKey>,
+    expected_dispatch: Option<ExpectedDispatch>,
+    implied_cancel: Option<Error>,
 }
 
 type CompletionSink<T> = Box<dyn FnOnce(Result<T>) + Send>;
@@ -306,6 +506,9 @@ impl<T> Shared<T> {
             rpc_context: None,
             retirement: None,
             resolver_close: None,
+            dispatch_key: None,
+            expected_dispatch: None,
+            implied_cancel: None,
         };
         if let Some(data) = data {
             // A ready receiver uses the same once-only completion checkpoint.
@@ -380,6 +583,50 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn claimed_dispatch_observes_settlement_before_admission_returns() {
+        for implied in [false, true] {
+            let (sent, received) = std::sync::mpsc::channel();
+            observe_claimed_dispatch(
+                || {
+                    let (completion, resolver) = Completion::new("claimed Cancel");
+                    resolver.observe_dispatch();
+                    if implied {
+                        resolver.settle_cancel(ErrorKind::MissingHeartbeatError.into());
+                    } else {
+                        resolver.resolve(());
+                    }
+                    let (result, cause) = received.try_recv().expect("settled at the resolver");
+                    result.unwrap();
+                    assert_eq!(cause.is_some(), implied);
+                    Ok(completion)
+                },
+                move |result, cause| sent.send((result, cause)).unwrap(),
+            );
+            assert!(received.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn same_type_mapped_dispatch_observes_the_projected_result() {
+        let (sent, received) = std::sync::mpsc::channel();
+        observe_dispatch(
+            || Completion::map_dispatch(
+                "projected value",
+                || {
+                    let (completion, resolver) = Completion::new("raw value");
+                    resolver.observe_dispatch();
+                    resolver.resolve(7);
+                    assert_eq!(received.try_recv().unwrap().unwrap(), 8);
+                    Ok(completion)
+                },
+                |value| value + 1,
+            ),
+            move |result| sent.send(result).unwrap(),
+        );
+        assert!(received.try_recv().is_err());
     }
 
     #[test]

@@ -70,6 +70,7 @@ impl Frames {
         expected_reply: Option<ExpectedReply>,
         resolver: Option<PromiseResolver<()>>,
     ) {
+        canceler.observe_dispatch();
         self.lock_inner()
             .push(channel_id, frame, canceler, expected_reply, resolver);
     }
@@ -169,6 +170,24 @@ impl Frames {
     ) -> Option<Reply> {
         self.lock_inner()
             .next_expected_close_ok_reply(channel_id, error)
+    }
+
+    pub(crate) fn matching_dispatch(
+        &self,
+        id: ChannelId,
+        class: u16,
+        method: u16,
+    ) -> Option<crate::DispatchKey> {
+        let inner = self.lock_inner();
+        let mut matches = inner.expected_replies.get(&id)?.iter().filter_map(|reply| {
+            let expected = reply.1.expected_dispatch()?;
+            (expected.class == class
+                && expected.method == method
+                && expected.written.load(std::sync::atomic::Ordering::Acquire))
+            .then_some(expected.key)
+        });
+        let key = matches.next()?;
+        matches.next().is_none().then_some(key)
     }
 
     pub(crate) fn has_pending(&self) -> bool {
@@ -309,6 +328,7 @@ impl fmt::Display for FrameEntry {
 pub(crate) struct FrameSending {
     canceler: Option<Box<dyn Cancelable + Send + Sync>>,
     resolver: Option<PromiseResolver<()>>,
+    request_written: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl FrameSending {
@@ -316,7 +336,11 @@ impl FrameSending {
         canceler: Option<Box<dyn Cancelable + Send + Sync>>,
         resolver: Option<PromiseResolver<()>>,
     ) -> Self {
-        Self { canceler, resolver }
+        Self {
+            canceler,
+            resolver,
+            request_written: None,
+        }
     }
 
     pub(crate) fn reject(&self, error: Error) {
@@ -328,6 +352,9 @@ impl FrameSending {
     }
 
     pub(crate) fn resolve(&self) {
+        if let Some(written) = &self.request_written {
+            written.store(true, std::sync::atomic::Ordering::Release);
+        }
         if let Some(resolver) = self.resolver.as_ref() {
             resolver.resolve(());
         }
@@ -365,7 +392,7 @@ impl Inner {
         expected_reply: Option<ExpectedReply>,
         resolver: Option<PromiseResolver<()>>,
     ) {
-        let sending = FrameSending::new(Some(canceler), resolver);
+        let mut sending = FrameSending::new(Some(canceler), resolver);
         // Shutdown/recovery rejects ordinary work, but the peer's mandatory
         // close acknowledgement still has to reach the wire on channel zero.
         let close_ok = matches!(
@@ -387,6 +414,11 @@ impl Inner {
             return;
         }
 
+        if let (AMQPFrame::Method(_, method), Some(reply)) = (&frame, &expected_reply) {
+            sending.request_written = reply
+                .1
+                .expect_method(method.get_amqp_class_id(), method.get_amqp_method_id());
+        }
         self.frames.push_back(FrameEntry::new(frame, sending));
         if let Some(reply) = expected_reply {
             trace!(
@@ -536,7 +568,7 @@ impl Inner {
         while let Some(reply) = expected_replies.pop_front() {
             match &reply.0 {
                 Reply::ChannelCloseOk(_) => return Some(reply.0),
-                Reply::BasicCancelOk(resolver) => resolver.resolve(()), // Channel close means consumer is canceled automatically
+                Reply::BasicCancelOk(resolver) => resolver.settle_cancel(error.clone()),
                 _ => reply.1.cancel(error.clone()),
             }
         }
@@ -558,7 +590,7 @@ impl Inner {
     fn cancel_expected_reply(reply: ExpectedReply, error: Error) {
         let ExpectedReply(reply, cancel) = reply;
         match reply {
-            Reply::BasicCancelOk(resolver) => resolver.resolve(()),
+            Reply::BasicCancelOk(resolver) => resolver.settle_cancel(error),
             _ => cancel.cancel(error.clone()),
         }
     }
