@@ -160,14 +160,20 @@ impl<T> Completion<T> {
         U: Send + 'static,
     {
         let observed = DISPATCH_SINK.with_borrow(|slot| {
-            slot.as_ref().is_some_and(|(_, sink)| sink.is::<DispatchObserver<U>>())
+            slot.as_ref()
+                .filter(|(_, sink)| sink.is::<DispatchObserver<U>>())
+                .map(|(key, _)| key.clone())
         });
-        if !observed {
+        let Some(key) = observed else {
             return Ok(dispatch()?.map(marker, map));
-        }
+        };
         let (outer, resolver) = Completion::new(marker);
         outer.shared.observe_dispatch();
-        observe_dispatch(dispatch, move |result| resolver.complete(result.map(map)));
+        // The wire method belongs to the inner resolver. Its expected
+        // response must carry the same key that the outer observer owns.
+        observe_dispatch_inner(key, dispatch, move |result, _| {
+            resolver.complete(result.map(map));
+        });
         Ok(outer)
     }
 
@@ -614,12 +620,19 @@ mod tests {
     #[test]
     fn same_type_mapped_dispatch_observes_the_projected_result() {
         let (sent, received) = std::sync::mpsc::channel::<Result<i32>>();
-        observe_dispatch(
+        let key = DispatchKey::default();
+        observe_dispatch_with_key(
+            key.clone(),
             || Completion::map_dispatch(
                 "projected value",
                 || {
                     let (completion, resolver) = Completion::new("raw value");
                     resolver.observe_dispatch();
+                    let written = resolver.expect_method(60, 20).unwrap();
+                    let expected = resolver.expected_dispatch().unwrap();
+                    assert!(expected.key.same(&key));
+                    assert_eq!((expected.class, expected.method), (60, 20));
+                    assert!(Arc::ptr_eq(&expected.written, &written));
                     resolver.resolve(7);
                     assert_eq!(received.try_recv().unwrap().unwrap(), 8);
                     Ok(completion)

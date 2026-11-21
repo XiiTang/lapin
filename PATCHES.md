@@ -1577,3 +1577,17 @@ returns. The resolver keeps the provenance and outcome in one mutex commit.
 Consume prebinds its external Consumer projection before the raw Consumer is
 admitted. Both receipts have the same result type. The mapped-dispatch test
 exercises native completion before the admission call returns.
+
+### Dispatch keys through mapped Consume receipts
+
+Upstream `0dc84fc1` projects the successful consumer after awaiting the
+native Basic.Consume resolver. This fork prebinds the mapped result and can
+identify the exact sent request answered by a broker Channel.Close. The
+inner resolver now receives the caller's dispatch key, so a correlated
+Consume refusal reaches its original grant intake before the channel ends.
+The mapped observer still receives the projected native result once.
+
+Regressions: `same_type_mapped_dispatch_observes_the_projected_result` checks
+the key at the native expected reply and the mapped answer, and Boundless's
+`a_correlated_channel_close_answers_consume_and_ends_its_channel` drives a
+scripted broker refusal.
