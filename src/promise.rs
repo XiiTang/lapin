@@ -39,10 +39,12 @@ impl<T> Drop for Completion<T> {
     }
 }
 
-#[derive(Clone, Default)]
+/// Identifies one native dispatch and its expected response.
+#[derive(Clone, Debug, Default)]
 pub struct DispatchKey(Arc<()>);
 
 impl DispatchKey {
+    /// Reports whether both keys identify the same dispatch.
     pub fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -588,7 +590,7 @@ mod tests {
     #[test]
     fn claimed_dispatch_observes_settlement_before_admission_returns() {
         for implied in [false, true] {
-            let (sent, received) = std::sync::mpsc::channel();
+            let (sent, received) = std::sync::mpsc::channel::<(Result<()>, Option<Error>)>();
             observe_claimed_dispatch(
                 || {
                     let (completion, resolver) = Completion::new("claimed Cancel");
@@ -611,7 +613,7 @@ mod tests {
 
     #[test]
     fn same_type_mapped_dispatch_observes_the_projected_result() {
-        let (sent, received) = std::sync::mpsc::channel();
+        let (sent, received) = std::sync::mpsc::channel::<Result<i32>>();
         observe_dispatch(
             || Completion::map_dispatch(
                 "projected value",
