@@ -268,6 +268,12 @@ impl Channels {
         error!(%error, "Connection error");
         if let Some(resolver) = self.frames.connection_resolver(0) {
             resolver.reject(error.clone());
+        } else if matches!(error.kind(), crate::ErrorKind::IOError(io)
+            if io.kind() != std::io::ErrorKind::ConnectionAborted)
+        {
+            // A physical receive failure must answer the pending handshake
+            // before canceling the authentication task that holds its resolver.
+            self.connection_status.reject_handshake(error.clone());
         }
 
         self.frames.drop_pending(error.clone(), &self.internal_rpc);

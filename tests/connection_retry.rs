@@ -170,7 +170,7 @@ async fn initial_half_close_rejects_when_retries_are_exhausted() {
         .expect("exhausted connection stayed pending")
         .unwrap_err();
         assert!(matches!(error.kind(), ErrorKind::IOError(error)
-            if error.kind() == std::io::ErrorKind::ConnectionAborted));
+            if error.kind() == std::io::ErrorKind::UnexpectedEof));
         server.join().unwrap();
     }
 }
@@ -207,6 +207,6 @@ async fn half_close_after_start_rejects_instead_of_replaying_authentication() {
     .expect("handshake stayed pending after EOF")
     .unwrap_err();
     assert!(matches!(error.kind(), ErrorKind::IOError(error)
-        if error.kind() == std::io::ErrorKind::ConnectionAborted));
+        if error.kind() == std::io::ErrorKind::UnexpectedEof));
     server.join().unwrap();
 }

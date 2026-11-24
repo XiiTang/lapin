@@ -56,6 +56,13 @@ impl ConnectionStatus {
         self.write().handshake = resolver.downgrade();
     }
 
+    pub(crate) fn reject_handshake(&self, error: Error) {
+        let handshake = self.read().handshake.upgrade();
+        if let Some(handshake) = handshake {
+            handshake.reject(error);
+        }
+    }
+
     pub(crate) fn defer_handshake_close(&self, error: Error) -> Option<HandshakeResolver> {
         self.read().handshake.defer_close(error)
     }

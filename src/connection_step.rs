@@ -109,6 +109,9 @@ impl Cancelable for HandshakeResolver {
     }
 }
 impl WeakHandshakeResolver {
+    pub(crate) fn upgrade(&self) -> Option<HandshakeResolver> {
+        self.0.upgrade().map(HandshakeResolver)
+    }
     pub(crate) fn defer_close(&self, error: Error) -> Option<HandshakeResolver> {
         let owner = HandshakeResolver(self.0.upgrade()?);
         {

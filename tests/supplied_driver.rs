@@ -488,12 +488,12 @@ async fn eof_during_authentication_ends_handshake_without_explicit_stop() {
         ConnectionProperties::default().with_auth_provider(PendingAuth { entered, dropped }),
     )
     .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(3), handshake)
-            .await
-            .unwrap()
-            .is_err()
-    );
+    let error = tokio::time::timeout(Duration::from_secs(3), handshake)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error.kind(), lapin::ErrorKind::IOError(cause)
+        if cause.kind() == io::ErrorKind::UnexpectedEof));
     until(|| owner.is_finished()).await;
     let _ = tokio::task::spawn_blocking(move || owner.join())
         .await
@@ -595,7 +595,8 @@ async fn close_during_async_authentication_retains_peer_facts() {
             }
             if route == 0 {
                 assert!(matches!(driver.kind(), lapin::ErrorKind::IOError(cause)
-                    if cause.kind() == io::ErrorKind::ConnectionAborted));
+                    if cause.kind() == io::ErrorKind::ConnectionAborted
+                        || eof_after_start && cause.kind() == io::ErrorKind::UnexpectedEof));
             } else {
                 assert!(matches!(driver.kind(), lapin::ErrorKind::InvalidChannel(7)));
             }

@@ -1591,3 +1591,11 @@ Regressions: `same_type_mapped_dispatch_observes_the_projected_result` checks
 the key at the native expected reply and the mapped answer, and Boundless's
 `a_correlated_channel_close_answers_consume_and_ends_its_channel` drives a
 scripted broker refusal.
+
+## Typed receive EOF for unfinished input
+
+Upstream manufactures ConnectionAborted after a socket read of zero, including the initial opening exit. The patch reports UnexpectedEof at those two producers after the existing buffered-frame parsing turn. During asynchronous authentication, a physical non-abort I/O failure rejects the existing HandshakeResolver through its weak ConnectionStatus reference before authentication task cancellation can manufacture an abandonment abort. Reserved peer/protocol closes still own completion. Local stop, auth guard abandonment and recovery exhaustion retain their existing causes.
+
+The rule is that a reliable stream ending before required input completes reports a receive cut. The check point is IoLoop::handle_half_closed_connection and initial half_closed exit. Boundless converts its typed native evidence through network::failure and keeps existing answer and end selection. The regressions are protocols::amqp::tests::a_broker_ending_the_connect_fails_it and supplied_driver::eof_during_authentication_ends_handshake_without_explicit_stop, alongside the local-stop and reserved-close controls. These tests are run with the Boundless integration change for #836.
+
+Upstream submission is deferred under the owner's no-GitHub-writes instruction for this batch.

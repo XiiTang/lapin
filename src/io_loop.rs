@@ -313,7 +313,7 @@ impl<
 
                     trace!(status=?self.status, connection_status=?self.connection_status.state(), "io_loop exiting for {}", if reconnect { "reconnection" } else if connecting { "connection" } else { "shutdown" });
                     if self.first_connection && connecting && self.half_closed && res.is_ok() {
-                        let error = Error::from(io::Error::from(io::ErrorKind::ConnectionAborted))
+                        let error = Error::from(io::Error::from(io::ErrorKind::UnexpectedEof))
                             .with_remote_close(self.connection_status.remote_close());
                         if self.frames.retry_connection_header() {
                             // Before Connection.Start, retry the protocol header with
@@ -669,7 +669,7 @@ impl<
             return Ok(true);
         }
         self.socket_state
-            .handle_io_result(Err(io::Error::from(io::ErrorKind::ConnectionAborted).into()))?;
+            .handle_io_result(Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()))?;
         Ok(false)
     }
 
