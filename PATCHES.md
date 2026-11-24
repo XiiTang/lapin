@@ -1599,3 +1599,32 @@ Upstream manufactures ConnectionAborted after a socket read of zero, including t
 The rule is that a reliable stream ending before required input completes reports a receive cut. The check point is IoLoop::handle_half_closed_connection and initial half_closed exit. Boundless converts its typed native evidence through network::failure and keeps existing answer and end selection. The regressions are protocols::amqp::tests::a_broker_ending_the_connect_fails_it and supplied_driver::eof_during_authentication_ends_handshake_without_explicit_stop, alongside the local-stop and reserved-close controls. These tests are run with the Boundless integration change for #836.
 
 Upstream submission is deferred under the owner's no-GitHub-writes instruction for this batch.
+
+### Public API and upstream comparison
+
+The public IOError(ConnectionAborted) is shared by actual zero reads, local
+stop, auth-task abandonment and retry exhaustion. No public predicate identifies
+which producer supplied it. During asynchronous authentication the task holds
+the handshake resolver outside Frames, so changing the two EOF producers alone
+still lets cancellation replace their error with an abandonment abort. These
+private owners must retain the observed physical I/O cause; Boundless cannot
+recover it from the final public abort or from error text.
+
+Converting zero reads to errors in a supplied stream would bypass the native buffered-frame parsing turn that precedes half-close handling. It also would not reach the pending authentication resolver before task cancellation. The fact therefore belongs at these existing native owners.
+
+Current upstream IoLoop retains ConnectionAborted in both the initial half-close
+exit and handle_half_closed_connection, after its buffered-frame parsing turn.
+This patch changes only those actual EOF producers. During pending auth it
+rejects the existing shared HandshakeResolver before dropping tasks, for physical
+non-abort I/O failures. Reserved peer/protocol closes keep that resolver's closing
+cause. Explicit stop, abandoned auth and retry-exhaustion fallback retain their
+original aborts; retries, frame parsing and close acknowledgements are unchanged.
+
+Regression evidence: at c534dec47e9077270e52c0ea84835852071e7815 on macOS arm64,
+connection_retry::{initial_half_close_rejects_when_retries_are_exhausted,
+half_close_after_start_rejects_instead_of_replaying_authentication} and supplied_driver::{
+eof_during_authentication_ends_handshake_without_explicit_stop,
+close_during_async_authentication_retains_peer_facts,
+canceled_async_authentication_rejects_handshake_and_drains_resources,
+abandoned_native_handshake_completes_to_its_owner_on_stop} all passed. Boundless
+protocols::amqp::tests::a_broker_ending_the_connect_fails_it passed as well.
